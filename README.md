@@ -25,3 +25,7 @@ Alpha. The implementation roadmap is complete through the release-gate tooling; 
 - [Architecture](ARCHITECTURE.md)
 - [Code index](CODE_INDEX.md)
 - [Code graph](CODE_GRAPH.md)
+
+## License
+
+Licensed under the [MIT License](LICENSE). Bundled third-party components remain under their own notices.
