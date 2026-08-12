@@ -1,0 +1,78 @@
+## Interface: 120001, 120005
+## Title: !RothDevLib
+## Notes: LLM-oriented feedback bus for WoW addon development. Error capture + Doctor context + breadcrumbs + structured export.
+## Author: Neomorph
+## Version: 1.0.0-alpha.19.0
+## SavedVariables: RothDevLibDB
+
+## AddonCompartmentFunc: RothDevLib_OnAddonCompartmentClick
+## AddonCompartmentFuncOnEnter: RothDevLib_OnAddonCompartmentEnter
+## AddonCompartmentFuncOnLeave: RothDevLib_OnAddonCompartmentLeave
+## IconTexture: Interface\AddOns\!RothDevLib\Media\bug
+## Category: Development Tools
+
+# Embedded libs (minimap launcher)
+libs\LibStub\LibStub.lua
+libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+libs\LibDataBroker-1.1\LibDataBroker-1.1.lua
+libs\LibDBIcon-1.0\lib.xml
+
+# Core
+Core\Core.lua
+Core\DB.lua
+Core\Internal.lua
+
+# Util
+Util\Util.lua
+Util\JSON.lua
+Util\Logger.lua
+Util\SecretGuard.lua
+
+# Export (Phase 4)
+Export\Export.lua
+Export\Packer.lua
+
+# Perf (Phase 3)
+Perf\CPU.lua
+Perf\Mem.lua
+
+# Doctor (before Capture for correlation)
+Doctor\Doctor.lua
+Doctor\Breadcrumbs.lua
+Doctor\Validation.lua
+
+# Integration Bus (before Capture for breadcrumbs in errors)
+Integration\Callbacks.lua
+Integration\Bus.lua
+Integration\API.lua
+Integration\LibStub.lua
+
+# Capture (ASAP)
+Capture\Locals.lua
+Capture\ErrorHandler.lua
+Capture\BugGrabber.lua
+Capture\Reported.lua
+Capture\ChatTap.lua
+Capture\Storm.lua
+Capture\Warnings.lua
+Capture\Taint.lua
+Capture\Suppress.lua
+
+# UI
+UI\Templates.xml
+UI\Skin.lua
+UI\Menu.lua
+UI\Table.lua
+UI\DetailView.lua
+UI\GroupGrid.lua
+UI\MainFrame.lua
+UI\Hyperlink.lua
+UI\Monitor.lua
+UI\ExportFrame.lua
+UI\Report.lua
+UI\MinimapButton.lua
+UI\AddonCompartment.lua
+UI\Slash.lua
+
+# Events / Init (last)
+Core\Events.lua

@@ -1,0 +1,607 @@
+===============================================================================
+ TODO: RothDevLib UI — полный рефакторинг интерфейса
+ Создано: 2026-02-21
+ Статус: ПЛАНИРОВАНИЕ
+===============================================================================
+
+ПРОБЛЕМА (РЕЗЮМЕ)
+=================
+Текущий UI (v2 dark theme rewrite) выглядит как незаконченная мешанина:
+- GroupGrid пуст при 6 группах (строки не видны)
+- Стили перемешаны (Blizzard UIDropDown рядом с кастомными dark-тёмными кнопками)
+- Табы/кнопки в DetailView налезают друг на друга
+- Unicode символы (▾) не рендерятся → квадратики
+- Монитор — просто текстовый дамп без графиков и сортировки
+- Дропдауны с белыми прямоугольниками на тёмном фоне
+- Splitter невидим
+
+СТРАТЕГИЧЕСКОЕ РЕШЕНИЕ
+======================
+Вместо кастомной dark-theme → использовать Blizzard UI templates как AddonProfiler.
+Blizzard-шаблоны уже стилизованы, совместимы между собой, и работают.
+Кастомный Skin модуль оставить только для мелких цветовых настроек.
+
+Референс: _Reference\!!AddonProfiler\AddonProfiler.lua
+  → ButtonFrameTemplate (основной фрейм)
+  → ColumnDisplayTemplate (сортируемые заголовки)
+  → WowScrollBoxList + MinimalScrollBar (современный scroll)
+  → WowStyle1DropdownTemplate (дропдауны)
+  → CreateDataProvider + SetSortComparator (управление данными)
+  → PanelDragBarTemplate (перетаскивание)
+  → PanelResizeButtonTemplate (ресайз)
+  → SearchBoxTemplate (поиск)
+
+Наш Skin.lua → сохранить Skin.C палитру для раскраски строк по типу ошибки
+(KindToRGB), но убрать кастомные кнопки/табы/инпуты.
+
+
+===============================================================================
+ FIX 0: ПОДГОТОВКА — Skin.lua → минимальный сервис
+===============================================================================
+
+Файл: UI/Skin.lua
+
+Что оставить:
+  - Skin.C (палитра для KindToRGB, badge цвета)
+  - Skin.BD (BackdropTemplate спеки, если используются где-то ещё)
+  - SaveFrameState / RestoreFrameState (для позиции окна)
+  - CreateResizeGrip (если не заменяем на PanelResizeButtonTemplate)
+  - Badge() (для minimap иконки)
+
+Что убрать / пометить deprecated:
+  - StyledButton() → заменить на UIPanelButtonTemplate / UIButtonTemplate
+  - TabButton() → заменить на стандартные табы (см. Fix 3)
+  - SearchBox() → заменить на SearchBoxTemplate
+  - DarkFrame() → заменить на ButtonFrameTemplate
+  - DarkInset() → Blizzard Inset уже есть в ButtonFrameTemplate
+
+ПРИМЕР (UIPanelButtonTemplate):
+```lua
+local btn = CreateFrame("Button", nil, parent, "UIPanelButtonTemplate")
+btn:SetSize(80, 22)
+btn:SetText("Clear All")
+btn:SetScript("OnClick", function() ... end)
+```
+
+
+===============================================================================
+ FIX 1 [P0]: MainFrame.lua → ButtonFrameTemplate
+===============================================================================
+
+Файл: UI/MainFrame.lua
+
+ТЕКУЩЕЕ:
+  CreateFrame("Frame", ..., "BackdropTemplate") + кастомные TitleBar, Toolbar, StatusBar
+
+ЗАМЕНИТЬ НА:
+  CreateFrame("Frame", "RothDevLibMainFrame", UIParent, "ButtonFrameTemplate")
+
+ПРИМЕР (из AddonProfiler):
+```lua
+local display = CreateFrame("Frame", "RothDevLibMainFrame", UIParent, "ButtonFrameTemplate")
+display:SetSize(980, 640)
+display:SetPoint("CENTER", 0, 0)
+display:SetMovable(true)
+display:EnableMouse(true)
+display:SetToplevel(true)
+display:SetResizable(true)
+display:SetClampedToScreen(true)
+display:Hide()
+
+-- Скрыть портрет
+ButtonFrameTemplate_HidePortrait(display)
+
+-- Заголовок
+display:SetTitle("|cffe03d02RothDevLib|r " .. (RDL.version or ""))
+
+-- Resize
+local resizeButton = CreateFrame("Button", nil, display, "PanelResizeButtonTemplate")
+resizeButton:Init(display)
+resizeButton:SetMinHeight(300)
+resizeButton:SetPoint("BOTTOMRIGHT", -4, 4)
+
+-- Drag
+local titleBar = CreateFrame("Frame", nil, display, "PanelDragBarTemplate")
+titleBar:SetPoint("TOPLEFT", 0, 0)
+titleBar:SetPoint("BOTTOMRIGHT", display, "TOPRIGHT", 0, -32)
+```
+
+INSET: ButtonFrameTemplate уже содержит display.Inset. Настроить его:
+```lua
+display.Inset:SetPoint("TOPLEFT", 8, -60)   -- ниже тулбара
+display.Inset:SetPoint("BOTTOMRIGHT", -4, 30)  -- выше статус-бара
+```
+
+ТУЛБАР (Errors/Monitor/Log табы + search):
+  → Разместить МЕЖДУ title и inset
+  → Табы: обычные текстовые кнопки с подчёркиванием (не кастомные)
+
+СТАТУС-БАР:
+  → Разместить кнопки НИЖЕ Inset, в зоне 30px
+  → Использовать UIPanelButtonTemplate
+
+SEARCH BOX:
+```lua
+local search = CreateFrame("EditBox", "$parentSearch", display, "SearchBoxTemplate")
+search:SetSize(200, 22)
+search:SetPoint("TOPRIGHT", display, "TOPRIGHT", -10, -34)
+search:SetAutoFocus(false)
+search:HookScript("OnTextChanged", function(self)
+  local text = self:GetText():trim():lower()
+  -- фильтрация
+end)
+```
+
+
+===============================================================================
+ FIX 2 [P0]: GroupGrid.lua → WowScrollBoxList + ColumnDisplay
+===============================================================================
+
+Файл: UI/GroupGrid.lua
+
+ТЕКУЩАЯ ПРОБЛЕМА:
+  - FauxScrollFrame создаёт строки при Init, когда listFrame ещё 0×0
+  - numRows = 0 → ни одна строка не видна
+  - Нет заголовков колонок (или сливаются с фоном)
+  - Дропдауны UIDropDownMenuTemplate — чужеродные на тёмном фоне
+
+РЕШЕНИЕ — ПОЛНОСТЬЮ ПЕРЕПИСАТЬ на современный Blizzard scroll:
+
+АРХИТЕКТУРА (как у AddonProfiler):
+```lua
+-- 1. Определяем колонки
+local COLUMN_INFO = {
+  kind = { order=1, title="Kind", width=80, textKey="kind" },
+  addon = { order=2, title="Addon", width=120, textKey="addon" },
+  count = { order=3, title="Count", width=60, textKey="count" },
+  last = { order=4, title="Last", width=70, textKey="last" },
+  msg = { order=5, title="Message", width=999, textKey="msg", justifyLeft=true },
+}
+
+-- 2. Сортировка
+local sortColumn = "count"
+local sortOrder = -1  -- desc
+
+-- 3. DataProvider
+local dataProvider = CreateDataProvider(filteredGroups)
+dataProvider:SetSortComparator(function(a, b)
+  -- сортировка по sortColumn
+end)
+
+-- 4. ColumnDisplayTemplate (заголовки с стрелками)
+local headers = CreateFrame("Button", nil, parent, "ColumnDisplayTemplate")
+headers:LayoutColumns(columnList)
+-- каждый header получает OnClick для смены сортировки
+-- + стрелка (atlas "auctionhouse-ui-sortarrow")
+
+-- 5. WowScrollBoxList
+local scrollBox = CreateFrame("Frame", nil, parent, "WowScrollBoxList")
+scrollBox:SetPoint("TOPLEFT", parent.Inset, "TOPLEFT", 4, -3)
+scrollBox:SetPoint("BOTTOMRIGHT", parent.Inset, "BOTTOMRIGHT", -22, 2)
+
+-- 6. MinimalScrollBar
+local scrollBar = CreateFrame("EventFrame", nil, parent, "MinimalScrollBar")
+scrollBar:SetPoint("TOPLEFT", scrollBox, "TOPRIGHT", 4, -4)
+scrollBar:SetPoint("BOTTOMLEFT", scrollBox, "BOTTOMRIGHT", 4, 4)
+
+-- 7. View + Element initializer
+local view = CreateScrollBoxListLinearView(2, 0, 2, 2, 2)
+view:SetElementExtent(20)  -- ROW_HEIGHT
+
+view:SetElementInitializer("Button", function(row, data)
+  if not row.initialized then
+    -- создать колонки (FontString pool)
+    row.columnPool = CreateObjectPool(...)
+    local bg = row:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints()
+    row.BG = bg
+    row.initialized = true
+  end
+  -- заполнить значения
+  row.columnPool:ReleaseAll()
+  for _, col in ipairs(activeColumns) do
+    local fs = row.columnPool:Acquire()
+    fs:SetText(data[col.textKey])
+    -- позиционирование
+  end
+end)
+
+ScrollUtil.InitScrollBoxListWithScrollBar(scrollBox, scrollBar, view)
+
+-- 8. Zebra-striping
+scrollBox:RegisterCallback("OnDataRangeChanged", function()
+  local index = scrollBox:GetDataIndexBegin()
+  scrollBox:ForEachFrame(function(button)
+    if index % 2 == 0 then
+      button.BG:SetColorTexture(0.1, 0.1, 0.1, 1)
+    else
+      button.BG:SetColorTexture(0.14, 0.14, 0.14, 1)
+    end
+    index = index + 1
+  end)
+end)
+```
+
+ФИЛЬТРЫ (Kind/Addon дропдауны):
+```lua
+-- WowStyle1DropdownTemplate вместо UIDropDownMenuTemplate
+local kindFilter = CreateFrame("DropdownButton", nil, parent, "WowStyle1DropdownTemplate")
+kindFilter:SetWidth(120)
+kindFilter:SetPoint("TOPLEFT", 10, -4)
+
+kindFilter:SetupMenu(function(_, rootDescription)
+  rootDescription:CreateTitle("Filter by Kind")
+  local function isSelected(data) return currentKindFilter == data end
+  local function onSelect(data)
+    currentKindFilter = data
+    RefreshGrid()
+    return MenuResponse.Refresh
+  end
+  rootDescription:CreateRadio("All", isSelected, onSelect, "ALL")
+  rootDescription:CreateRadio("Lua Errors", isSelected, onSelect, "LUA_ERROR")
+  rootDescription:CreateRadio("Taint", isSelected, onSelect, "TAINT")
+  rootDescription:CreateRadio("Warnings", isSelected, onSelect, "LUA_WARNING")
+  rootDescription:CreateRadio("Alerts", isSelected, onSelect, "ALERT")
+end)
+```
+
+FALLBACK: Если WowStyle1DropdownTemplate недоступен (старый клиент),
+использовать UIDropDownMenu_Initialize как сейчас, но скрыть визуал кнопки.
+
+
+===============================================================================
+ FIX 3 [P0]: Auto-select первой группы
+===============================================================================
+
+Файл: UI/MainFrame.lua → Refresh()
+
+ТЕКУЩЕЕ: Авто-выбор работает, но GroupGrid пуст → _groups[1] = nil.
+
+РЕШЕНИЕ: После Fix 2 GroupGrid будет заполнен → авто-выбор заработает.
+Дополнительно — при клике на строку в ScrollBox:
+```lua
+-- В element initializer:
+row:SetScript("OnClick", function()
+  UI.selectedSig = data.sig
+  UI:ShowGroup(data.sig)
+  UI:UpdateGroupGrid()  -- перерисовать selection highlight
+end)
+```
+
+
+===============================================================================
+ FIX 4 [P1]: DetailView.lua — layout табов и кнопок
+===============================================================================
+
+Файл: UI/DetailView.lua
+
+ПРОБЛЕМЫ:
+  1. 5 табов + 3 кнопки + occur фильтр в одной строке 28px → налезают
+  2. Unicode "▾" → квадратики
+  3. Кастомные StyledButton рядом с другими стилями
+
+РЕШЕНИЕ:
+
+a) Разнести на 2 строки:
+   Строка 1 (28px): Message | Stack | Locals | Doctor | Occur    [Actions] [Copy] [Export]
+   Строка 2 (24px, только на Occur): [< Prev] occurrence 3/15 [Next >] [Filter: ...]
+
+b) Unicode → ASCII:
+   "Actions ▾" → "Actions"  (дропдаун по клику, без стрелки)
+   "Copy ▾"    → "Copy"
+   "Export ▾"  → "Export View"
+
+c) Кнопки → UIPanelButtonTemplate:
+```lua
+local btnCopy = CreateFrame("Button", nil, tabsRow, "UIPanelButtonTemplate")
+btnCopy:SetSize(60, 22)
+btnCopy:SetText("Copy")
+btnCopy:SetPoint("RIGHT", tabsRow, "RIGHT", -4, 0)
+btnCopy:SetScript("OnClick", function()
+  -- копирование текста
+end)
+```
+
+d) Табы → простые текстовые кнопки с подчёркиванием:
+```lua
+local function MakeDetailTab(parent, text, x)
+  local tab = CreateFrame("Button", nil, parent)
+  tab:SetSize(70, 24)
+  tab:SetPoint("LEFT", parent, "LEFT", x, 0)
+  
+  local label = tab:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  label:SetPoint("CENTER")
+  label:SetText(text)
+  
+  local underline = tab:CreateTexture(nil, "OVERLAY")
+  underline:SetHeight(2)
+  underline:SetPoint("BOTTOMLEFT", 2, 0)
+  underline:SetPoint("BOTTOMRIGHT", -2, 0)
+  underline:SetColorTexture(0.35, 0.55, 0.85, 1) -- accent
+  underline:Hide()
+  tab._underline = underline
+  
+  function tab:SetActive(isActive)
+    underline:SetShown(isActive)
+    if isActive then
+      label:SetTextColor(1, 1, 1)
+    else
+      label:SetTextColor(0.6, 0.6, 0.6)
+    end
+  end
+  
+  tab:SetScript("OnEnter", function()
+    label:SetTextColor(1, 1, 1)
+  end)
+  tab:SetScript("OnLeave", function()
+    if not underline:IsShown() then
+      label:SetTextColor(0.6, 0.6, 0.6)
+    end
+  end)
+  
+  return tab
+end
+```
+
+
+===============================================================================
+ FIX 5 [P1]: Column headers — видимость и сортировка
+===============================================================================
+
+Файл: UI/GroupGrid.lua
+
+Fix 2 уже решает эту проблему через ColumnDisplayTemplate.
+
+Если ColumnDisplayTemplate недоступен (маловероятно для 12.x):
+- Создать headers вручную как строку кнопок
+- Каждый header: GameFontNormal текст + стрелка atlas
+- OnClick: смена сортировки + стрелка
+
+ПРИМЕР стрелки:
+```lua
+local arrow = header:CreateTexture(nil, "OVERLAY")
+arrow:SetAtlas("auctionhouse-ui-sortarrow", true)
+arrow:SetPoint("LEFT", header:GetFontString(), "RIGHT", 0, 0)
+
+-- ASC
+arrow:SetTexCoord(0, 1, 1, 0)
+-- DESC
+arrow:SetTexCoord(0, 1, 0, 1)
+```
+
+
+===============================================================================
+ FIX 6 [P2]: Monitor.lua — графики и таблицы
+===============================================================================
+
+Файл: UI/Monitor.lua
+
+ТЕКУЩЕЕ: Текстовый дамп FormatStatLine() в EditBox. Мешанина шрифтов.
+
+ЦЕЛЬ: Выглядеть как AddonProfiler — таблица с колонками, сортировка, обновление.
+
+ПЛАН:
+
+a) CPU панель → таблица вместо текста:
+```
+[#]  [Callback/Function]       [EMA ms]  [Last ms]  [Peak ms]  [Calls]
+ 1   !RothDevLib:UI:Init        4.44      4.44       4.44       1
+ 2   !RothDevLib:UI:InitMinimap 0.24      0.24       0.24       1
+ 3   !RothDevLib:Capture:Init   0.15      0.15       0.15       1
+```
+
+Реализация — упрощённый WowScrollBoxList внутри панели:
+```lua
+-- Для каждой панели (CPU, Mem):
+local scrollBox = CreateFrame("Frame", nil, panel, "WowScrollBoxList")
+local scrollBar = CreateFrame("EventFrame", nil, panel, "MinimalScrollBar")
+local view = CreateScrollBoxListLinearView()
+view:SetElementExtent(18) -- компактнее чем основной grid
+
+view:SetElementInitializer("Frame", function(row, data)
+  -- создать FontString'и для каждой колонки
+  -- row.rank:SetText(data.rank)
+  -- row.name:SetText(data.key)
+  -- row.ema:SetText(format("%.2f", data.ema))
+  -- row.last:SetText(format("%.2f", data.last))
+  -- row.peak:SetText(format("%.2f", data.max))
+  -- row.calls:SetText(data.n)
+end)
+```
+
+b) Mem панель → аналогично, но в KB/MB.
+
+c) Alerts панель → список с кликабельными строками:
+   Клик → переключение на Errors tab + OpenToSig(sig)
+
+d) Bus Inspector → оставить как есть (текстовый лог норм для bus).
+
+e) Заголовки панелей → стилизовать одинаково:
+```lua
+local function MakePanelHeader(parent, text)
+  local bg = parent:CreateTexture(nil, "BACKGROUND")
+  bg:SetPoint("TOPLEFT")
+  bg:SetPoint("TOPRIGHT")
+  bg:SetHeight(20)
+  bg:SetColorTexture(0.15, 0.15, 0.15, 1)
+  
+  local label = parent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  label:SetPoint("LEFT", bg, "LEFT", 6, 0)
+  label:SetText(text)
+  
+  return bg
+end
+```
+
+f) Графики (бонус, не обязательно):
+   Простой CPU graph — текстура-полоска шириной пропорционально значению:
+```lua
+-- bar graph в строке таблицы
+local bar = row:CreateTexture(nil, "ARTWORK")
+bar:SetHeight(12)
+bar:SetPoint("LEFT", row.emaText, "RIGHT", 4, 0)
+local maxEma = topEntries[1] and topEntries[1].ema or 1
+local barW = math.min(100, (data.ema / maxEma) * 100)
+bar:SetWidth(math.max(1, barW))
+bar:SetColorTexture(0.35, 0.55, 0.85, 0.6)
+```
+
+
+===============================================================================
+ FIX 7 [P2]: Splitter — видимость
+===============================================================================
+
+Файл: UI/MainFrame.lua
+
+ТЕКУЩЕЕ: alpha 0.6, цвет C.splitter (0.22) → невидим на тёмном фоне.
+
+РЕШЕНИЕ:
+```lua
+splitter:SetBackdropColor(0.30, 0.30, 0.33, 1.0)  -- чуть ярче
+splitter:SetAlpha(0.5)
+
+splitter:SetScript("OnEnter", function(s)
+  s:SetBackdropColor(0.45, 0.55, 0.85, 1.0) -- accent при hover
+  s:SetAlpha(1.0)
+  SetCursor("UI-Cursor-SizeRight") -- курсор resize (если доступен)
+end)
+splitter:SetScript("OnLeave", function(s)
+  s:SetBackdropColor(0.30, 0.30, 0.33, 1.0)
+  s:SetAlpha(0.5)
+  ResetCursor()
+end)
+```
+
+
+===============================================================================
+ FIX 8 [P2]: Ignore чекбокс → toggle-кнопка
+===============================================================================
+
+Файл: UI/GroupGrid.lua (если есть UICheckButtonTemplate)
+
+ТЕКУЩЕЕ: UICheckButtonTemplate — Blizzard стиль, торчит.
+
+РЕШЕНИЕ: Убрать чекбокс. Ignore уже доступен через кнопки в StatusBar.
+Если нужен inline-toggle на строке:
+```lua
+local ignBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+ignBtn:SetSize(16, 16)
+ignBtn:SetText("×")
+ignBtn:SetPoint("RIGHT", row, "RIGHT", -2, 0)
+ignBtn:SetScript("OnClick", function()
+  UI:ToggleIgnoreSig(data.sig)
+end)
+```
+
+
+===============================================================================
+ FIX 9 [P3]: ExportFrame.lua — привести в соответствие
+===============================================================================
+
+Файл: UI/ExportFrame.lua
+
+РЕШЕНИЕ: Использовать ButtonFrameTemplate как основной фрейм:
+```lua
+local f = CreateFrame("Frame", "RothDevLibExportFrame", UIParent, "ButtonFrameTemplate")
+ButtonFrameTemplate_HidePortrait(f)
+f:SetTitle("Export")
+-- кнопки внизу: UIPanelButtonTemplate
+```
+
+
+===============================================================================
+ FIX 10 [P3]: StatusBar кнопки → единый стиль
+===============================================================================
+
+Файл: UI/MainFrame.lua
+
+Все кнопки в StatusBar: UIPanelButtonTemplate.
+Export дропдаун → WowStyle1DropdownTemplate (как historyMenu в AddonProfiler):
+```lua
+local exportMenu = CreateFrame("DropdownButton", nil, statusBar, "WowStyle1DropdownTemplate")
+exportMenu:SetWidth(90)
+exportMenu:SetPoint("RIGHT", statusBar, "RIGHT", -8, 0)
+exportMenu:OverrideText("Export")
+
+exportMenu:SetupMenu(function(_, rootDescription)
+  rootDescription:CreateTitle("Export Options")
+  rootDescription:CreateButton("Export All", function()
+    UI:OpenExportAll()
+  end)
+  rootDescription:CreateButton("Export Selected", function()
+    UI:OpenExportSelected()
+  end)
+  rootDescription:CreateButton("GitHub Issue", function()
+    UI:OpenExportGitHub(UI.selectedSig)
+  end)
+  rootDescription:CreateButton("JSON", function()
+    UI:OpenExportJSON()
+  end)
+  rootDescription:CreateButton("Pack (LLM)", function()
+    UI:OpenExportPacked()
+  end)
+end)
+```
+
+
+===============================================================================
+ ПОРЯДОК РЕАЛИЗАЦИИ
+===============================================================================
+
+ЭТАП 1 — ФУНДАМЕНТ (без него ничего не работает):
+  [x] Прочитать AddonProfiler код для референса
+  [ ] FIX 0: Подготовить Skin.lua (оставить палитру, убрать кастомные виджеты)
+  [ ] FIX 1: MainFrame → ButtonFrameTemplate
+  [ ] FIX 2: GroupGrid → WowScrollBoxList + ColumnDisplay
+  [ ] FIX 3: Auto-select первой группы (заработает после Fix 2)
+
+ЭТАП 2 — ВИЗУАЛ:
+  [ ] FIX 4: DetailView tabs/buttons layout
+  [ ] FIX 5: Column headers (уже в Fix 2)
+  [ ] FIX 7: Splitter visibility
+  [ ] FIX 10: StatusBar кнопки
+
+ЭТАП 3 — МОНИТОР:
+  [ ] FIX 6: Monitor → таблицы вместо текста
+
+ЭТАП 4 — ПОЛИРОВКА:
+  [ ] FIX 8: Ignore toggle
+  [ ] FIX 9: ExportFrame стиль
+  [ ] Тестирование всех вкладок
+  [ ] Проверка в WoW 12.x (Midnight)
+
+
+===============================================================================
+ ВАЖНЫЕ ЗАМЕТКИ
+===============================================================================
+
+1. ПРОВЕРИТЬ ДОСТУПНОСТЬ ШАБЛОНОВ в 12.x:
+   - ButtonFrameTemplate          → есть (используется везде)
+   - ColumnDisplayTemplate        → есть (AH, Collections)
+   - WowScrollBoxList             → есть (все новые списки)
+   - MinimalScrollBar             → есть
+   - WowStyle1DropdownTemplate    → есть (все новые DD)
+   - SearchBoxTemplate            → есть
+   - PanelDragBarTemplate         → есть
+   - PanelResizeButtonTemplate    → есть
+   - UIPanelButtonTemplate        → есть (базовая кнопка)
+   Все эти шаблоны — часть современного Blizzard UI toolkit и не планируются
+   к удалению.
+
+2. COMPATIBILITY: если какой-то шаблон вдруг отсутствует, проверять через:
+   ```lua
+   if C_XMLUtil and C_XMLUtil.GetTemplateInfo and C_XMLUtil.GetTemplateInfo("WowScrollBoxList") then
+     -- modern path
+   else
+     -- fallback к FauxScrollFrame
+   end
+   ```
+
+3. ТЕСТИРОВАНИЕ: После каждого этапа — /reload в игре и проверка:
+   - /rdev test alert (создать тестовые ошибки)
+   - /rdev ui (открыть окно)
+   - Проверить все вкладки
+   - Проверить resize, drag, splitter
+
+4. AddonProfiler использует ТОЛЬКО ButtonFrameTemplate + встроенные виджеты.
+   Ни одного кастомного фрейма для UI shell. Это и есть секрет чистого вида.

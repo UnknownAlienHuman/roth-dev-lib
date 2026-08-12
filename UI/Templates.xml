@@ -1,0 +1,21 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/">
+  <!--
+    !RothDevLib/UI/Templates.xml
+
+    Minimal virtual templates for ScrollBox-based lists.
+    Keep templates extremely light; heavy construction happens in Lua initializer.
+  -->
+
+  <Button name="RothDevLibGroupRowTemplate" virtual="true" inherits="BackdropTemplate">
+    <Size>
+      <AbsDimension x="10" y="20"/>
+    </Size>
+  </Button>
+
+  <!-- Generic row template for Monitor ScrollBox tables. -->
+  <Button name="RothDevLibMonitorRowTemplate" virtual="true" inherits="BackdropTemplate">
+    <Size>
+      <AbsDimension x="10" y="18"/>
+    </Size>
+  </Button>
+</Ui>
