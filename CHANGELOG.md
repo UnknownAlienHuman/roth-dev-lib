@@ -5,6 +5,7 @@
 ### Compatibility
 
 - Target Retail 12.1.5, Interface 120105.
+- Declare `LoadSavedVariablesFirst` because capture policy and handler installation intentionally read persisted settings during file loading.
 - Register `rothdevlib` links through the current `LinkUtil` dispatcher, with a bounded legacy fallback.
 - Load Blizzard menu support through `C_AddOns.LoadAddOn`.
 
@@ -12,13 +13,16 @@
 
 - Normalize external values before comparison, formatting, iteration, persistence or callback delivery.
 - Deep-copy and bound diagnostic payloads; inaccessible values are represented explicitly.
-- Bound JSON traversal, strings, arrays, object entries and total output.
-- Add a total node budget and raw traversal for diagnostic table copies, preventing exponential graphs and hostile `__pairs`/`__index` execution.
+- Traverse foreign diagnostic tables with raw `next`/`rawget`; never invoke `__pairs`, `__index` or `__len`.
+- Bound JSON traversal by depth, table entries, scan entries, total nodes, strings, arrays and total output.
+- Add a total-node table-copy budget, preventing broad/exponential diagnostic graphs.
+- Keep `Core/Core.lua` limited to namespace/integrity ownership; the final public wrappers have one owner in `Core/CallSafety.lua`.
 - Preserve newest breadcrumbs when a ring is resized.
 - Retire the invasive global error-handler lock and force compatibility-first chain mode.
 - Install the error handler once; stop automatic reclaim/watchdog fights after another addon becomes owner. Explicit `/rdev reclaim` remains available.
 - Do not call secure-only `AddLuaErrorHandler` or hook private ScriptErrorsFrame internals. Fallback is bounded BugGrabber import or an explicit unavailable state.
 - Baseline existing BugGrabber counters by default and use content-stable keys, preventing historical replay and list-reorder duplicates.
+- Scan BugGrabber records without the foreign length operator, so hostile `__len` code cannot run.
 - Rebuild ChatTap and BugGrabber import as bounded, secret-safe external intake paths.
 - Stop replacing Blizzard frame methods, mutating `StaticPopupDialogs`, or unregistering Blizzard-owned events.
 - Give callbacks deterministic mutation semantics and an independent detached payload per consumer.
@@ -33,6 +37,7 @@
 
 ### Validation
 
-- Strengthened 6 existing regression tests and added 6 focused second-pass tests for the compact capture engine, ownership policy, callback isolation/mutation, Doctor cleanup, internal calls, profiling return tuples, BugGrabber baselining and traversal budgets. The suite now contains 28 test files.
+- Add manifest/load-order coverage for `LoadSavedVariablesFirst` and capture ordering.
+- Add regression coverage for raw JSON traversal, hostile metamethods, JSON node budgets and raw BugGrabber list scanning.
 - All modified production Lua files pass `texluac -p`.
 - In-game matrix: not run in this environment.

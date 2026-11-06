@@ -4,6 +4,7 @@
 ## Author: Neomorph
 ## Version: 1.0.0-alpha.20.0
 ## SavedVariables: RothDevLibDB
+## LoadSavedVariablesFirst: 1
 
 ## AddonCompartmentFunc: RothDevLib_OnAddonCompartmentClick
 ## AddonCompartmentFuncOnEnter: RothDevLib_OnAddonCompartmentEnter

@@ -56,6 +56,7 @@ local function SafeCopy(value)
     local ok, copy = pcall(util.CopyDiagnosticValue, util, value, {
       maxDepth = 4,
       maxEntries = 80,
+      maxNodes = 500,
       maxStringBytes = 8192,
     })
     if ok then return copy end
@@ -78,15 +79,16 @@ local function IsReadableTable(value)
 end
 
 local function SafeGet(tbl, key)
-  if not IsReadableTable(tbl) then return nil end
-  local ok, value = pcall(function() return rawget(tbl, key) end)
+  tbl = IsReadableTable(tbl)
+  if not tbl then return nil end
+  local ok, value = pcall(rawget, tbl, key)
   if not ok then return nil end
   return Scrub(value)
 end
 
 local function First(tbl, ...)
-  for i = 1, select("#", ...) do
-    local value = SafeGet(tbl, select(i, ...))
+  for index = 1, select("#", ...) do
+    local value = SafeGet(tbl, select(index, ...))
     if value ~= nil then return value end
   end
   return nil
@@ -98,8 +100,7 @@ end
 
 local function GetErrorList(db)
   if not db then return nil end
-  local list = First(db, "errors", "error", "errs")
-  list = IsReadableTable(list)
+  local list = IsReadableTable(First(db, "errors", "error", "errs"))
   if list then return list end
   if SafeGet(db, 1) ~= nil then return db end
   return nil
@@ -114,20 +115,29 @@ local function SafeNumber(value, fallback, minimum, maximum)
   return ordinary
 end
 
+-- Do not use #list: BugGrabberDB is foreign input and a hostile __len
+-- metamethod must never run inside the fallback importer. Scan raw positive
+-- integer keys once and cap the result at the configured maximum.
 local function ListLength(list, maximum)
-  local length = 0
-  local ok, value = pcall(function() return #list end)
-  if ok and type(value) == "number" then
-    length = math.floor(value)
-  else
-    for i = 1, maximum do
-      if SafeGet(list, i) == nil then break end
-      length = i
+  list = IsReadableTable(list)
+  if not list then return 0 end
+
+  local largest, scanned, rawKey = 0, 0, nil
+  while true do
+    local ok, nextKey = pcall(next, list, rawKey)
+    if not ok or nextKey == nil then break end
+    rawKey = nextKey
+    scanned = scanned + 1
+    if scanned > maximum then return maximum end
+
+    local ordinaryKey = Scrub(nextKey)
+    if type(ordinaryKey) == "number" and ordinaryKey >= 1
+        and ordinaryKey % 1 == 0 and ordinaryKey <= maximum
+        and ordinaryKey > largest then
+      largest = ordinaryKey
     end
   end
-  if length < 0 then return 0 end
-  if length > maximum then return maximum end
-  return length
+  return largest
 end
 
 local function NormalizeRecord(raw)
@@ -143,8 +153,7 @@ local function NormalizeRecord(raw)
   local message = SafeText(First(ordinary, "message", "msg", "error", 1), "", 64 * 1024)
   if message == "" or message == "nil" then return nil end
 
-  local rawStack = First(ordinary, "stack", "traceback", "trace", 2)
-  local stack = SafeText(rawStack, "", 128 * 1024)
+  local stack = SafeText(First(ordinary, "stack", "traceback", "trace", 2), "", 128 * 1024)
   if stack == "nil" then stack = "" end
 
   return {
@@ -260,7 +269,7 @@ function Bug:ImportNew()
           local okStore, status = pcall(Capture.StoreEntry, entry)
           if not okStore or status == "failed" then break end
           if status == "throttled" then return imported end
-          if status == "stored" or status == "queued" or status == "ignored" or status then
+          if status == "stored" or status == "queued" or status == "ignored" then
             imported = imported + 1
             budget = budget - 1
             self._counterByKey[key] = previous + step

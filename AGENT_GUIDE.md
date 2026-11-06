@@ -2,77 +2,74 @@
 
 ## Start here
 
-The executable contract is [`!RothDevLib.toc`](!RothDevLib.toc), not archived planning documents. Its load order is deliberate: embedded libraries, Core and utilities, Export, Perf, Doctor, Integration, Capture, UI, then `Core/Events.lua`.
+The executable contract is [`!RothDevLib.toc`](!RothDevLib.toc). Read it before changing code. The declared order is intentional:
 
-The runtime path is:
+1. embedded libraries;
+2. namespace, version, DB and internal calls;
+3. Secret Value guards, bounded copy/JSON and public call safety;
+4. export, profiling, Doctor and integration;
+5. capture policy/engine/intake modules;
+6. UI and the final lifecycle dispatcher.
 
-`Capture/Policy.lua` -> one-time chain ownership policy -> `Capture/Engine.lua:EarlyInit` -> `ADDON_LOADED("!RothDevLib")` -> DB/capture readiness -> `PLAYER_LOGIN` -> `InitAll`.
+`## LoadSavedVariablesFirst: 1` is required. `Capture/Policy.lua` and `Capture/Engine.lua` establish the early error-handler policy during file loading, so their DB reads must see the real persisted `RothDevLibDB`, not a temporary table created before `ADDON_LOADED`.
 
-`Capture/Policy.lua` must load immediately before `Capture/Engine.lua`. It establishes the chain-once settings consumed by file-load EarlyInit. `Capture/Safety.lua` then installs the richer bounded intake and fallback policy. Do not reorder these files casually.
+## Runtime ownership
 
-## Runtime map
-
-- `Core/DB.lua` owns defaults, settings, grouped entries, sessions, indexes and trimming.
-- `Core/CallSafety.lua` owns public safe/unsafe wrappers and Doctor-token cleanup; `Core/Core.lua` retains namespace and self-check ownership.
-- `Core/Internal.lua` owns guarded internal execution; it must preserve arbitrary return tuples and always release its exact Doctor token.
-- `Doctor/Doctor.lua` owns the context stack. `Leave(expectedToken)` removes exactly that scope so delayed cleanup cannot pop an unrelated later context.
-- `Integration/Callbacks.lua` snapshots registrations before dispatch. New registrations wait for the next dispatch, replacements/unregistrations before a callback turn are respected, and every callback receives its own detached bounded payload.
-- `Integration/Bus.lua` owns bounded transient breadcrumbs/metrics.
-- `Capture/Engine.lua` owns initial handler construction, ownership state, entry construction and storage routing. `Capture/Safety.lua` owns the richer hard/suppressed/integration intake and fallback diagnostics.
-- `Capture/BugGrabber.lua` is the only hard-error fallback when RothDevLib loses handler ownership. It baselines existing history unless `importBugGrabberHistory == true`.
-- `Export/Export.lua` and `Export/Packer.lua` produce bounded reports. `LibDeflate` is optional.
+- `Core/Core.lua`: namespace bootstrap and integrity fingerprints only.
+- `Core/CallSafety.lua`: public safe/unsafe wrappers and tuple-preserving Doctor cleanup.
+- `Core/DB.lua`: persistence, migration, grouped entries, sessions and trimming.
+- `Util/BoundedCopy.lua`: raw bounded snapshots of foreign diagnostic values.
+- `Util/JSON.lua`: deterministic raw traversal, node/depth/entry/string/output budgets.
+- `Doctor/Doctor.lua`: token-aware context stack.
+- `Integration/Callbacks.lua`: deterministic snapshot dispatch; every consumer receives a detached payload.
+- `Capture/Policy.lua`: one-time compatibility policy before handler installation.
+- `Capture/Engine.lua`: handler construction, ownership state, entry construction and storage routing.
+- `Capture/Safety.lua`: bounded hard/suppressed/integration intake and fallback selection.
+- `Capture/BugGrabber.lua`: the only supported hard-error fallback after handler ownership is lost.
 - UI modules are consumers; they do not own capture state.
 
-## Ownership contract
+## Non-negotiable invariants
 
-The global error handler is shared process state:
+### Global error handler
 
-1. RothDevLib chain-wraps the current handler once during EarlyInit.
-2. It forwards to the previous handler in chain mode.
-3. If a later addon replaces it, RothDevLib records the new owner and attaches BugGrabber fallback when available.
-4. It does **not** automatically reclaim, poll or fight the later owner.
-5. `/rdev reclaim` is the only supported explicit reclaim path.
+1. Chain-wrap the current handler once during `EarlyInit`.
+2. Forward to the prior handler in chain mode.
+3. Observe later replacement without automatically reclaiming or polling.
+4. Allow one explicit `/rdev reclaim` attempt.
+5. Never replace `_G.seterrorhandler`, call secure-only `AddLuaErrorHandler`, or hook/poll private ScriptErrorsFrame internals.
 
-Do not reintroduce:
+### Foreign data
 
-- `_G.seterrorhandler = function() end`;
-- periodic ownership reclaim;
-- reclaim from the `seterrorhandler` post-hook;
-- a mutating “probe” that temporarily swaps the handler;
-- `AddLuaErrorHandler` from ordinary addon execution (selected Blizzard source asserts secure execution);
-- ScriptErrorsFrame private polling or method hooks.
+Before comparison, formatting, indexing, iteration, logging, callback delivery, export or persistence:
 
-## State and data boundaries
+- gate Secret Value and table access;
+- copy into bounded ordinary values;
+- traverse foreign tables with raw `next`/`rawget`, never `pairs`, `#`, `__index`, `__pairs` or `__len`;
+- cap depth, entries, total nodes and string bytes;
+- represent inaccessible/cyclic/unsupported data with explicit markers;
+- never retain foreign tables, frames, timers, callbacks or pooled objects in `RothDevLibDB`.
 
-`RothDevLibDB` is the only durable table. Persist only bounded ordinary copies. External tables, secret-capable values, frames, callbacks, timers and pooled objects must not survive into DB state.
+### Lifecycle
 
-`Util:CopyDiagnosticValue` owns the generic copy boundary:
-
-- gate value/table access before Lua operations;
-- traverse with raw `next`/`rawget`, not foreign `__pairs`/`__index`;
-- bound depth, per-table entries, total nodes and string bytes;
-- preserve nil only as tuple position, not as an invented table value;
-- replace cycles, inaccessible values and unsupported runtime types with explicit markers.
-
-Callbacks are not an ownership shortcut. `RDL:Fire` provides independent detached copies; consumers must not depend on table identity or mutate DB state through callback payloads.
+- Every registration/ticker has one owner and one terminal cleanup path.
+- Doctor scopes are released by exact token.
+- Safe, internal, CPU and memory wrappers preserve the complete return tuple, including nil positions.
+- A failed or throttled store is not reported as captured.
+- BugGrabber attaches at the current counters by default; historical replay is opt-in.
 
 ## Change routing
 
-- Persistence/schema/trimming: `Core/DB.lua`.
-- Initial ownership policy: `Capture/Policy.lua`.
-- Handler construction/ownership state: `Capture/Engine.lua`.
-- Current intake, manual reclaim and fallback selection: `Capture/Safety.lua`.
-- BugGrabber counters/history: `Capture/BugGrabber.lua`.
-- Public wrappers: `Core/CallSafety.lua`, `Integration/API.lua`, `Integration/LibStub.lua`.
-- Callback semantics: `Integration/Callbacks.lua`.
-- Context lifecycle: `Doctor/Doctor.lua`, `Core/Internal.lua`.
-- Performance wrappers: `Perf/CPU.lua`, `Perf/Mem.lua`; preserve the complete return tuple and keep telemetry best-effort.
-- Export format/budgets: `Export/*`.
-- Display only: `UI/*`.
+- schema/defaults/trimming: `Core/DB.lua`
+- public wrappers: `Core/CallSafety.lua`, `Integration/API.lua`, `Integration/LibStub.lua`
+- diagnostic copy/encoding: `Util/BoundedCopy.lua`, `Util/JSON.lua`
+- handler ownership: `Capture/Policy.lua`, `Capture/Engine.lua`
+- intake/fallback: `Capture/Safety.lua`, `Capture/BugGrabber.lua`, `Capture/Reported.lua`, `Capture/Taint.lua`, `Capture/Warnings.lua`
+- callback semantics: `Integration/Callbacks.lua`
+- UI only: `UI/*`
+
+Do not add another generic framework, owner, event bus or compatibility layer when one of these files already owns the concern.
 
 ## Verification
-
-Offline:
 
 ```sh
 ./tests/run.sh
@@ -81,11 +78,11 @@ find Core Capture Doctor Integration Perf Util UI Export -name '*.lua' -print0 |
 
 Required client matrix:
 
-- RothDevLib only: login/reload, hard/suppressed/report/warning/taint paths.
-- RothDevLib + BugGrabber/BugSack: no duplicate import or ownership churn.
-- Replace the handler after login: no automatic reclaim; fallback/unavailable state is accurate.
-- Explicit `/rdev reclaim`: one bounded user-requested attempt.
-- Combat and restriction transitions: zero RothDevLib-caused blocked/forbidden actions.
-- Stress/reload/export/DB persistence and SavedVariables inspection.
+- RothDevLib only: login/reload and hard/suppressed/report/warning/taint paths;
+- RothDevLib + BugGrabber/BugSack: no replay, duplicates or ownership churn;
+- later handler replacement: fallback/unavailable state, no automatic reclaim;
+- explicit `/rdev reclaim`;
+- combat/restriction transitions with zero RothDevLib-caused blocked/forbidden actions;
+- stress, reload loop, bounded export and SavedVariables inspection.
 
 Static review cannot certify client taint, secure execution, frame timing or actual Secret Value behavior. Record exact client build, Interface and addon commit for runtime PASS.

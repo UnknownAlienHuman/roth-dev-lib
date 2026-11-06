@@ -33,12 +33,16 @@ RDL.Capture.StoreEntry = function()
 end
 RDL.Capture.ownsHandler = false
 
-_G.BugGrabberDB = {
-  errors = {
-    { message = 'boom', stack = 'Interface/AddOns/Demo/Core.lua:7', locals = { hidden = secret }, counter = 2 },
-    { message = 'other', stack = 'Interface/AddOns/Demo/Other.lua:9', counter = 1 },
-  },
+local errors = {
+  { message = 'boom', stack = 'Interface/AddOns/Demo/Core.lua:7', locals = { hidden = secret }, counter = 2 },
+  { message = 'other', stack = 'Interface/AddOns/Demo/Other.lua:9', counter = 1 },
 }
+setmetatable(errors, {
+  __len = function() error('foreign __len must not run') end,
+  __pairs = function() error('foreign __pairs must not run') end,
+})
+_G.BugGrabberDB = { errors = errors }
+
 assert(loadfile('Capture/BugGrabber.lua'))()
 local bug = assert(RDL.Capture.BugGrabber)
 assert(bug:IsPresent())
