@@ -1,31 +1,50 @@
 # !RothDevLib
 
-An alpha development-feedback library for World of Warcraft addons. It captures errors and warnings, retains diagnostic context and breadcrumbs, and provides structured exports for triage.
+A bounded diagnostics library and UI for World of Warcraft addon development. It captures hard Lua errors, warnings, restricted-action signals, explicitly reported failures, execution context, breadcrumbs and lightweight performance metrics.
+
+## Compatibility
+
+- Retail target: **12.1.5**
+- Interface: **120105**
+- Version: **1.0.0-alpha.20.0**
+- Saved variables: `RothDevLibDB`
+
+The implementation is aligned with Blizzard UI source build **12.1.5 (70783)**. Static Lua tests pass; the in-game validation matrix remains required before release.
 
 ## Installation
 
-Copy the `!RothDevLib` directory into `World of Warcraft/_retail_/Interface/AddOns/`, then restart the client or use `/reload`. The TOC vendors its LibStub, callback, data-broker, and minimap-button libraries.
+Copy the `!RothDevLib` directory into `World of Warcraft/_retail_/Interface/AddOns/`, then restart the client or run `/reload`.
 
-## Compatibility and data
+Open the UI with `/rdev`, the addon-compartment entry, or the minimap launcher.
 
-- Interface: `120001`, `120005`
-- Version: `1.0.0-alpha.19.0`
-- Saved variables: `RothDevLibDB`
+## Integration
 
-## Usage
+Add this optional dependency:
 
-The addon exposes a main diagnostic UI, slash-command tooling under `/rdev`, an addon-compartment entry, and a minimap launcher. Its integration API and examples are documented in [docs/INTEGRATION.md](docs/INTEGRATION.md).
+```toc
+## OptionalDeps: !RothDevLib
+```
 
-## Development status
+Then acquire a scoped client:
 
-Alpha. The implementation roadmap is complete through the release-gate tooling; the remaining work is to run the in-game matrix (standalone and BugGrabber, combat, stress flood, and reload loops) and confirm zero self-taint blocked/forbidden events. See [todo.md](todo.md).
+```lua
+local Dev = LibStub and LibStub("RothDevLib-1.0", true)
+local dev = Dev and Dev:NewAddon("MyAddon")
+```
 
-## Developer documentation
+See [docs/INTEGRATION.md](docs/INTEGRATION.md) and [docs/INTEGRATION_RU.md](docs/INTEGRATION_RU.md).
 
-- [Architecture](ARCHITECTURE.md)
-- [Code index](CODE_INDEX.md)
-- [Code graph](CODE_GRAPH.md)
+## Safety model
+
+- External diagnostic values cross a bounded ordinary-value boundary before persistence or callbacks.
+- Secret/inaccessible values become explicit markers; foreign tables are copied, not retained by reference.
+- Blizzard UI is observed or post-hooked. RothDevLib does not replace Blizzard frame methods, mutate popup definitions, or unregister events owned by other frames.
+- Exports, breadcrumb rings, strings and table traversal are bounded.
+
+## Validation
+
+Offline checks live in `tests/`. Runtime gates are `/rdev gate`, `/rdev stress`, `/rdev reloadloop`, and the matrix in [todo.md](todo.md).
 
 ## License
 
-Licensed under the [MIT License](LICENSE). Bundled third-party components remain under their own notices.
+MIT. Bundled third-party libraries retain their own notices.

@@ -1,8 +1,8 @@
-## Interface: 120001, 120005
+## Interface: 120105
 ## Title: !RothDevLib
-## Notes: LLM-oriented feedback bus for WoW addon development. Error capture + Doctor context + breadcrumbs + structured export.
+## Notes: Bounded diagnostics for WoW addon development: error capture, context, breadcrumbs, profiling and structured export.
 ## Author: Neomorph
-## Version: 1.0.0-alpha.19.0
+## Version: 1.0.0-alpha.20.0
 ## SavedVariables: RothDevLibDB
 
 ## AddonCompartmentFunc: RothDevLib_OnAddonCompartmentClick
@@ -19,37 +19,39 @@ libs\LibDBIcon-1.0\lib.xml
 
 # Core
 Core\Core.lua
+Core\Version.lua
 Core\DB.lua
 Core\Internal.lua
 
-# Util
+# Ordinary-value boundary and utilities
+Util\SecretGuard.lua
 Util\Util.lua
 Util\JSON.lua
 Util\Logger.lua
-Util\SecretGuard.lua
 
-# Export (Phase 4)
+# Export
 Export\Export.lua
 Export\Packer.lua
 
-# Perf (Phase 3)
+# Profiling
 Perf\CPU.lua
 Perf\Mem.lua
 
-# Doctor (before Capture for correlation)
+# Correlation context
 Doctor\Doctor.lua
 Doctor\Breadcrumbs.lua
 Doctor\Validation.lua
 
-# Integration Bus (before Capture for breadcrumbs in errors)
+# Integration bus
 Integration\Callbacks.lua
 Integration\Bus.lua
 Integration\API.lua
 Integration\LibStub.lua
 
-# Capture (ASAP)
+# Capture
 Capture\Locals.lua
 Capture\ErrorHandler.lua
+Capture\Safety.lua
 Capture\BugGrabber.lua
 Capture\Reported.lua
 Capture\ChatTap.lua
@@ -74,5 +76,5 @@ UI\MinimapButton.lua
 UI\AddonCompartment.lua
 UI\Slash.lua
 
-# Events / Init (last)
+# Events / init (last)
 Core\Events.lua

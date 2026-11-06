@@ -1,19 +1,17 @@
 -- !RothDevLib/Core/Core.lua
--- Global namespace + public API surface.
--- Merged from !RothGrabber/Core.lua + RothDevLib/Bootstrap.lua.
--- Single addon: ! prefix ensures earliest load order.
+-- Namespace, guarded public call wrappers, and lightweight integrity checks.
 
-local ADDON, ns = ...
+local ADDON = ...
 
 _G.RothDevLib = _G.RothDevLib or {}
 local RDL = _G.RothDevLib
 
 RDL.name = "RothDevLib"
-RDL.addonName = ADDON  -- "!RothDevLib"
-RDL.version = "1.0.0-alpha.19.0"
+RDL.addonName = ADDON
+RDL.version = "1.0.0-alpha.20.0"
 RDL._initialized = false
 
--- Module slots (populated by other files)
+-- Module slots populated by later TOC entries.
 RDL.Util = nil
 RDL.DB = nil
 RDL.Logger = nil
@@ -26,253 +24,240 @@ RDL.SecretGuard = nil
 RDL.Locals = nil
 RDL.UI = RDL.UI or {}
 
--- API fingerprints (guard against accidental override by internal modules)
--- NOTE: These are assigned after the methods are defined further below.
 RDL._apiFingerprint = RDL._apiFingerprint or {}
-
--- Timer baseline fingerprint (used to detect invasive timer hooks by any addon).
 RDL._timerFingerprint = RDL._timerFingerprint or {}
 
-function RDL:Log(level, tag, msg, data)
-  if self.Logger and self.Logger.Log then
-    self.Logger:Log(level, tag, msg, data)
+local Unpack = table.unpack or unpack
+
+local function Pack(...)
+  return { n = select("#", ...), ... }
+end
+
+local function CanAccess(value)
+  local guard = RDL.SecretGuard
+  if guard and type(guard.CanAccess) == "function" then
+    local ok, accessible = pcall(guard.CanAccess, guard, value)
+    if not ok or not accessible then return false end
+  elseif type(_G.canaccessvalue) == "function" then
+    local ok, accessible = pcall(_G.canaccessvalue, value)
+    if not ok or not accessible then return false end
+  end
+
+  if guard and type(guard.IsSecret) == "function" then
+    local ok, secret = pcall(guard.IsSecret, guard, value)
+    if not ok or secret then return false end
+  elseif type(_G.issecretvalue) == "function" then
+    local ok, secret = pcall(_G.issecretvalue, value)
+    if not ok or secret then return false end
+  end
+
+  return true
+end
+
+local function IsCallable(value)
+  if not CanAccess(value) then return false end
+  return type(value) == "function"
+end
+
+local function SafeText(value, fallback, maxBytes)
+  fallback = fallback or "<?>"
+  maxBytes = tonumber(maxBytes) or 256
+
+  if not CanAccess(value) then return "<inaccessible>" end
+  if value == nil then return fallback end
+
+  local util = RDL.Util
+  if util and type(util.SafeToString) == "function" then
+    local ok, text = pcall(util.SafeToString, util, value)
+    if ok and type(text) == "string" then
+      if #text > maxBytes then text = text:sub(1, maxBytes) end
+      return text
+    end
+  end
+
+  if type(value) ~= "string" then return fallback end
+  if #value > maxBytes then return value:sub(1, maxBytes) end
+  return value
+end
+
+local function SafeContext(value)
+  if not CanAccess(value) then return "<inaccessible>" end
+  if value == nil then return nil end
+
+  local util = RDL.Util
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, {
+      maxDepth = 4,
+      maxEntries = 80,
+      maxStringBytes = 4096,
+    })
+    if ok then return copy end
+  end
+
+  local kind = type(value)
+  if kind == "string" then return SafeText(value, "", 4096) end
+  if kind == "number" or kind == "boolean" or kind == "nil" then return value end
+  return "<" .. kind .. ">"
+end
+
+local function SafeDebugStack(level)
+  if type(_G.debugstack) ~= "function" then return "" end
+  local ok, stack = pcall(_G.debugstack, level or 2, 40, 40)
+  if ok and type(stack) == "string" then return stack end
+  return ""
+end
+
+local function EnterDoctor(addonName, funcName, ctx)
+  local doctor = RDL.Doctor
+  if doctor and type(doctor.Enter) == "function" then
+    pcall(doctor.Enter, doctor, addonName, funcName, SafeContext(ctx))
   end
 end
 
--- SafeCall: xpcall wrapper that captures suppressed errors WITH locals.
--- Doctor context correlation is included.
+local function LeaveDoctor()
+  local doctor = RDL.Doctor
+  if doctor and type(doctor.Leave) == "function" then
+    pcall(doctor.Leave, doctor)
+  end
+end
+
+local function CaptureLocals(addonName, stack)
+  local locals, meta
+  if RDL.Locals and type(RDL.Locals.CaptureBest) == "function" then
+    local ok, captured, capturedMeta = pcall(RDL.Locals.CaptureBest, RDL.Locals, {
+      addon = addonName,
+      stack = stack,
+      baseLevel = 2,
+    })
+    if ok then
+      locals = captured
+      meta = capturedMeta
+    end
+  elseif type(_G.debuglocals) == "function" then
+    local ok, captured = pcall(_G.debuglocals, 2)
+    if ok and captured and RDL.Util and type(RDL.Util.FilterLocals) == "function" then
+      local maxBytes = 8192
+      if RDL.DB and type(RDL.DB.GetSettings) == "function" then
+        local okSettings, settings = pcall(RDL.DB.GetSettings, RDL.DB)
+        if okSettings and type(settings) == "table" then
+          maxBytes = tonumber(settings.maxLocalsSize) or maxBytes
+        end
+      end
+      local okFilter, filtered = pcall(RDL.Util.FilterLocals, RDL.Util, captured, maxBytes)
+      if okFilter then locals = filtered end
+    end
+  end
+  return locals, meta
+end
+
+local function ReportSuppressed(err, stack, locals, addonName, funcName, meta)
+  local capture = RDL.Capture
+  if capture and type(capture.OnSuppressedError) == "function" then
+    pcall(capture.OnSuppressedError, capture, SafeText(err, "<error>", 4096), stack, locals, addonName, funcName, {
+      localsProbe = SafeContext(meta),
+    })
+  end
+end
+
+local function NormalizeIdentity(addonName, funcName)
+  return SafeText(addonName, "<?>", 128), SafeText(funcName, "<?>", 256)
+end
+
+local function RunProtected(addonName, funcName, ctx, fn, ...)
+  if not IsCallable(fn) then return nil end
+  addonName, funcName = NormalizeIdentity(addonName, funcName)
+  EnterDoctor(addonName, funcName, ctx)
+
+  local function ErrHandler(err)
+    local stack = SafeDebugStack(3)
+    local locals, meta = CaptureLocals(addonName, stack)
+    ReportSuppressed(err, stack, locals, addonName, funcName, meta)
+    return err
+  end
+
+  local result
+  local cpu = RDL.CPU
+  if cpu and type(cpu.Measure) == "function" then
+    result = Pack(cpu:Measure(addonName, funcName, function(...)
+      return xpcall(fn, ErrHandler, ...)
+    end, nil, ...))
+  else
+    result = Pack(xpcall(fn, ErrHandler, ...))
+  end
+
+  LeaveDoctor()
+  if result[1] then
+    return Unpack(result, 2, result.n)
+  end
+  return nil
+end
+
+function RDL:Log(level, tag, message, data)
+  local logger = self.Logger
+  if not (logger and type(logger.Log) == "function") then return false end
+  local ok = pcall(
+    logger.Log,
+    logger,
+    SafeText(level, "INFO", 32),
+    SafeText(tag, "LOG", 64),
+    SafeText(message, "", 4096),
+    SafeContext(data)
+  )
+  return ok
+end
+
 function RDL:SafeCall(addonName, funcName, fn, ...)
-  if type(fn) ~= "function" then return end
-  if self.Doctor and self.Doctor.Enter then
-    self.Doctor:Enter(addonName, funcName, { note = "SafeCall" })
-  end
-
-  local function ErrHandler(err)
-    local stack = debugstack(2, 40, 40)
-    local locals, lmeta = nil, nil
-
-    if self.Locals and self.Locals.CaptureBest then
-      local ok2, l, m = pcall(function()
-        return self.Locals:CaptureBest({ addon = addonName, stack = stack, baseLevel = 2 })
-      end)
-      if ok2 then locals, lmeta = l, m end
-    else
-      local lok, lval = pcall(debuglocals, 2)
-      if lok and lval and self.Util and self.Util.FilterLocals then
-        local settings = self.DB and self.DB.GetSettings and self.DB:GetSettings() or nil
-        locals = self.Util:FilterLocals(lval, (settings and settings.maxLocalsSize) or 8192)
-      end
-    end
-
-    if self.Capture and self.Capture.OnSuppressedError then
-      self.Capture:OnSuppressedError(err, stack, locals, addonName, funcName, { localsProbe = lmeta })
-    end
-    return err
-  end
-
-  local cpu = self.CPU
-  local ok, r1, r2, r3, r4, r5
-  if cpu and cpu.Measure then
-    ok, r1, r2, r3, r4, r5 = cpu:Measure(addonName, funcName, function(...)
-      return xpcall(fn, ErrHandler, ...)
-    end, nil, ...)
-  else
-    ok, r1, r2, r3, r4, r5 = xpcall(fn, ErrHandler, ...)
-  end
-
-  if self.Doctor and self.Doctor.Leave then
-    self.Doctor:Leave()
-  end
-
-  if ok then
-    return r1, r2, r3, r4, r5
-  end
-  return nil
+  return RunProtected(addonName, funcName, { note = "SafeCall" }, fn, ...)
 end
--- SafeCallCtx: like SafeCall, but lets the caller provide Doctor context for this invocation.
--- This is the safest way to attach dynamic context without manual Enter/Leave bookkeeping.
+
 function RDL:SafeCallCtx(addonName, funcName, ctx, fn, ...)
-  if type(fn) ~= "function" then return end
-
-  if self.Doctor and self.Doctor.Enter then
-    self.Doctor:Enter(addonName, funcName, ctx)
-  end
-
-  local function ErrHandler(err)
-    local stack = debugstack(2, 40, 40)
-    local locals, lmeta = nil, nil
-
-    if self.Locals and self.Locals.CaptureBest then
-      local ok2, l, m = pcall(function()
-        return self.Locals:CaptureBest({ addon = addonName, stack = stack, baseLevel = 2 })
-      end)
-      if ok2 then locals, lmeta = l, m end
-    else
-      local lok, lval = pcall(debuglocals, 2)
-      if lok and lval and self.Util and self.Util.FilterLocals then
-        local settings = self.DB and self.DB.GetSettings and self.DB:GetSettings() or nil
-        locals = self.Util:FilterLocals(lval, (settings and settings.maxLocalsSize) or 8192)
-      end
-    end
-
-    if self.Capture and self.Capture.OnSuppressedError then
-      self.Capture:OnSuppressedError(err, stack, locals, addonName, funcName, { localsProbe = lmeta })
-    end
-    return err
-  end
-
-  local cpu = self.CPU
-  local ok, r1, r2, r3, r4, r5
-  if cpu and cpu.Measure then
-    ok, r1, r2, r3, r4, r5 = cpu:Measure(addonName, funcName, function(...)
-      return xpcall(fn, ErrHandler, ...)
-    end, nil, ...)
-  else
-    ok, r1, r2, r3, r4, r5 = xpcall(fn, ErrHandler, ...)
-  end
-
-  if self.Doctor and self.Doctor.Leave then
-    self.Doctor:Leave()
-  end
-
-  if ok then
-    return r1, r2, r3, r4, r5
-  end
-  return nil
+  return RunProtected(addonName, funcName, ctx, fn, ...)
 end
 
-
-
--- WrapUnsafe: keeps hard errors hard, but adds Doctor context for correlation.
 function RDL:WrapUnsafe(addonName, funcName, fn, ctxFn)
+  if not IsCallable(fn) then return nil end
+  addonName, funcName = NormalizeIdentity(addonName, funcName)
+  if not IsCallable(ctxFn) then ctxFn = nil end
+
   return function(...)
-    if self.Doctor and self.Doctor.Enter then
-      local ctx = nil
-      if type(ctxFn) == "function" then
-        local ok2, c = pcall(ctxFn, ...)
-        if ok2 then ctx = c end
-      end
-      self.Doctor:Enter(addonName, funcName, ctx)
+    local ctx
+    if ctxFn then
+      local ok, value = pcall(ctxFn, ...)
+      if ok then ctx = value end
     end
+    EnterDoctor(addonName, funcName, ctx)
 
+    -- Deliberately do not catch target errors. The global error handler consumes
+    -- the Doctor context and resets it after capture.
     local r1, r2, r3, r4, r5 = fn(...)
-
-    if self.Doctor and self.Doctor.Leave then
-      self.Doctor:Leave()
-    end
+    LeaveDoctor()
     return r1, r2, r3, r4, r5
   end
 end
 
--- WrapSafe: converts hard errors into suppressed entries WITH locals.
 function RDL:WrapSafe(addonName, funcName, fn, staticCtx)
+  if not IsCallable(fn) then return nil end
+  addonName, funcName = NormalizeIdentity(addonName, funcName)
+  local ctx = SafeContext(staticCtx)
   return function(...)
-    if self.Doctor and self.Doctor.Enter then
-      self.Doctor:Enter(addonName, funcName, staticCtx)
-    end
-
-    local function ErrHandler(err)
-      local stack = debugstack(2, 40, 40)
-      local locals, lmeta = nil, nil
-
-      if self.Locals and self.Locals.CaptureBest then
-        local ok2, l, m = pcall(function()
-          return self.Locals:CaptureBest({ addon = addonName, stack = stack, baseLevel = 2 })
-        end)
-        if ok2 then locals, lmeta = l, m end
-      else
-        local lok, lval = pcall(debuglocals, 2)
-        if lok and lval and self.Util and self.Util.FilterLocals then
-          local settings = self.DB and self.DB.GetSettings and self.DB:GetSettings() or nil
-          locals = self.Util:FilterLocals(lval, (settings and settings.maxLocalsSize) or 8192)
-        end
-      end
-
-      if self.Capture and self.Capture.OnSuppressedError then
-        self.Capture:OnSuppressedError(err, stack, locals, addonName, funcName, { localsProbe = lmeta })
-      end
-      return err
-    end
-
-    local cpu = self.CPU
-    local ok, r1, r2, r3, r4, r5
-    if cpu and cpu.Measure then
-      ok, r1, r2, r3, r4, r5 = cpu:Measure(addonName, funcName, function(...)
-        return xpcall(fn, ErrHandler, ...)
-      end, nil, ...)
-    else
-      ok, r1, r2, r3, r4, r5 = xpcall(fn, ErrHandler, ...)
-    end
-
-    if self.Doctor and self.Doctor.Leave then
-      self.Doctor:Leave()
-    end
-
-    if ok then
-      return r1, r2, r3, r4, r5
-    end
-    return nil
+    return RunProtected(addonName, funcName, ctx, fn, ...)
   end
 end
 
-
--- WrapSafeCtx: like WrapSafe, but computes Doctor context per call.
--- ctxFn receives the same arguments as the wrapped function.
 function RDL:WrapSafeCtx(addonName, funcName, fn, ctxFn)
+  if not IsCallable(fn) then return nil end
+  addonName, funcName = NormalizeIdentity(addonName, funcName)
+  if not IsCallable(ctxFn) then ctxFn = nil end
+
   return function(...)
-    if self.Doctor and self.Doctor.Enter then
-      local ctx = nil
-      if type(ctxFn) == "function" then
-        local ok2, c = pcall(ctxFn, ...)
-        if ok2 then ctx = c end
-      end
-      self.Doctor:Enter(addonName, funcName, ctx)
+    local ctx
+    if ctxFn then
+      local ok, value = pcall(ctxFn, ...)
+      if ok then ctx = value end
     end
-
-    local function ErrHandler(err)
-      local stack = debugstack(2, 40, 40)
-      local locals, lmeta = nil, nil
-
-      if self.Locals and self.Locals.CaptureBest then
-        local ok2, l, m = pcall(function()
-          return self.Locals:CaptureBest({ addon = addonName, stack = stack, baseLevel = 2 })
-        end)
-        if ok2 then locals, lmeta = l, m end
-      else
-        local lok, lval = pcall(debuglocals, 2)
-        if lok and lval and self.Util and self.Util.FilterLocals then
-          local settings = self.DB and self.DB.GetSettings and self.DB:GetSettings() or nil
-          locals = self.Util:FilterLocals(lval, (settings and settings.maxLocalsSize) or 8192)
-        end
-      end
-
-      if self.Capture and self.Capture.OnSuppressedError then
-        self.Capture:OnSuppressedError(err, stack, locals, addonName, funcName, { localsProbe = lmeta })
-      end
-      return err
-    end
-
-    local cpu = self.CPU
-    local ok, r1, r2, r3, r4, r5
-    if cpu and cpu.Measure then
-      ok, r1, r2, r3, r4, r5 = cpu:Measure(addonName, funcName, function(...)
-        return xpcall(fn, ErrHandler, ...)
-      end, nil, ...)
-    else
-      ok, r1, r2, r3, r4, r5 = xpcall(fn, ErrHandler, ...)
-    end
-
-    if self.Doctor and self.Doctor.Leave then
-      self.Doctor:Leave()
-    end
-
-    if ok then
-      return r1, r2, r3, r4, r5
-    end
-    return nil
+    return RunProtected(addonName, funcName, ctx, fn, ...)
   end
 end
-
 
 -- -----------------------------------------------------------------------------
 -- Self-checks (correctness / taint risk)
@@ -293,55 +278,48 @@ local function FnInfo(fn)
   }
 end
 
--- Capture baseline references for later comparison.
 function RDL:_InitFingerprints()
   if self._apiFingerprint and self._apiFingerprint._init then return end
   self._apiFingerprint = self._apiFingerprint or {}
   self._apiFingerprint._init = true
-
-  -- Public API methods that must not be overwritten by internal modules.
   self._apiFingerprint.SafeCall = self.SafeCall
   self._apiFingerprint.SafeCallCtx = self.SafeCallCtx
   self._apiFingerprint.WrapSafe = self.WrapSafe
   self._apiFingerprint.WrapSafeCtx = self.WrapSafeCtx
   self._apiFingerprint.WrapUnsafe = self.WrapUnsafe
 
-  -- Timer baselines (used to detect invasive C_Timer monkey-patching by any addon).
   self._timerFingerprint = self._timerFingerprint or {}
-  local CT = _G.C_Timer
-  self._timerFingerprint.atLoad = time()
-  self._timerFingerprint.After = CT and CT.After or nil
-  self._timerFingerprint.NewTicker = CT and CT.NewTicker or nil
-  self._timerFingerprint.NewTimer = CT and CT.NewTimer or nil
-  self._timerFingerprint.AfterInfo = FnInfo(CT and CT.After)
-  self._timerFingerprint.NewTickerInfo = FnInfo(CT and CT.NewTicker)
-  self._timerFingerprint.NewTimerInfo = FnInfo(CT and CT.NewTimer)
+  local timers = _G.C_Timer
+  self._timerFingerprint.atLoad = type(_G.time) == "function" and _G.time() or 0
+  self._timerFingerprint.After = timers and timers.After or nil
+  self._timerFingerprint.NewTicker = timers and timers.NewTicker or nil
+  self._timerFingerprint.NewTimer = timers and timers.NewTimer or nil
+  self._timerFingerprint.AfterInfo = FnInfo(timers and timers.After)
+  self._timerFingerprint.NewTickerInfo = FnInfo(timers and timers.NewTicker)
+  self._timerFingerprint.NewTimerInfo = FnInfo(timers and timers.NewTimer)
 end
 
 local function EmitAlert(code, message, data)
-  -- Prefer storing as an ALERT entry so it shows up in UI/exports.
-  if RDL and RDL.Capture and RDL.Capture.OnIntegrationEvent then
+  if RDL.Capture and type(RDL.Capture.OnIntegrationEvent) == "function" then
     pcall(RDL.Capture.OnIntegrationEvent, RDL.Capture, "ALERT", RDL.addonName or "RothDevLib", code, message, data, "WARN")
-    return
-  end
-  if RDL and RDL.Log then
-    RDL:Log("WARN", "ALERT", tostring(message), { code = code, data = data })
+  elseif RDL.Log then
+    RDL:Log("WARN", "ALERT", message, { code = code, data = data })
   end
 end
 
--- Run lightweight invariants. Call after Capture.EarlyInit so ALERT can be stored.
 function RDL:SelfCheckEarly(stage)
   self:_InitFingerprints()
-  stage = tostring(stage or "early")
+  stage = SafeText(stage, "early", 64)
 
-  -- API override detection
   local api = self._apiFingerprint or {}
   local function CheckAPI(name)
     if api[name] and self[name] ~= api[name] then
+      local expected = FnInfo(api[name])
+      local actual = FnInfo(self[name])
       EmitAlert("API_OVERRIDDEN", "Public API method was overwritten: " .. name, {
         stage = stage,
-        expected = tostring(FnInfo(api[name]) and FnInfo(api[name]).short_src or "?"),
-        actual = tostring(FnInfo(self[name]) and FnInfo(self[name]).short_src or "?"),
+        expected = expected and expected.short_src or "?",
+        actual = actual and actual.short_src or "?",
       })
     end
   end
@@ -351,43 +329,39 @@ function RDL:SelfCheckEarly(stage)
   CheckAPI("WrapSafeCtx")
   CheckAPI("WrapUnsafe")
 
-  -- Timer monkey-patch detection
-  local CT = _G.C_Timer
-  local tf = self._timerFingerprint or {}
-  if CT and type(CT) == "table" then
-    if tf.After and CT.After ~= tf.After then
+  local timers = _G.C_Timer
+  local baseline = self._timerFingerprint or {}
+  if timers and type(timers) == "table" then
+    if baseline.After and timers.After ~= baseline.After then
       EmitAlert("C_TIMER_AFTER_HOOKED", "C_Timer.After was replaced after load (taint risk)", {
         stage = stage,
-        baseline = tf.AfterInfo,
-        now = FnInfo(CT.After),
+        baseline = baseline.AfterInfo,
+        now = FnInfo(timers.After),
       })
     end
-    if tf.NewTicker and CT.NewTicker ~= tf.NewTicker then
+    if baseline.NewTicker and timers.NewTicker ~= baseline.NewTicker then
       EmitAlert("C_TIMER_NEWTICKER_HOOKED", "C_Timer.NewTicker was replaced after load (taint risk)", {
         stage = stage,
-        baseline = tf.NewTickerInfo,
-        now = FnInfo(CT.NewTicker),
+        baseline = baseline.NewTickerInfo,
+        now = FnInfo(timers.NewTicker),
       })
     end
-    if tf.NewTimer and CT.NewTimer ~= tf.NewTimer then
+    if baseline.NewTimer and timers.NewTimer ~= baseline.NewTimer then
       EmitAlert("C_TIMER_NEWTIMER_HOOKED", "C_Timer.NewTimer was replaced after load (taint risk)", {
         stage = stage,
-        baseline = tf.NewTimerInfo,
-        now = FnInfo(CT.NewTimer),
+        baseline = baseline.NewTimerInfo,
+        now = FnInfo(timers.NewTimer),
       })
     end
 
-    -- Heuristic: Blizzard timer functions are typically C-side; warn if they look Lua.
-    local ai = FnInfo(CT.After)
-    if ai and ai.what == "Lua" then
+    local afterInfo = FnInfo(timers.After)
+    if afterInfo and afterInfo.what == "Lua" then
       EmitAlert("C_TIMER_AFTER_LUA", "C_Timer.After appears to be a Lua function (likely hooked)", {
         stage = stage,
-        now = ai,
+        now = afterInfo,
       })
     end
   end
 end
 
-
--- Initialize fingerprints at file load.
 RDL:_InitFingerprints()

@@ -1,12 +1,5 @@
 -- !RothDevLib/UI/Menu.lua
--- Wrapper for Blizzard_Menu dropdown/menu system (11.0+).
--- Goal: keep UI modules free of version checks and reduce risk of UIDropDownMenu taint.
---
--- Primary public helpers:
---   * Menu:EnsureLoaded()
---   * Menu:SupportsWowStyleDropdown()
---   * Menu:CreateFilterDropdown(parent, name, width, defaultText[, template])
---   * Menu:SafeGenerate(dropdown)
+-- Narrow wrapper around Blizzard_Menu dropdown APIs used by the UI.
 
 local RDL = _G.RothDevLib
 if not RDL then return end
@@ -18,38 +11,39 @@ local Menu = {}
 UI.Menu = Menu
 
 local function SafeCall(fn, ...)
-  local ok, err = pcall(fn, ...)
-  return ok, err
+  if type(fn) ~= "function" then return false, nil end
+  return pcall(fn, ...)
+end
+
+local function HasMenuAPI()
+  return type(_G.MenuUtil) == "table"
+    and type(MenuUtil.CreateContextMenu) == "function"
 end
 
 function Menu:EnsureLoaded()
-  if self._ensureAttempted then
-    return (MenuUtil and MenuUtil.CreateContextMenu) and true or false
-  end
-  self._ensureAttempted = true
+  if HasMenuAPI() then return true end
 
-  -- Blizzard_Menu is load-on-demand on some builds.
-  if not (MenuUtil and MenuUtil.CreateContextMenu) then
-    if type(UIParentLoadAddOn) == "function" then
-      SafeCall(UIParentLoadAddOn, "Blizzard_Menu")
+  if not self._loadAttempted then
+    self._loadAttempted = true
+    local addons = _G.C_AddOns
+    if type(addons) == "table" and type(addons.LoadAddOn) == "function" then
+      SafeCall(addons.LoadAddOn, "Blizzard_Menu")
     end
   end
 
-  return (MenuUtil and MenuUtil.CreateContextMenu) and true or false
+  return HasMenuAPI()
 end
 
 function Menu:SupportsWowStyleDropdown()
   if self._supportsWowStyle ~= nil then return self._supportsWowStyle end
-  self:EnsureLoaded()
-
-  if type(CreateFrame) ~= "function" then
+  if not self:EnsureLoaded() or type(_G.CreateFrame) ~= "function" then
     self._supportsWowStyle = false
     return false
   end
 
-  local ok, dd = SafeCall(CreateFrame, "DropdownButton", nil, UIParent, "WowStyle1FilterDropdownTemplate")
-  if ok and dd then
-    dd:Hide()
+  local ok, probe = SafeCall(CreateFrame, "DropdownButton", nil, UIParent, "WowStyle1FilterDropdownTemplate")
+  if ok and probe then
+    probe:Hide()
     self._supportsWowStyle = true
   else
     self._supportsWowStyle = false
@@ -58,36 +52,58 @@ function Menu:SupportsWowStyleDropdown()
   return self._supportsWowStyle
 end
 
+local function SetDefaultText(dropdown, value)
+  local U = RDL.Util
+  local ordinary = value
+  if U and U.Scrub then
+    local ok, scrubbed = pcall(U.Scrub, U, value)
+    if ok then ordinary = scrubbed else ordinary = "<unavailable>" end
+  end
+  if ordinary == nil then return end
+
+  local text = "<unavailable>"
+  if U and U.SafeToString then
+    local ok, rendered = pcall(U.SafeToString, U, ordinary)
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(ordinary) == "string" then
+    text = ordinary
+  end
+
+  if dropdown.SetDefaultText then
+    SafeCall(dropdown.SetDefaultText, dropdown, text)
+  elseif dropdown.SetText then
+    SafeCall(dropdown.SetText, dropdown, text)
+  elseif dropdown.Text and dropdown.Text.SetText then
+    SafeCall(dropdown.Text.SetText, dropdown.Text, text)
+  elseif dropdown.ButtonText and dropdown.ButtonText.SetText then
+    SafeCall(dropdown.ButtonText.SetText, dropdown.ButtonText, text)
+  end
+end
+
 function Menu:CreateFilterDropdown(parent, name, width, defaultText, template)
   if not self:SupportsWowStyleDropdown() then return nil end
   template = template or "WowStyle1FilterDropdownTemplate"
 
-  local ok, dd = SafeCall(CreateFrame, "DropdownButton", name, parent, template)
-  if not (ok and dd) then return nil end
+  local ok, dropdown = SafeCall(CreateFrame, "DropdownButton", name, parent, template)
+  if not ok or not dropdown then return nil end
 
-  if width and dd.SetWidth then
-    SafeCall(dd.SetWidth, dd, tonumber(width) or width)
-  end
-
-  if defaultText then
-    local t = tostring(defaultText)
-    if dd.SetDefaultText then
-      SafeCall(dd.SetDefaultText, dd, t)
-    elseif dd.SetText then
-      SafeCall(dd.SetText, dd, t)
-    elseif dd.Text and dd.Text.SetText then
-      SafeCall(dd.Text.SetText, dd.Text, t)
-    elseif dd.ButtonText and dd.ButtonText.SetText then
-      SafeCall(dd.ButtonText.SetText, dd.ButtonText, t)
+  if dropdown.SetWidth then
+    local widthValue = width
+    local U = RDL.Util
+    if U and U.Scrub then
+      local ok, scrubbed = pcall(U.Scrub, U, width)
+      if ok then widthValue = scrubbed else widthValue = nil end
     end
+    local numericWidth = tonumber(widthValue)
+    if numericWidth then SafeCall(dropdown.SetWidth, dropdown, numericWidth) end
   end
 
-  return dd
+  SetDefaultText(dropdown, defaultText)
+  return dropdown
 end
 
 function Menu:SafeGenerate(dropdown)
-  if not dropdown then return end
-  if type(dropdown.GenerateMenu) == "function" then
+  if dropdown and type(dropdown.GenerateMenu) == "function" then
     SafeCall(dropdown.GenerateMenu, dropdown)
   end
 end

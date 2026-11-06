@@ -1,15 +1,21 @@
 -- !RothDevLib/UI/MinimapButton.lua
--- Minimap icon (BugSack-style entrypoint).
--- Ported from RothDevLib/UI/MinimapButton.lua (no functional changes).
--- Preferred: LibDataBroker-1.1 + LibDBIcon-1.0 (embedded in /libs).
--- Fallback: simple custom minimap button.
+-- Minimap launcher. Prefers LibDataBroker/LibDBIcon, with a bounded manual fallback.
 
 local RDL = _G.RothDevLib
 RDL.UI = RDL.UI or {}
 local UI = RDL.UI
 
--- NOTE: WoW texture paths are safest with backslashes.
 local ICON_PATH = "Interface\\AddOns\\!RothDevLib\\Media\\bug"
+local hookedLDBButtons = setmetatable({}, { __mode = "k" })
+
+local function SafeError(value)
+  local U = RDL.Util
+  if U and type(U.SafeToString) == "function" then
+    local ok, text = pcall(U.SafeToString, U, value)
+    if ok and type(text) == "string" then return text end
+  end
+  return "<error>"
+end
 
 local function GetActiveIssueCount()
   if RDL.DB and RDL.DB.GetActiveGroupCount then
@@ -23,117 +29,124 @@ end
 
 local function GetIconColor(activeIssues)
   if (tonumber(activeIssues) or 0) > 0 then
-    -- "Bug is red" state.
     return 1, 0.20, 0.20
   end
   return 1, 1, 1
 end
 
-
-local function FormatCount(n)
-  n = tonumber(n) or 0
-  if n <= 0 then return "" end
-  if n >= 100 then return "99+" end
-  return tostring(n)
+local function FormatCount(value)
+  local count = tonumber(value) or 0
+  if count <= 0 then return "" end
+  if count >= 100 then return "99+" end
+  return tostring(count)
 end
 
-local function EnsureCountText(btn)
-  if not btn or btn.countText then return end
-  local fs = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
-  fs:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -2, 2)
-  fs:SetJustifyH("RIGHT")
-  fs:SetJustifyV("BOTTOM")
-  fs:SetText("")
-  fs:SetTextColor(1, 1, 1)
-  fs:SetShadowOffset(1, -1)
-  fs:SetShadowColor(0, 0, 0, 1)
-  btn.countText = fs
+local function EnsureCountText(button)
+  if not button or button.countText then return end
+  local text = button:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
+  text:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -2, 2)
+  text:SetJustifyH("RIGHT")
+  text:SetJustifyV("BOTTOM")
+  text:SetText("")
+  text:SetTextColor(1, 1, 1)
+  text:SetShadowOffset(1, -1)
+  text:SetShadowColor(0, 0, 0, 1)
+  button.countText = text
 end
 
-local function SetCountText(btn, n)
-  if not btn then return end
-  EnsureCountText(btn)
-  if not btn.countText then return end
-  local t = FormatCount(n)
-  btn.countText:SetText(t)
-  if t == "" then
-    btn.countText:Hide()
+local function SetCountText(button, value)
+  if not button then return end
+  EnsureCountText(button)
+  if not button.countText then return end
+
+  local text = FormatCount(value)
+  button.countText:SetText(text)
+  if text == "" then
+    button.countText:Hide()
   else
-    btn.countText:Show()
-    -- red-ish if there are issues, otherwise white (shouldn't show on 0 anyway)
-    btn.countText:SetTextColor(1, 0.3, 0.3)
+    button.countText:Show()
+    button.countText:SetTextColor(1, 0.3, 0.3)
   end
 end
 
+local fallbackSettings = { minimap = { hide = false, minimapPos = 225 } }
+
 local function GetSettings()
-  return (RDL.DB and RDL.DB:GetSettings()) or (_G.RothDevLibDB and _G.RothDevLibDB.settings) or {}
+  local settings = (RDL.DB and RDL.DB:GetSettings())
+    or (_G.RothDevLibDB and _G.RothDevLibDB.settings)
+  if type(settings) ~= "table" then return fallbackSettings end
+  return settings
 end
 
 local function EnsureMinimapSettings()
-  local s = GetSettings()
-  s.minimap = s.minimap or { hide = false, minimapPos = 225 }
+  local settings = GetSettings()
+  if type(settings.minimap) ~= "table" then
+    settings.minimap = { hide = false, minimapPos = 225 }
+  end
 
   if RDL.DB and RDL.DB.GetSettings then
-    local settings = RDL.DB:GetSettings()
-    if settings and settings.minimapForceShowOnNextLogin then
-      s.minimap.hide = false
-      settings.minimapForceShowOnNextLogin = false
+    local dbSettings = RDL.DB:GetSettings()
+    if dbSettings and dbSettings.minimapForceShowOnNextLogin then
+      settings.minimap.hide = false
+      dbSettings.minimapForceShowOnNextLogin = false
     end
   end
 
-  if s.minimap.hide == nil and s.minimapHide ~= nil then
-    s.minimap.hide = s.minimapHide
+  if settings.minimap.hide == nil and settings.minimapHide ~= nil then
+    settings.minimap.hide = settings.minimapHide
   end
-  if s.minimap.minimapPos == nil then
-    s.minimap.minimapPos = s.minimapAngle or 225
+  if settings.minimap.minimapPos == nil then
+    settings.minimap.minimapPos = settings.minimapAngle or 225
   end
 
-  s.minimapHide = (s.minimap.hide == true)
-  s.minimapAngle = s.minimap.minimapPos
-  return s
+  settings.minimapHide = settings.minimap.hide == true
+  settings.minimapAngle = settings.minimap.minimapPos
+  return settings
 end
 
-local function TooltipLines(tt)
-  tt:AddLine("RothDevLib", 1, 1, 1)
-  local n = GetActiveIssueCount()
-  if n > 0 then
-    tt:AddLine(string.format("Active issues: %d", n), 1, 0.3, 0.3)
+local function TooltipLines(tooltip)
+  tooltip:AddLine("RothDevLib", 1, 1, 1)
+  local count = GetActiveIssueCount()
+  if count > 0 then
+    tooltip:AddLine(string.format("Active issues: %d", count), 1, 0.3, 0.3)
   else
-    tt:AddLine("No issues", 0.5, 1, 0.5)
+    tooltip:AddLine("No issues", 0.5, 1, 0.5)
   end
-  tt:AddLine("Left click: open bag", 0.8, 0.8, 0.8)
-  tt:AddLine("Right click: export all", 0.8, 0.8, 0.8)
-  tt:AddLine("Shift+Right: open log", 0.8, 0.8, 0.8)
-  local owned = (RDL.Capture and RDL.Capture.ownsHandler) and "owned" or "not-owned"
-  tt:AddLine("Errorhandler: " .. owned, 0.8, 0.8, 0.8)
+  tooltip:AddLine("Left click: open bag", 0.8, 0.8, 0.8)
+  tooltip:AddLine("Right click: export all", 0.8, 0.8, 0.8)
+  tooltip:AddLine("Shift+Right: open log", 0.8, 0.8, 0.8)
+  local owned = RDL.Capture and RDL.Capture.ownsHandler and "owned" or "not-owned"
+  tooltip:AddLine("Errorhandler: " .. owned, 0.8, 0.8, 0.8)
 end
 
--- Public: set minimap icon color based on current DB state.
-function UI:UpdateMinimapIconState()
-  local n = GetActiveIssueCount()
-  local r, g, b = GetIconColor(n)
+local function GetLDBButton(self)
+  if self and self._ldbIcon and type(self._ldbIcon.GetMinimapButton) == "function" then
+    local ok, button = pcall(self._ldbIcon.GetMinimapButton, self._ldbIcon, "RothDevLib")
+    if ok and button then return button end
+  end
+  return _G.LibDBIcon10_RothDevLib
+end
 
-  -- LDB icon
+function UI:UpdateMinimapIconState()
+  local count = GetActiveIssueCount()
+  local red, green, blue = GetIconColor(count)
+
   if self._ldbInited then
-    local btn = _G["LibDBIcon10_RothDevLib"]
-    if btn and btn.icon then
-      -- Some UI packs / reload paths can lose the texture; force it.
-      btn.icon:SetTexture(ICON_PATH)
-      btn.icon:SetVertexColor(r, g, b)
-      SetCountText(btn, n)
+    local button = GetLDBButton(self)
+    if button and button.icon then
+      button.icon:SetTexture(ICON_PATH)
+      button.icon:SetVertexColor(red, green, blue)
+      SetCountText(button, count)
     end
     if self._ldbObj then
-      -- Store for later button recreation
-      self._ldbObj.iconR, self._ldbObj.iconG, self._ldbObj.iconB = r, g, b
+      self._ldbObj.iconR, self._ldbObj.iconG, self._ldbObj.iconB = red, green, blue
     end
   end
 
-  -- Manual icon
   if self.minimapButton and self.minimapButton.icon then
-    -- Ensure texture stays valid
     self.minimapButton.icon:SetTexture(ICON_PATH)
-    self.minimapButton.icon:SetVertexColor(r, g, b)
-    SetCountText(self.minimapButton, n)
+    self.minimapButton.icon:SetVertexColor(red, green, blue)
+    SetCountText(self.minimapButton, count)
   end
 end
 
@@ -143,7 +156,7 @@ local function InitLDB(self)
 
   local LDB = LibStub("LibDataBroker-1.1", true)
   local LDBIcon = LibStub("LibDBIcon-1.0", true)
-  if not (LDB and LDBIcon) then return false end
+  if not LDB or not LDBIcon then return false end
 
   local settings = EnsureMinimapSettings()
 
@@ -160,13 +173,13 @@ local function InitLDB(self)
         if button == "RightButton" then
           if IsShiftKeyDown() then
             if UI and UI.OpenLog then UI:OpenLog() end
-          else
-            if UI and UI.OpenExportAll then UI:OpenExportAll() end
+          elseif UI and UI.OpenExportAll then
+            UI:OpenExportAll()
           end
         end
       end,
-      OnTooltipShow = function(tt)
-        TooltipLines(tt)
+      OnTooltipShow = function(tooltip)
+        TooltipLines(tooltip)
       end,
     })
   end
@@ -179,15 +192,12 @@ local function InitLDB(self)
   self._ldbIcon = LDBIcon
   self._ldbInited = true
 
-  -- Ensure the button texture exists and stays correct (some reload/UI paths lose it).
-  local btn = _G["LibDBIcon10_RothDevLib"]
-  if btn and not btn._rdlHooked then
-    btn._rdlHooked = true
-    pcall(function()
-      btn:HookScript("OnShow", function()
-        if UI and UI.UpdateMinimapIconState then UI:UpdateMinimapIconState() end
-      end)
+  local button = GetLDBButton(self)
+  if button and not hookedLDBButtons[button] then
+    button:HookScript("OnShow", function()
+      if UI and UI.UpdateMinimapIconState then UI:UpdateMinimapIconState() end
     end)
+    hookedLDBButtons[button] = true
   end
 
   if settings.minimap.hide then
@@ -196,105 +206,121 @@ local function InitLDB(self)
     LDBIcon:Show("RothDevLib")
   end
 
-  -- Apply current state color (0 issues => normal, >0 => red).
   if UI and UI.UpdateMinimapIconState then
-    pcall(function() UI:UpdateMinimapIconState() end)
+    UI:UpdateMinimapIconState()
   end
   return true
 end
 
-local function ClampAngle(a)
-  if type(a) ~= "number" then return 225 end
-  while a < 0 do a = a + 360 end
-  while a >= 360 do a = a - 360 end
-  return a
+local function ClampAngle(value)
+  if type(value) ~= "number" then return 225 end
+  while value < 0 do value = value + 360 end
+  while value >= 360 do value = value - 360 end
+  return value
 end
 
 local function ManualUpdatePosition(self)
-  local b = self.minimapButton
-  if not b or not _G.Minimap then return end
-  local s = EnsureMinimapSettings()
-  local angle = ClampAngle(s.minimap.minimapPos or 225)
-  local rad = math.rad(angle)
-  local r = 78
-  local x = math.cos(rad) * r
-  local y = math.sin(rad) * r
-  b:ClearAllPoints()
-  b:SetPoint("CENTER", _G.Minimap, "CENTER", x, y)
+  local button = self.minimapButton
+  local minimap = _G.Minimap
+  if not button or not minimap then return end
+
+  local settings = EnsureMinimapSettings()
+  local angle = ClampAngle(settings.minimap.minimapPos or 225)
+  local radians = math.rad(angle)
+  local radius = 78
+  button:ClearAllPoints()
+  button:SetPoint("CENTER", minimap, "CENTER", math.cos(radians) * radius, math.sin(radians) * radius)
+end
+
+local function StopManualDrag(button)
+  if button then button:SetScript("OnUpdate", nil) end
 end
 
 local function InitManual(self)
   if self.minimapButton or not _G.Minimap then return true end
 
-  local b = CreateFrame("Button", "RothDevLibMinimapButton", _G.Minimap)
-  self.minimapButton = b
-  b:SetSize(31, 31)
-  b:SetFrameStrata("HIGH")
-  b:SetFrameLevel(20)
-  b:SetHighlightTexture("Interface/Minimap/UI-Minimap-ZoomButton-Highlight")
+  local button = CreateFrame("Button", "RothDevLibMinimapButton", _G.Minimap)
+  self.minimapButton = button
+  button:SetSize(31, 31)
+  button:SetFrameStrata("HIGH")
+  button:SetFrameLevel(20)
+  button:SetHighlightTexture("Interface/Minimap/UI-Minimap-ZoomButton-Highlight")
 
-  local icon = b:CreateTexture(nil, "BACKGROUND")
+  local icon = button:CreateTexture(nil, "BACKGROUND")
   icon:SetAllPoints()
   icon:SetTexture(ICON_PATH)
   icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-  b.icon = icon
-  SetCountText(b, GetActiveIssueCount())
+  button.icon = icon
+  SetCountText(button, GetActiveIssueCount())
 
-  local border = b:CreateTexture(nil, "OVERLAY")
+  local border = button:CreateTexture(nil, "OVERLAY")
   border:SetAllPoints()
   border:SetTexture("Interface/Minimap/MiniMap-TrackingBorder")
-  b.border = border
+  button.border = border
 
-  b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-  b:SetScript("OnClick", function(_, btn)
-    if btn == "LeftButton" then
+  button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+  button:SetScript("OnClick", function(_, clickButton)
+    if clickButton == "LeftButton" then
       if UI and UI.Toggle then UI:Toggle() end
-    elseif btn == "RightButton" then
+    elseif clickButton == "RightButton" then
       if IsShiftKeyDown() then
         if UI and UI.OpenLog then UI:OpenLog() end
-      else
-        if UI and UI.OpenExportAll then UI:OpenExportAll() end
+      elseif UI and UI.OpenExportAll then
+        UI:OpenExportAll()
       end
     end
   end)
 
-  b:SetScript("OnEnter", function(selfBtn)
-    GameTooltip:SetOwner(selfBtn, "ANCHOR_LEFT")
+  button:SetScript("OnEnter", function(owner)
+    GameTooltip:SetOwner(owner, "ANCHOR_LEFT")
     TooltipLines(GameTooltip)
     GameTooltip:Show()
   end)
-  b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  button:SetScript("OnLeave", function(owner)
+    if GameTooltip:GetOwner() == owner then GameTooltip:Hide() end
+  end)
+  button:SetScript("OnHide", function(owner)
+    StopManualDrag(owner)
+    if GameTooltip:GetOwner() == owner then GameTooltip:Hide() end
+  end)
 
-  b:RegisterForDrag("LeftButton")
-  b:SetMovable(true)
-  b:SetScript("OnDragStart", function(selfBtn)
-    selfBtn:SetScript("OnUpdate", function()
-      local mx, my = _G.Minimap:GetCenter()
-      local cx, cy = GetCursorPosition()
-      local scale = UIParent:GetScale()
-      cx, cy = cx / scale, cy / scale
-      local dx, dy = cx - mx, cy - my
-      local angle = math.deg(math.atan(dy, dx))
-      local s = EnsureMinimapSettings()
-      s.minimap.minimapPos = ClampAngle(angle)
-      s.minimapAngle = s.minimap.minimapPos
+  button:RegisterForDrag("LeftButton")
+  button:SetMovable(true)
+  button:SetScript("OnDragStart", function(owner)
+    owner:SetScript("OnUpdate", function()
+      local minimapX, minimapY = _G.Minimap:GetCenter()
+      if not minimapX or not minimapY then return end
+
+      local cursorX, cursorY = GetCursorPosition()
+      local scale
+      if UIParent.GetEffectiveScale then
+        scale = UIParent:GetEffectiveScale()
+      elseif UIParent.GetScale then
+        scale = UIParent:GetScale()
+      end
+      if not scale or scale <= 0 then return end
+      cursorX, cursorY = cursorX / scale, cursorY / scale
+
+      local deltaX, deltaY = cursorX - minimapX, cursorY - minimapY
+      local angle = math.deg(math.atan2(deltaY, deltaX))
+      local settings = EnsureMinimapSettings()
+      settings.minimap.minimapPos = ClampAngle(angle)
+      settings.minimapAngle = settings.minimap.minimapPos
       ManualUpdatePosition(UI)
     end)
   end)
-  b:SetScript("OnDragStop", function(selfBtn)
-    selfBtn:SetScript("OnUpdate", nil)
-  end)
+  button:SetScript("OnDragStop", StopManualDrag)
 
-  local s = EnsureMinimapSettings()
-  if s.minimap.hide then
-    b:Hide()
+  local settings = EnsureMinimapSettings()
+  if settings.minimap.hide then
+    button:Hide()
   else
-    b:Show()
+    button:Show()
   end
   ManualUpdatePosition(UI)
 
   if UI and UI.UpdateMinimapIconState then
-    pcall(function() UI:UpdateMinimapIconState() end)
+    UI:UpdateMinimapIconState()
   end
   return true
 end
@@ -303,80 +329,94 @@ function UI:InitMinimapButton()
   if self._minimapInited then return end
   self._minimapInited = true
 
-  local ok = false
-  local okInit, res = pcall(function() return InitLDB(self) end)
-  ok = okInit and res
-
-  if not ok then
-    pcall(function() InitManual(self) end)
+  local ldbCallOK, ldbInitialized = pcall(InitLDB, self)
+  if not ldbCallOK then
+    RDL:Log("WARN", "MINIMAP", "LDB minimap init failed", { error = SafeError(ldbInitialized) })
+  end
+  if not ldbCallOK or not ldbInitialized then
+    local manualOK, manualError = pcall(InitManual, self)
+    if not manualOK then
+      RDL:Log("ERROR", "MINIMAP", "Manual minimap init failed", { error = SafeError(manualError) })
+    end
   end
 
-  local s = EnsureMinimapSettings()
+  local settings = EnsureMinimapSettings()
   RDL:Log("INFO", "MINIMAP", "Minimap init", {
-    usedLDB = (self._ldbInited == true),
-    hide = s.minimap.hide,
-    pos = s.minimap.minimapPos,
+    usedLDB = self._ldbInited == true,
+    hide = settings.minimap.hide,
+    pos = settings.minimap.minimapPos,
   })
 
-  if C_Timer then
+  if type(_G.C_Timer) == "table" and type(C_Timer.After) == "function" then
     C_Timer.After(1.0, function()
-      local settings = EnsureMinimapSettings()
+      local currentSettings = EnsureMinimapSettings()
 
       if UI._ldbInited then
-        local btn = _G["LibDBIcon10_RothDevLib"]
+        local button = GetLDBButton(UI)
 
-        if not btn and UI._ldbRegistered and UI._ldbObj then
-          UI._ldbRegistered = false
-          local ok2 = pcall(function() InitLDB(UI) end)
-          btn = _G["LibDBIcon10_RothDevLib"]
-          RDL:Log(ok2 and "INFO" or "WARN", "MINIMAP", "LDB re-register", { buttonNow = (btn ~= nil) })
+        if not button and UI._ldbIcon and not currentSettings.minimap.hide then
+          local showOK, showError = pcall(UI._ldbIcon.Show, UI._ldbIcon, "RothDevLib")
+          button = GetLDBButton(UI)
+          local showFailure
+          if not showOK then showFailure = SafeError(showError) end
+          RDL:Log(button and "INFO" or "WARN", "MINIMAP", "LDB button recovery", {
+            buttonNow = button ~= nil,
+            error = showFailure,
+          })
         end
 
-        if btn and (not settings.minimap.hide) and (not btn:IsShown()) and UI._ldbIcon then
-          pcall(function() UI._ldbIcon:Show("RothDevLib") end)
+        if button and not currentSettings.minimap.hide and UI._ldbIcon then
+          local shown = true
+          if type(button.IsShown) == "function" then
+            local ok, value = pcall(button.IsShown, button)
+            shown = ok and value == true
+          end
+          if not shown then pcall(UI._ldbIcon.Show, UI._ldbIcon, "RothDevLib") end
         end
 
-        if (not btn) and (not UI.minimapButton) then
-          pcall(function() InitManual(UI) end)
-          RDL:Log("WARN", "MINIMAP", "Fell back to manual minimap button", {})
+        if not button and not UI.minimapButton then
+          local manualOK, manualError = pcall(InitManual, UI)
+          local manualFailure
+          if not manualOK then manualFailure = SafeError(manualError) end
+          RDL:Log(manualOK and "WARN" or "ERROR", "MINIMAP", "Fell back to manual minimap button", {
+            error = manualFailure,
+          })
         end
       end
     end)
   end
 
   if self.UpdateMinimapIconState then
-    pcall(function() self:UpdateMinimapIconState() end)
+    self:UpdateMinimapIconState()
   end
 end
 
 function UI:SetMinimapButtonShown(shown)
-  local s = EnsureMinimapSettings()
-  s.minimap.hide = not shown
-  s.minimapHide = s.minimap.hide
+  shown = shown == true
+  local settings = EnsureMinimapSettings()
+  settings.minimap.hide = not shown
+  settings.minimapHide = settings.minimap.hide
 
   if self._ldbIcon then
     if shown then
-      self._ldbIcon:Show("RothDevLib")
+      pcall(self._ldbIcon.Show, self._ldbIcon, "RothDevLib")
     else
-      self._ldbIcon:Hide("RothDevLib")
+      pcall(self._ldbIcon.Hide, self._ldbIcon, "RothDevLib")
     end
 
-    if self.UpdateMinimapIconState then
-      pcall(function() self:UpdateMinimapIconState() end)
-    end
+    if self.UpdateMinimapIconState then self:UpdateMinimapIconState() end
     return
   end
 
-  local b = self.minimapButton
-  if not b then return end
+  local button = self.minimapButton
+  if not button then return end
   if shown then
-    b:Show()
+    button:Show()
     ManualUpdatePosition(self)
   else
-    b:Hide()
+    StopManualDrag(button)
+    button:Hide()
   end
 
-  if self.UpdateMinimapIconState then
-    pcall(function() self:UpdateMinimapIconState() end)
-  end
+  if self.UpdateMinimapIconState then self:UpdateMinimapIconState() end
 end

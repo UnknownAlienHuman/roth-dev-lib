@@ -1,121 +1,66 @@
-# RothDevLib Integration (for other addons)
+# RothDevLib integration
 
-RothDevLib is a debugging/telemetry sink for World of Warcraft addons. It captures:
-- hard Lua errors (global errorhandler),
-- taints (ADDON_ACTION_BLOCKED/FORBIDDEN),
-- Lua warnings,
-- *suppressed* failures (wrappers / xpcall / swallowed errors) via explicit `Report*`,
-- correlation context (Doctor) + breadcrumbs/metrics,
-- exports (JSON / packed LLM bundle).
+Use RothDevLib as an optional local diagnostics sink. Do not use chat transport for errors.
 
-> Do not rely on `SendChatMessage` for diagnostics. In combat/instances it may be restricted. Local library calls are fine in combat.
-
----
-
-## 1) Load order / dependency
-
-Recommended in your `.toc`:
-
-```
+```toc
 ## OptionalDeps: !RothDevLib
 ```
 
-Always acquire the library safely:
-
 ```lua
-local Dev = LibStub and LibStub("RothDevLib-1.0", true) -- nil if not installed
-local dev = Dev and Dev:NewAddon("MyAddon")
+local Dev = LibStub and LibStub("RothDevLib-1.0", true)
+local dev = Dev and Dev:NewAddon("MyAddon", { maxBreadcrumbs = 80 })
 ```
 
----
+Every public diagnostic input is copied into a bounded ordinary-value snapshot. Secret/inaccessible values become markers, so callers may pass event payloads without persisting foreign table references.
 
-## 2) The most important pattern: WrapSafe surfaces
+## Safe entry points
 
-### Static context
 ```lua
-frame:SetScript("OnEvent", dev:WrapSafe("OnEvent", OnEvent, { frame = "Main" }))
-```
-
-### Dynamic context per call (recommended): WrapSafeCtx
-```lua
-frame:SetScript("OnEvent", dev:WrapSafeCtx("OnEvent", OnEvent, function(self, event, ...)
+frame:SetScript("OnEvent", dev:WrapSafeCtx("OnEvent", OnEvent, function(_, event, ...)
   return { event = event, unit = select(1, ...) }
 end))
+
+C_Timer.After(0, dev:WrapSafe("DeferredInit", DeferredInit))
 ```
 
----
-
-## 3) Doctor context (correlation)
-
-Prefer `SafeCallCtx` over manual Enter/Leave:
+For code that already catches an error:
 
 ```lua
-dev:SafeCallCtx("ScanBags", { bag = bagId }, function()
-  -- risky work
-end)
-```
-
-Manual:
-```lua
-dev:Enter("ScanBags", { bag = bagId })
--- work
-dev:Leave()
-```
-
----
-
-## 4) Explicit reporting (when you catch/swallow errors yourself)
-
-```lua
-local ok, err = xpcall(fn, function(e)
-  return debugstack(2, 40, 40) .. "\n" .. tostring(e)
+local ok, err = xpcall(RiskyWork, function(value)
+  return debugstack(2, 40, 40) .. "\n" .. tostring(value)
 end)
 
-if (not ok) and dev then
-  dev:Error(err, { func = "Init", stack = err, tag = "xpcall" })
+if not ok and dev then
+  dev:Error(err, {
+    func = "RiskyWork",
+    stack = err,
+    tag = "xpcall",
+    data = { phase = "startup" },
+  })
 end
 ```
 
-Generic:
-```lua
-dev:Report("LUA_ERROR", err, { func = "OnEvent", stackLevel = 3 })
-```
-
-`opts` highlights:
-- `stack` (string) or `stackLevel`
-- `locals` (string/table) or let RDL attempt capture
-- `event`, `tag`, `data`, `extra`, `code`
-
----
-
-## 5) Signals
+## Context and signals
 
 ```lua
-dev:Breadcrumb("flow", "scan_start", { bag = bagId })
-dev:Metric("scan.windows", n, "count")
+dev:SafeCallCtx("ScanBags", { bag = bagID }, ScanBags)
+dev:Breadcrumb("flow", "scan_start", { bag = bagID })
+dev:Metric("scan.windows", count, "count", { minInterval = 0.5 })
 dev:Alert("SANITY", "Unexpected nil", { key = key })
-dev:Assert(type(foo) == "table", "E_FOO", "foo must be table", { foo = foo })
+dev:Assert(type(value) == "table", "E_VALUE", "value must be a table", { value = value })
 ```
 
----
-
-## 6) Profiling (CPU / Memory delta)
+## Profiling
 
 ```lua
 frame:SetScript("OnEvent", dev:WrapProfiled("OnEvent", OnEvent, { spikeMs = 16 }))
-frame:SetScript("OnEvent", dev:WrapMemDelta("OnEvent", OnEvent, { spikeKB = 64 }))
+local wrapped = dev:WrapMemDelta("Rebuild", Rebuild, { spikeKB = 64 })
 ```
 
----
+## Rules
 
-## 7) Exports
-
-UI buttons:
-- Export JSON
-- Pack (LLM)
-
-Slash:
-- `/rdev export json`
-- `/rdev export pack`
-- `/rdev export share` (compressed if LibDeflate is installed)
-
+- Treat RothDevLib as optional; normal addon behavior must not depend on it.
+- Wrap entry points, not every helper.
+- Report swallowed failures at the catch site.
+- Keep context semantically useful; payloads are bounded but garbage is still garbage.
+- Never call protected actions from diagnostic callbacks.
