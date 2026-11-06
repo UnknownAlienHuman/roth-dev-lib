@@ -5,19 +5,20 @@
 The executable contract is [`!RothDevLib.toc`](!RothDevLib.toc). Read it before changing code. The declared order is intentional:
 
 1. embedded libraries;
-2. namespace, version, DB and internal calls;
+2. namespace, version, DB, DB lifecycle gate and internal calls;
 3. Secret Value guards, bounded copy/JSON and public call safety;
 4. export, profiling, Doctor and integration;
 5. capture policy/engine/intake modules;
 6. UI and the final lifecycle dispatcher.
 
-`## LoadSavedVariablesFirst: 1` is required. `Capture/Policy.lua` and `Capture/Engine.lua` establish the early error-handler policy during file loading, so their DB reads must see the real persisted `RothDevLibDB`, not a temporary table created before `ADDON_LOADED`.
+`## LoadSavedVariablesFirst: 1` is required. `Capture/Policy.lua` reads only the persisted settings table during file loading; `Core/DBLifecycle.lua` prevents player/session construction until `PLAYER_LOGIN`. Early captured entries remain in the bounded boot queue and are bound to the real session only when committed.
 
 ## Runtime ownership
 
 - `Core/Core.lua`: namespace bootstrap and integrity fingerprints only.
 - `Core/CallSafety.lua`: public safe/unsafe wrappers and tuple-preserving Doctor cleanup.
-- `Core/DB.lua`: persistence, migration, grouped entries, sessions and trimming.
+- `Core/DB.lua`: authoritative persistence/group/session implementation.
+- `Core/DBLifecycle.lua`: PLAYER_LOGIN readiness gate, one-time persisted-state repair and boot-entry session binding.
 - `Util/BoundedCopy.lua`: raw bounded snapshots of foreign diagnostic values.
 - `Util/JSON.lua`: deterministic raw traversal, node/depth/entry/string/output budgets.
 - `Doctor/Doctor.lua`: token-aware context stack.
@@ -59,7 +60,7 @@ Before comparison, formatting, indexing, iteration, logging, callback delivery, 
 
 ## Change routing
 
-- schema/defaults/trimming: `Core/DB.lua`
+- schema/defaults/grouping: `Core/DB.lua`; readiness and persisted repair: `Core/DBLifecycle.lua`
 - public wrappers: `Core/CallSafety.lua`, `Integration/API.lua`, `Integration/LibStub.lua`
 - diagnostic copy/encoding: `Util/BoundedCopy.lua`, `Util/JSON.lua`
 - handler ownership: `Capture/Policy.lua`, `Capture/Engine.lua`

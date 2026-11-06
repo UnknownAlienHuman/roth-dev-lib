@@ -10,9 +10,9 @@ loader/persistence
   -> UI consumers
 ```
 
-`!RothDevLib.toc` is authoritative. `LoadSavedVariablesFirst` deliberately makes `RothDevLibDB` available before the first Lua file because capture policy and handler installation occur during file loading. `ADDON_LOADED` still owns completed-addon initialization; `PLAYER_LOGIN` owns player/UI readiness.
+`!RothDevLib.toc` is authoritative. `LoadSavedVariablesFirst` makes only the persisted root available before the first Lua file. File-load capture policy may read that root, but `Core/DBLifecycle.lua` blocks full DB/session construction until `PLAYER_LOGIN`. Errors captured earlier stay in a bounded boot queue and receive the real session ID when committed after login.
 
-`Core/Core.lua` only creates the namespace and integrity fingerprints. `Core/CallSafety.lua` owns public wrappers after Secret Value guards and bounded-copy utilities are loaded. `Core/DB.lua` is the sole persistence owner.
+`Core/Core.lua` only creates the namespace and integrity fingerprints. `Core/CallSafety.lua` owns public wrappers after Secret Value guards and bounded-copy utilities are loaded. `Core/DB.lua` remains the persistence owner; `Core/DBLifecycle.lua` supplies the readiness gate and one-time repair layer without creating a second store.
 
 `Capture/Policy.lua` configures one-time chain ownership. `Capture/Engine.lua` installs and observes the global error handler without reclaim wars. `Capture/Safety.lua` normalizes hard/suppressed/integration intake. If ownership is lost, `Capture/BugGrabber.lua` provides bounded counter-delta import; otherwise fallback is explicitly unavailable.
 

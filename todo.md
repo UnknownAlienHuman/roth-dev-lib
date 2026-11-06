@@ -10,7 +10,8 @@ Target: **Retail 12.1.5 / Interface 120105**
 - [x] Harden the tiny pre-`Safety.lua` error-handler window so an intake fault cannot strand `_inHandler` or skip the prior handler.
 - [x] Recheck warning/taint/report store-status handling and fallback ticker teardown.
 - [x] Recheck ChatTap continuation parsing and disabled-setting timer cleanup.
-- [ ] Run the complete repository offline suite after the final static pass; the focused third-pass matrix is green.
+- [x] Separate early SavedVariables availability from PLAYER_LOGIN session construction and add lifecycle/load-order regression coverage.
+- [ ] Run the complete repository offline suite after the final static pass; focused lifecycle and capture matrices are green.
 
 ### Named-client validation
 
@@ -43,3 +44,4 @@ Target: **Retail 12.1.5 / Interface 120105**
 - Fixed minimap drag angle/scale handling and LDB button recovery.
 - Fixed breadcrumb ring resize semantics and option alias compatibility.
 - Updated load-on-demand menu loading to `C_AddOns.LoadAddOn`.
+- Added a PLAYER_LOGIN DB/session gate, one-time persisted-state normalization and bounded boot-entry session binding.

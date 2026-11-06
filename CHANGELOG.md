@@ -34,6 +34,9 @@
 - Preserve inaccessible restriction-state values instead of coercing them to `false`.
 - Reject inaccessible external signature overrides rather than using them as grouping keys.
 - Preserve warning tuple arity and recognize ChatTap stack continuations before generic headers.
+- Separate early SavedVariables access from player-session readiness; construct sessions only at `PLAYER_LOGIN`.
+- Queue file-load errors without a session and bind them to the first real session when committed.
+- Normalize persisted settings/groups/session indexes once per DB root and trim stale/excess persisted data before normal use.
 
 ### UI
 

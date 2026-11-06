@@ -9,7 +9,7 @@ A bounded diagnostics library and UI for World of Warcraft addon development. It
 - Version: **1.0.0-alpha.20.0**
 - Saved variables: `RothDevLibDB`
 
-The implementation is aligned with Blizzard UI source build **12.1.5 (70783)**. Static Lua tests pass; the in-game validation matrix remains required before release.
+The implementation is aligned with Blizzard UI source build **12.1.5 (70783)**. Static focused tests pass; the in-game validation matrix remains required before release.
 
 ## Installation
 
@@ -38,6 +38,8 @@ See [docs/INTEGRATION.md](docs/INTEGRATION.md) and [docs/INTEGRATION_RU.md](docs
 
 - External diagnostic values cross a bounded ordinary-value boundary before persistence or callbacks.
 - Secret/inaccessible values become explicit markers; foreign tables are copied, not retained by reference.
+- SavedVariables are available during file loading, but player/session initialization is gated until `PLAYER_LOGIN`.
+- File-load errors use a bounded boot queue and are assigned to the real session only when committed.
 - Blizzard UI is observed or post-hooked. RothDevLib does not replace Blizzard frame methods, mutate popup definitions, or unregister events owned by other frames.
 - Exports, breadcrumb rings, strings and table traversal are bounded.
 

@@ -22,6 +22,7 @@ libs\LibDBIcon-1.0\lib.xml
 Core\Core.lua
 Core\Version.lua
 Core\DB.lua
+Core\DBLifecycle.lua
 Core\Internal.lua
 
 # Ordinary-value boundary and utilities
