@@ -1,92 +1,139 @@
 -- !RothDevLib/Core/Internal.lua
--- Internal self-diagnostics helpers.
--- Goal: NEVER silently swallow errors inside !RothDevLib itself.
--- We still protect execution (no hard crash), but report failures into the Capture pipeline.
+-- Guarded internal calls that report faults without leaking Doctor scopes.
 
 local RDL = _G.RothDevLib
 RDL.Internal = RDL.Internal or {}
-local I = RDL.Internal
+local Internal = RDL.Internal
 
-I._depth = 0
-I._maxDepth = 3
+Internal._depth = 0
+Internal._maxDepth = 3
 
-local function SafeDebugStack(level)
-  local ok, s = pcall(debugstack, level or 2, 40, 40)
-  if ok then return s end
-  return ""
+local Unpack = table.unpack or unpack
+
+local function Pack(...)
+  return { n = select("#", ...), ... }
 end
 
--- Guarded call for internal code paths.
--- addonHint: if nil, let Capture infer addon from stack.
--- funcName: string label shown in Doctor/UI.
-function I:Call(addonHint, funcName, fn, ...)
-  if type(fn) ~= "function" then return false, "Internal.Call: fn is not a function" end
-  funcName = tostring(funcName or "Internal")
+local function SafeText(value, fallback, maxBytes)
+  fallback = fallback or "<error>"
+  maxBytes = tonumber(maxBytes) or 4096
 
-  -- Avoid recursive reporting loops.
+  local util = RDL.Util
+  if util and type(util.SafeToString) == "function" then
+    local ok, text = pcall(util.SafeToString, util, value)
+    if ok and type(text) == "string" then
+      if #text > maxBytes then text = text:sub(1, maxBytes) end
+      return text
+    end
+  end
+
+  if type(value) == "string" then
+    if #value > maxBytes then return value:sub(1, maxBytes) end
+    return value
+  end
+  return fallback
+end
+
+local function SafeDebugStack(level)
+  if type(_G.debugstack) ~= "function" then return "" end
+  local ok, stack = pcall(_G.debugstack, level or 2, 40, 40)
+  if not ok then return "" end
+
+  local util = RDL.Util
+  if util and type(util.FilterSecretEscapes) == "function" then
+    local okFilter, filtered = pcall(util.FilterSecretEscapes, util, stack)
+    if okFilter and type(filtered) == "string" then return filtered end
+  end
+  return type(stack) == "string" and stack or ""
+end
+
+local function EnterDoctor(addonHint, funcName)
+  local doctor = RDL.Doctor
+  if not (doctor and type(doctor.Enter) == "function") then return nil end
+
+  local ok, token = pcall(doctor.Enter, doctor, RDL.addonName, funcName, {
+    internal = true,
+    hint = addonHint,
+  })
+  if ok then return token end
+  return nil
+end
+
+local function LeaveDoctor(token)
+  if token == nil then return end
+  local doctor = RDL.Doctor
+  if doctor and type(doctor.Leave) == "function" then
+    pcall(doctor.Leave, doctor, token)
+  end
+end
+
+function Internal:Call(addonHint, funcName, fn, ...)
+  if type(fn) ~= "function" then
+    return false, "Internal.Call: fn is not a function"
+  end
+  funcName = SafeText(funcName, "Internal", 256)
+
   if (self._depth or 0) >= (self._maxDepth or 3) then
     return pcall(fn, ...)
   end
 
   self._depth = (self._depth or 0) + 1
+  local doctorToken = EnterDoctor(addonHint, funcName)
 
-  -- Doctor context for self-debug.
-  if RDL.Doctor and RDL.Doctor.Enter then
-    pcall(function()
-      RDL.Doctor:Enter(RDL.addonName, funcName, { internal = true, hint = addonHint })
-    end)
-  end
+  local function ErrorHandler(err)
+    local stack = SafeDebugStack(3)
+    local locals, localsMeta
 
-  local function ErrHandler(err)
-    local stack = SafeDebugStack(2)
-
-    local locals, lmeta = nil, nil
-    if RDL.Locals and RDL.Locals.CaptureBest then
-      local ok2, l, m = pcall(function()
-        return RDL.Locals:CaptureBest({ addon = addonHint or RDL.addonName, stack = stack, baseLevel = 2 })
-      end)
-      if ok2 then locals, lmeta = l, m end
+    if RDL.Locals and type(RDL.Locals.CaptureBest) == "function" then
+      local ok, captured, meta = pcall(RDL.Locals.CaptureBest, RDL.Locals, {
+        addon = addonHint or RDL.addonName,
+        stack = stack,
+        baseLevel = 2,
+      })
+      if ok then
+        locals = captured
+        localsMeta = meta
+      end
     end
 
-    if RDL.Capture and RDL.Capture.OnSuppressedError then
-      -- NOTE: pass addonHint through; nil means "infer from stack".
-      pcall(function()
-        RDL.Capture:OnSuppressedError(err, stack, locals, addonHint, funcName, {
+    local safeError = SafeText(err, "<error>", 4096)
+    if RDL.Capture and type(RDL.Capture.OnSuppressedError) == "function" then
+      pcall(RDL.Capture.OnSuppressedError, RDL.Capture, safeError, stack, locals,
+        addonHint, funcName, {
           internal = true,
           source = "internal",
-          localsProbe = lmeta,
+          localsProbe = localsMeta,
         })
-      end)
-    else
-      -- Last resort: do not hard error.
-      pcall(function()
-        DEFAULT_CHAT_FRAME:AddMessage("|cffff3333RothDevLib|r internal error: " .. tostring(err))
-      end)
+    elseif _G.DEFAULT_CHAT_FRAME and type(_G.DEFAULT_CHAT_FRAME.AddMessage) == "function" then
+      pcall(_G.DEFAULT_CHAT_FRAME.AddMessage, _G.DEFAULT_CHAT_FRAME,
+        "|cffff3333RothDevLib|r internal error: " .. safeError)
     end
 
-    return err
+    return safeError
   end
 
-  -- Optional CPU profiling: record internal call costs so Monitor is never empty.
-  local cpu = RDL.CPU
-  local ok, r1, r2, r3, r4, r5
-  if cpu and cpu.Measure then
-    ok, r1, r2, r3, r4, r5 = cpu:Measure(addonHint or RDL.addonName, tostring(funcName), function(...)
-      return xpcall(fn, ErrHandler, ...)
-    end, { sampleRate = 1.0 }, ...)
-  else
-    ok, r1, r2, r3, r4, r5 = xpcall(fn, ErrHandler, ...)
+  -- The outer pcall contains failures in the profiling layer itself. Target
+  -- failures are represented by the inner xpcall boolean.
+  local result = Pack(pcall(function(...)
+    local cpu = RDL.CPU
+    if cpu and type(cpu.Measure) == "function" then
+      return cpu:Measure(addonHint or RDL.addonName, funcName, function(...)
+        return xpcall(fn, ErrorHandler, ...)
+      end, { sampleRate = 1.0 }, ...)
+    end
+    return xpcall(fn, ErrorHandler, ...)
+  end, ...))
+
+  LeaveDoctor(doctorToken)
+  self._depth = math.max(0, (self._depth or 1) - 1)
+
+  if not result[1] then
+    return false, SafeText(result[2], "Internal.Call infrastructure failure", 4096)
   end
 
-  if RDL.Doctor and RDL.Doctor.Leave then
-    pcall(function() RDL.Doctor:Leave() end)
+  local targetOK = result[2]
+  if targetOK then
+    return true, Unpack(result, 3, result.n)
   end
-
-  self._depth = (self._depth or 1) - 1
-
-  if ok then
-    return true, r1, r2, r3, r4, r5
-  end
-  return false, r1
+  return false, result[3]
 end
-

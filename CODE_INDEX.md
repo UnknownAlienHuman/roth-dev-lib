@@ -3,16 +3,20 @@
 | Path | Responsibility |
 | --- | --- |
 | `!RothDevLib.toc` | Metadata and definitive load order. |
-| `Core/Core.lua`, `Core/Version.lua` | Namespace and runtime release metadata. |
-| `Core/DB.lua`, `Core/Events.lua`, `Core/Internal.lua` | Persistence, lifecycle/event bootstrap and guarded internal dispatch. |
-| `Util/SecretGuard.lua`, `Util/Util.lua` | Ordinary-value boundary, bounded snapshots and shared normalization. |
-| `Util/JSON.lua` | Deterministic bounded JSON encoding. |
-| `Integration/` | Public API, callbacks, per-addon breadcrumb bus and LibStub bridge. |
-| `Capture/ErrorHandler.lua`, `Capture/Safety.lua` | Error ownership and non-invasive safety policy. |
-| `Capture/` | Report, warning, taint, chat, flood and presentation capture modules. |
-| `Doctor/` | Execution context, validation and correlation breadcrumbs. |
-| `Perf/` | CPU and memory observations. |
-| `Export/` | Bounded report packing and export formatting. |
-| `UI/` | Main frame, lists, monitor, links, export views, launchers and slash commands. |
-| `tests/` | Offline contract/regression tests; not loaded by WoW. |
-| `docs/` | User and integration documentation. |
+| `Core/Core.lua`, `Core/CallSafety.lua`, `Core/Internal.lua` | Namespace plus public/internal guarded calls, return-tuple preservation and Doctor cleanup. |
+| `Core/Version.lua` | TOC-derived runtime version/interface metadata. |
+| `Core/DB.lua`, `Core/Events.lua` | Persistence, sessions, lifecycle and event routing. |
+| `Capture/Policy.lua` | Pre-EarlyInit chain-once ownership policy and unsupported fallback disablement. |
+| `Capture/Engine.lua` | Compact handler construction, ownership observation, entry construction and storage routing. |
+| `Capture/Safety.lua` | Rich bounded intake, manual reclaim and BugGrabber/unavailable fallback diagnostics. |
+| `Capture/BugGrabber.lua` | Counter-delta fallback import with history baselining and stable keys. |
+| `Capture/` | Remaining warning, taint, chat, locals and storm capture modules. |
+| `Doctor/` | Token-aware context stack, breadcrumbs and validation. |
+| `Integration/Callbacks.lua` | Deterministic callback dispatch with independent detached payloads. |
+| `Integration/Bus.lua`, `Integration/API.lua`, `Integration/LibStub.lua` | Public diagnostics bus and integration surfaces. |
+| `Export/` | Report packing and formatting. |
+| `Perf/` | Best-effort CPU/memory observations that preserve complete return tuples. |
+| `UI/` | Main frame, lists, monitor, report/export views and slash commands. |
+| `Util/Util.lua`, `Util/BoundedCopy.lua` | Shared helpers plus bounded raw diagnostic copying/serialization. |
+| `tests/` | Offline regression tests. |
+| `docs/` | User and integration documentation; legacy plans remain explicitly archived. |

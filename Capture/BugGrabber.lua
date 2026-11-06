@@ -79,7 +79,7 @@ end
 
 local function SafeGet(tbl, key)
   if not IsReadableTable(tbl) then return nil end
-  local ok, value = pcall(function() return tbl[key] end)
+  local ok, value = pcall(function() return rawget(tbl, key) end)
   if not ok then return nil end
   return Scrub(value)
 end
@@ -157,12 +157,16 @@ local function NormalizeRecord(raw)
   }
 end
 
-local function RecordKey(index, record)
-  return tostring(index) .. "\031" .. record.message .. "\031" .. (record.stack or "")
+-- BugGrabber counters are attached to a logical error, not to its current list
+-- index. A stable content key survives list reordering and compaction.
+local function RecordKey(record)
+  return record.message .. "\031" .. (record.stack or "")
 end
 
 function Bug:IsPresent()
-  return GetBugDB() ~= nil or Scrub(_G.BugGrabber) ~= nil
+  if GetBugDB() ~= nil then return true end
+  local direct = Scrub(_G.BugGrabber)
+  return direct ~= nil and direct ~= "<inaccessible>" and direct ~= "<secret>"
 end
 
 function Bug:Disable()
@@ -173,20 +177,34 @@ function Bug:Disable()
 end
 
 function Bug:Enable()
-  if self._enabled then return end
-  self._enabled = true
+  if self._enabled and self._ticker then return true end
 
   local timer = _G.C_Timer
-  if type(timer) ~= "table" or type(timer.NewTicker) ~= "function" then return end
+  if type(timer) ~= "table" or type(timer.NewTicker) ~= "function" then
+    self._enabled = false
+    return false
+  end
+
   local interval = SafeNumber(Settings().bugGrabberPollSec, 1, 0.25, 60)
   local ok, ticker = pcall(timer.NewTicker, interval, function()
     if Bug._enabled then pcall(Bug.ImportNew, Bug) end
   end)
-  if ok then self._ticker = ticker end
+  if not ok or not ticker then
+    self._enabled = false
+    self._ticker = nil
+    return false
+  end
+
+  self._enabled = true
+  self._ticker = ticker
+  return true
 end
 
 function Bug:ImportNew()
-  if Capture.ownsHandler then return 0 end
+  if Capture.ownsHandler then
+    self:Disable()
+    return 0
+  end
   if type(Capture.BuildEntry) ~= "function" or type(Capture.StoreEntry) ~= "function" then return 0 end
 
   local settings = Settings()
@@ -194,18 +212,34 @@ function Bug:ImportNew()
 
   local budget = math.floor(SafeNumber(settings.bugGrabberImportMaxPerPoll, 200, 1, 1000))
   local scanMaximum = math.floor(SafeNumber(settings.bugGrabberScanMax, 5000, 1, 20000))
+  local importHistory = settings.importBugGrabberHistory == true
   local list = GetErrorList(GetBugDB())
   if not list then return 0 end
 
   local count = ListLength(list, scanMaximum)
+  local fullyScanned = count < scanMaximum or SafeGet(list, scanMaximum + 1) == nil
   local seen, imported = {}, 0
+  local scanCompleted = true
+
   for index = 1, count do
-    if budget <= 0 then break end
+    if budget <= 0 then
+      scanCompleted = false
+      break
+    end
     local record = NormalizeRecord(SafeGet(list, index))
     if record then
-      local key = RecordKey(index, record)
+      local key = RecordKey(record)
       seen[key] = true
-      local previous = math.floor(SafeNumber(self._counterByKey[key], 0, 0, 1000000))
+
+      local previousRaw = self._counterByKey[key]
+      if previousRaw == nil and not importHistory then
+        -- Attach at the current authoritative counter. This avoids replaying
+        -- errors RothDevLib may already have captured while it owned the chain.
+        self._counterByKey[key] = record.counter
+        previousRaw = record.counter
+      end
+
+      local previous = math.floor(SafeNumber(previousRaw, 0, 0, 1000000))
       local delta = record.counter - previous
       if delta > 0 then
         local attempts = math.min(delta, budget)
@@ -235,13 +269,13 @@ function Bug:ImportNew()
           end
         end
       elseif delta < 0 then
+        -- Source rotation/reset: accept the new baseline without replaying.
         self._counterByKey[key] = record.counter
       end
     end
   end
 
-  -- Remove records that disappeared only after a complete bounded scan.
-  if count < scanMaximum then
+  if fullyScanned and scanCompleted then
     for key in pairs(self._counterByKey) do
       if not seen[key] then self._counterByKey[key] = nil end
     end

@@ -1,10 +1,6 @@
 -- !RothDevLib/Perf/Mem.lua
--- Phase 3: Memory watcher helpers.
---
--- Goals:
---   * Track memory deltas around critical functions (per-addon/module attribution).
---   * Optionally sample global memory periodically.
---   * Emit metrics (Bus:Metric) and alerts on spikes.
+-- Memory-delta observations that preserve the wrapped function's complete
+-- return tuple. Measurements are diagnostic traffic, not retained-memory proof.
 
 local RDL = _G.RothDevLib
 if not RDL then return end
@@ -17,113 +13,146 @@ Mem._lastAlert = Mem._lastAlert or {}
 Mem._lastSample = Mem._lastSample or {}
 Mem._ticker = Mem._ticker or nil
 
+local Unpack = table.unpack or unpack
+
+local function Pack(...)
+  return { n = select("#", ...), ... }
+end
+
 local function NowMs()
-  if type(debugprofilestop) == "function" then return debugprofilestop() end
-  if type(GetTime) == "function" then return GetTime() * 1000 end
-  return (time() or 0) * 1000
+  if type(_G.debugprofilestop) == "function" then
+    local ok, value = pcall(_G.debugprofilestop)
+    if ok and type(value) == "number" then return value end
+  end
+  if type(_G.GetTime) == "function" then
+    local ok, value = pcall(_G.GetTime)
+    if ok and type(value) == "number" then return value * 1000 end
+  end
+  if type(_G.time) == "function" then
+    local ok, value = pcall(_G.time)
+    if ok and type(value) == "number" then return value * 1000 end
+  end
+  return 0
 end
 
 local function GetSettings()
-  return (RDL.DB and RDL.DB.GetSettings and RDL.DB:GetSettings()) or nil
+  if RDL.DB and type(RDL.DB.GetSettings) == "function" then
+    local ok, settings = pcall(RDL.DB.GetSettings, RDL.DB)
+    if ok and type(settings) == "table" then return settings end
+  end
+  return nil
 end
 
-local function Clamp(n, lo, hi)
-  if n < lo then return lo end
-  if n > hi then return hi end
-  return n
+local function Option(opts, key)
+  if type(opts) ~= "table" then return nil end
+  local ok, value = pcall(rawget, opts, key)
+  if ok then return value end
+  return nil
+end
+
+local function Clamp(value, minimum, maximum)
+  if value < minimum then return minimum end
+  if value > maximum then return maximum end
+  return value
 end
 
 local function Key(addonName, funcName)
   return tostring(addonName or "?") .. ":" .. tostring(funcName or "?")
 end
 
-local function AlertThrottleOK(k, nowMs, minIntervalMs)
-  minIntervalMs = tonumber(minIntervalMs) or 0
-  if minIntervalMs <= 0 then return true end
-  local last = Mem._lastAlert[k]
-  if last and (nowMs - last) < minIntervalMs then return false end
-  Mem._lastAlert[k] = nowMs
+local function AlertThrottleOK(key, nowMs, minimumIntervalMs)
+  minimumIntervalMs = tonumber(minimumIntervalMs) or 0
+  if minimumIntervalMs <= 0 then return true end
+  local last = Mem._lastAlert[key]
+  if last and (nowMs - last) < minimumIntervalMs then return false end
+  Mem._lastAlert[key] = nowMs
   return true
 end
 
 function Mem:GetKB()
-  -- WoW: collectgarbage("count") returns KB.
-  if type(collectgarbage) == "function" then
-    local ok, v = pcall(collectgarbage, "count")
-    if ok and type(v) == "number" then return v end
+  if type(_G.collectgarbage) == "function" then
+    local ok, value = pcall(_G.collectgarbage, "count")
+    if ok and type(value) == "number" then return value end
   end
-  -- Legacy: gcinfo() used to return KB.
-  if type(gcinfo) == "function" then
-    local ok, v = pcall(gcinfo)
-    if ok and type(v) == "number" then return v end
+  if type(_G.gcinfo) == "function" then
+    local ok, value = pcall(_G.gcinfo)
+    if ok and type(value) == "number" then return value end
   end
   return nil
 end
 
-local function UpdateStats(k, dKB)
-  local s = Mem._stats[k]
-  if not s then
-    s = { n = 0, total = 0, max = 0, ema = 0, last = 0 }
-    Mem._stats[k] = s
+local function UpdateStats(key, deltaKB)
+  local stats = Mem._stats[key]
+  if not stats then
+    stats = { n = 0, total = 0, max = 0, ema = 0, last = 0 }
+    Mem._stats[key] = stats
   end
 
-  s.n = (s.n or 0) + 1
-  s.total = (s.total or 0) + dKB
-  s.last = dKB
-  if dKB > (s.max or 0) then s.max = dKB end
+  stats.n = (stats.n or 0) + 1
+  stats.total = (stats.total or 0) + deltaKB
+  stats.last = deltaKB
+  if deltaKB > (stats.max or 0) then stats.max = deltaKB end
 
-  local a = 0.15
-  if s.n <= 1 then s.ema = dKB
-  else s.ema = (s.ema or dKB) * (1 - a) + dKB * a end
-
-  return s
+  local alpha = 0.15
+  if stats.n <= 1 then
+    stats.ema = deltaKB
+  else
+    stats.ema = (stats.ema or deltaKB) * (1 - alpha) + deltaKB * alpha
+  end
+  return stats
 end
 
--- Measure memory delta around a call.
+local function Record(addonName, funcName, deltaKB, opts, settings)
+  local key = Key(addonName, funcName)
+  local stats = UpdateStats(key, deltaKB)
+
+  if RDL.Bus and type(RDL.Bus.Metric) == "function" then
+    local minimum = Option(opts, "metricMinInterval")
+      or (type(settings) == "table" and rawget(settings, "metricMinInterval"))
+      or 1
+    pcall(RDL.Bus.Metric, RDL.Bus, addonName, "mem_kb:" .. tostring(funcName),
+      deltaKB, "KB", { minInterval = minimum })
+  end
+
+  local spikeKB = tonumber(Option(opts, "spikeKB"))
+    or (type(settings) == "table" and tonumber(rawget(settings, "memSpikeKB")))
+    or 64
+  spikeKB = Clamp(spikeKB, 1, 1024 * 1024)
+
+  if deltaKB >= spikeKB and type(RDL.Alert) == "function" then
+    local alertMinimum = tonumber(Option(opts, "alertMinIntervalMs"))
+      or (type(settings) == "table" and tonumber(rawget(settings, "memAlertMinIntervalMs")))
+      or 2000
+    local now = NowMs()
+    if AlertThrottleOK("mem:" .. key, now, alertMinimum) then
+      pcall(RDL.Alert, RDL, addonName, "MEM_SPIKE",
+        tostring(funcName) .. " +" .. string.format("%.1f", deltaKB) .. "KB", {
+          dKB = deltaKB,
+          ema = stats.ema,
+          max = stats.max,
+          n = stats.n,
+        }, "WARN")
+    end
+  end
+end
+
 function Mem:Measure(addonName, funcName, fn, opts, ...)
   if type(fn) ~= "function" then return nil end
 
   local settings = GetSettings()
-  if settings and settings.enablePerfProfiling == false then
+  if settings and rawget(settings, "enablePerfProfiling") == false then
     return fn(...)
   end
 
   local before = self:GetKB()
-  local r1, r2, r3, r4, r5, r6 = fn(...)
+  -- Preserve the target's original hard-error behavior.
+  local result = Pack(fn(...))
   local after = self:GetKB()
 
-  if type(before) ~= "number" or type(after) ~= "number" then
-    return r1, r2, r3, r4, r5, r6
+  if type(before) == "number" and type(after) == "number" then
+    pcall(Record, addonName, funcName, after - before, opts, settings)
   end
-
-  local dKB = after - before
-  local k = Key(addonName, funcName)
-  local s = UpdateStats(k, dKB)
-
-  -- Metric
-  if RDL.Bus and RDL.Bus.Metric then
-    local mopts = { minInterval = (opts and opts.metricMinInterval) or (settings and settings.metricMinInterval) or 1 }
-    RDL.Bus:Metric(addonName, "mem_kb:" .. tostring(funcName), dKB, "KB", mopts)
-  end
-
-  -- Alert on spikes
-  local spikeKB = (opts and tonumber(opts.spikeKB)) or (settings and tonumber(settings.memSpikeKB)) or 64
-  spikeKB = Clamp(spikeKB, 1, 1024 * 1024)
-
-  if dKB >= spikeKB and RDL.Alert then
-    local now = NowMs()
-    local alertMin = (opts and tonumber(opts.alertMinIntervalMs)) or (settings and tonumber(settings.memAlertMinIntervalMs)) or 2000
-    if AlertThrottleOK("mem:" .. k, now, alertMin) then
-      RDL:Alert(addonName, "MEM_SPIKE", tostring(funcName) .. " +" .. string.format("%.1f", dKB) .. "KB", {
-        dKB = dKB,
-        ema = s and s.ema,
-        max = s and s.max,
-        n = s and s.n,
-      }, "WARN")
-    end
-  end
-
-  return r1, r2, r3, r4, r5, r6
+  return Unpack(result, 1, result.n)
 end
 
 function Mem:Wrap(addonName, funcName, fn, opts)
@@ -133,11 +162,9 @@ function Mem:Wrap(addonName, funcName, fn, opts)
   end
 end
 
--- Sample global memory for a given addon/tag and emit a delta metric.
--- This does not provide true per-addon memory; it attributes the delta to the moment the addon calls Sample.
 function Mem:Sample(addonName, tag, opts)
   local settings = GetSettings()
-  if settings and settings.enablePerfProfiling == false then return end
+  if settings and rawget(settings, "enablePerfProfiling") == false then return end
 
   local nowKB = self:GetKB()
   if type(nowKB) ~= "number" then return end
@@ -146,76 +173,80 @@ function Mem:Sample(addonName, tag, opts)
   local last = self._lastSample[key]
   self._lastSample[key] = nowKB
 
-  if type(last) == "number" then
-    local dKB = nowKB - last
-    if RDL.Bus and RDL.Bus.Metric then
-      local mopts = { minInterval = (opts and opts.metricMinInterval) or (settings and settings.metricMinInterval) or 1 }
-      RDL.Bus:Metric(addonName, "mem_kb_delta:" .. tostring(tag), dKB, "KB", mopts)
-    end
-  else
-    if RDL.Bus and RDL.Bus.Metric then
-      local mopts = { minInterval = 0 }
-      RDL.Bus:Metric(addonName, "mem_kb:" .. tostring(tag), nowKB, "KB", mopts)
+  if RDL.Bus and type(RDL.Bus.Metric) == "function" then
+    if type(last) == "number" then
+      local minimum = Option(opts, "metricMinInterval")
+        or (type(settings) == "table" and rawget(settings, "metricMinInterval"))
+        or 1
+      pcall(RDL.Bus.Metric, RDL.Bus, addonName,
+        "mem_kb_delta:" .. tostring(tag), nowKB - last, "KB", { minInterval = minimum })
+    else
+      pcall(RDL.Bus.Metric, RDL.Bus, addonName,
+        "mem_kb:" .. tostring(tag), nowKB, "KB", { minInterval = 0 })
     end
   end
 end
 
--- Optional: periodic global memory sampling.
 function Mem:StartWatcher()
   local settings = GetSettings() or {}
-  if settings.memWatchEnabled ~= true then return end
-  if type(C_Timer) ~= "table" or type(C_Timer.NewTicker) ~= "function" then return end
-
+  if rawget(settings, "memWatchEnabled") ~= true then return end
+  if type(_G.C_Timer) ~= "table" or type(_G.C_Timer.NewTicker) ~= "function" then return end
   if self._ticker then return end
 
-  local interval = tonumber(settings.memWatchIntervalSec) or 2
-  if interval < 0.2 then interval = 0.2 end
-
+  local interval = tonumber(rawget(settings, "memWatchIntervalSec")) or 2
+  interval = Clamp(interval, 0.2, 3600)
   local last = self:GetKB()
-  self._ticker = C_Timer.NewTicker(interval, function()
+
+  local ok, ticker = pcall(_G.C_Timer.NewTicker, interval, function()
     local now = Mem:GetKB()
     if type(now) ~= "number" then return end
-    if type(last) ~= "number" then last = now return end
-
-    local dKB = now - last
-    last = now
-
-    if RDL.Bus and RDL.Bus.Metric then
-      RDL.Bus:Metric("RothDevLib", "mem_kb_global_delta", dKB, "KB", { minInterval = interval })
+    if type(last) ~= "number" then
+      last = now
+      return
     end
 
-    local spike = tonumber(settings.memWatchSpikeKB) or 256
-    if dKB >= spike and RDL.Alert then
+    local deltaKB = now - last
+    last = now
+
+    if RDL.Bus and type(RDL.Bus.Metric) == "function" then
+      pcall(RDL.Bus.Metric, RDL.Bus, "RothDevLib",
+        "mem_kb_global_delta", deltaKB, "KB", { minInterval = interval })
+    end
+
+    local spikeKB = tonumber(rawget(settings, "memWatchSpikeKB")) or 256
+    if deltaKB >= spikeKB and type(RDL.Alert) == "function" then
+      local alertMinimum = tonumber(rawget(settings, "memAlertMinIntervalMs")) or 2000
       local nowMs = NowMs()
-      if AlertThrottleOK("memwatch:global", nowMs, tonumber(settings.memAlertMinIntervalMs) or 2000) then
-        RDL:Alert("RothDevLib", "MEM_WATCH", "Global mem +" .. string.format("%.1f", dKB) .. "KB", { dKB = dKB, intervalSec = interval }, "WARN")
+      if AlertThrottleOK("memwatch:global", nowMs, alertMinimum) then
+        pcall(RDL.Alert, RDL, "RothDevLib", "MEM_WATCH",
+          "Global mem +" .. string.format("%.1f", deltaKB) .. "KB", {
+            dKB = deltaKB,
+            intervalSec = interval,
+          }, "WARN")
       end
     end
   end)
+
+  if ok then self._ticker = ticker end
 end
 
 function Mem:StopWatcher()
-  if self._ticker and type(self._ticker.Cancel) == "function" then
-    pcall(function() self._ticker:Cancel() end)
-  end
+  local ticker = self._ticker
   self._ticker = nil
+  if ticker and type(ticker.Cancel) == "function" then
+    pcall(ticker.Cancel, ticker)
+  end
 end
 
 function Mem:ResetStats()
   if self._stats then
-    for k in pairs(self._stats) do
-      self._stats[k] = nil
-    end
+    for key in pairs(self._stats) do self._stats[key] = nil end
   end
   if self._lastAlert then
-    for k in pairs(self._lastAlert) do
-      self._lastAlert[k] = nil
-    end
+    for key in pairs(self._lastAlert) do self._lastAlert[key] = nil end
   end
   if self._lastSample then
-    for k in pairs(self._lastSample) do
-      self._lastSample[k] = nil
-    end
+    for key in pairs(self._lastSample) do self._lastSample[key] = nil end
   end
 end
 

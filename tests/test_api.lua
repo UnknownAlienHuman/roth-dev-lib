@@ -16,6 +16,7 @@ function _G.canaccessallvalues(...)
 end
 
 assert(loadfile('Util/Util.lua'))()
+assert(loadfile('Util/BoundedCopy.lua'))()
 assert(loadfile('Util/SecretGuard.lua'))()
 
 local calls = {}
@@ -76,7 +77,6 @@ assert(calls.report[3] == '<inaccessible>')
 assert(calls.report[4].code == '<inaccessible>')
 assert(calls.report[4].data.x == '<inaccessible>')
 
-
 RDL:Alert('Test', nil, nil, nil, nil)
 assert(calls.alert[2] == 'ALERT')
 assert(calls.alert[3] == '')
@@ -86,7 +86,7 @@ assert(RDL:WrapMemDelta('Test', 'bad', secret) == nil)
 
 local poison = setmetatable({}, { __pairs = function() error("poison pairs") end })
 RDL:Breadcrumb('Test', 'poison', 'payload', poison)
-assert(calls.breadcrumb[4] == '<table>')
+assert(type(calls.breadcrumb[4]) == 'table' and next(calls.breadcrumb[4]) == nil)
 
 RDL.Bus.Breadcrumb = function() error('sink failure') end
 local ok = pcall(RDL.Breadcrumb, RDL, 'Test', 'event', 'must not escape')

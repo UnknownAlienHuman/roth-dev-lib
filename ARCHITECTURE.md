@@ -1,23 +1,47 @@
 # Architecture
 
-`!RothDevLib.toc` is the executable load-order contract: vendored libraries, core/version/database, the ordinary-value boundary, export/performance/context services, integration API, capture, UI, then the event bootstrap.
+The TOC is the executable composition root. It loads vendored libraries, Core/utilities, Export, Perf, Doctor, Integration, Capture, UI and finally `Core/Events.lua`.
 
-## Ownership
+## Capture ownership
 
-- `Core/Events.lua` owns lifecycle and event dispatch.
-- `Core/DB.lua` exclusively owns `RothDevLibDB` normalization and persistence.
-- `Capture/ErrorHandler.lua` owns error-handler capture; `Capture/Safety.lua` enforces the non-invasive ownership policy.
-- `Integration/Bus.lua` owns bounded in-memory breadcrumb rings.
-- UI modules consume services; they do not own capture or database state.
+`Capture/Policy.lua` runs immediately before `Capture/Engine.lua` and establishes a compatibility-first policy before file-load EarlyInit:
 
-## Data boundary
+```text
+current handler
+  -> one RothDevLib chain wrapper
+  -> previous handler forwarded once
+  -> later owner may replace RothDevLib
+  -> no automatic reclaim fight
+  -> BugGrabber delta fallback or explicit unavailable state
+  -> optional user `/rdev reclaim`
+```
 
-`Util/SecretGuard.lua` and `Util/Util.lua` gate external values before ordinary Lua operations. Public API, reports, restricted-action events, breadcrumbs and JSON export convert caller data into bounded snapshots. Foreign tables are never retained by reference.
+`Capture/Engine.lua` is the complete loaded ownership implementation; the obsolete legacy monolith is no longer loaded. `Capture/Safety.lua` adds the richer bounded intake and fallback diagnostics. Secure-only `AddLuaErrorHandler`, private ScriptErrorsFrame hooks/polling and global setter locking are not supported addon paths.
 
-## Blizzard UI integration
+## Data flow
 
-Use documented APIs, events and post-hooks. Presentation suppression is reversible by setting and never replaces Blizzard methods, mutates popup definitions, or unregisters events from foreign frames.
+```text
+external or runtime diagnostic input
+  -> immediate access gate
+  -> bounded detached ordinary copy
+  -> Capture entry construction
+  -> bounded DB group/session storage
+  -> callback dispatch with one copy per consumer
+  -> UI/export consumers
+```
 
-## Validation boundary
+`Util:CopyDiagnosticValue` uses raw traversal and bounds depth, entries, total nodes and string bytes. Callback payloads never expose live DB/bus tables or shared mutable copies between consumers.
 
-Offline syntax and mocked contract tests cannot prove combat lockdown, taint propagation, real secret-value behavior or Blizzard frame timing. Those remain explicit in-game release gates in [todo.md](todo.md).
+## Context and wrappers
+
+`Core/CallSafety.lua` is loaded after `Util/BoundedCopy.lua`, so public wrappers use the final ordinary-value boundary without duplicating the namespace/self-check owner.
+
+Doctor scopes are identity tokens. Normal calls remove their exact token. Hard-error wrappers keep the token available to the synchronous global handler and arm a one-frame token cleanup in case another owner handles the error. CPU/memory wrappers and internal calls preserve arbitrary return tuples, including nil positions; telemetry failure cannot alter a successful target result.
+
+## State
+
+`RothDevLibDB` is the only TOC-declared durable table. Capture queues, bus rings, callback registrations, profiler samples, timer handles and UI frames are transient. Export reads bounded ordinary snapshots.
+
+## Runtime gate
+
+Static tests cannot prove combat lockdown, taint propagation, secure execution or frame timing. Use `/rdev gate`, `/rdev stress`, `/rdev reloadloop` and the named-client matrix in [todo.md](todo.md), recording exact client build, Interface and addon commit.

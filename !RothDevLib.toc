@@ -26,8 +26,10 @@ Core\Internal.lua
 # Ordinary-value boundary and utilities
 Util\SecretGuard.lua
 Util\Util.lua
+Util\BoundedCopy.lua
 Util\JSON.lua
 Util\Logger.lua
+Core\CallSafety.lua
 
 # Export
 Export\Export.lua
@@ -50,7 +52,8 @@ Integration\LibStub.lua
 
 # Capture
 Capture\Locals.lua
-Capture\ErrorHandler.lua
+Capture\Policy.lua
+Capture\Engine.lua
 Capture\Safety.lua
 Capture\BugGrabber.lua
 Capture\Reported.lua

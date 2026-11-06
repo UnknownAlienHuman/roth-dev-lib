@@ -2,56 +2,90 @@
 
 ## Start here
 
-The executable contract is [`!RothDevLib.toc`](!RothDevLib.toc), not the archived planning documents. Its load order is deliberate: embedded LibStub/CallbackHandler/LibDataBroker/LibDBIcon, `Core/*` and utilities, Export, Perf, Doctor, Integration, Capture, UI, and finally `Core/Events.lua`. `Core/Events.lua:InitAll` is the lifecycle entry point; `Core/Core.lua` creates the `RDL` namespace and `Core/DB.lua` owns the `RothDevLibDB` SavedVariables table.
+The executable contract is [`!RothDevLib.toc`](!RothDevLib.toc), not archived planning documents. Its load order is deliberate: embedded libraries, Core and utilities, Export, Perf, Doctor, Integration, Capture, UI, then `Core/Events.lua`.
 
 The runtime path is:
 
-`ADDON_LOADED("!RothDevLib")` -> `DB:EnsureReady`/`Capture:EarlyInit` -> `PLAYER_LOGIN` -> `InitAll` -> DB, Logger, Doctor, Validation, Bus, memory watcher, Capture, UI, and minimap initialization. `PLAYER_LOGOUT` stops persistent/session work; `PLAYER_REGEN_ENABLED` flushes leave-combat capture work.
+`Capture/Policy.lua` -> one-time chain ownership policy -> `Capture/Engine.lua:EarlyInit` -> `ADDON_LOADED("!RothDevLib")` -> DB/capture readiness -> `PLAYER_LOGIN` -> `InitAll`.
+
+`Capture/Policy.lua` must load immediately before `Capture/Engine.lua`. It establishes the chain-once settings consumed by file-load EarlyInit. `Capture/Safety.lua` then installs the richer bounded intake and fallback policy. Do not reorder these files casually.
 
 ## Runtime map
 
-- `Core/DB.lua` initializes defaults, settings, groups, session indexes, bounded trimming, and clear/export-facing reads.
-- `Capture/ErrorHandler.lua` is the high-risk ingestion path. It captures Lua errors/warnings, locals, stack/addon attribution, taint/restriction events, boot-queue entries, and forwards structured entries to `DB:UpsertGroup`.
-- `Doctor/Doctor.lua`, `Doctor/Breadcrumbs.lua`, and `Doctor/Validation.lua` provide context, breadcrumbs, gates, stress tests, and reload-loop checks used by Capture and UI.
-- `Integration/Bus.lua` is the low-allocation cross-addon ring-buffer bus. `Integration/API.lua` exposes `RDL:InitAddon`, `Breadcrumb`, `Metric`, `Profile`, `MemDelta`, `Report*`, `Enter`, and `NewAddon`. `Integration/LibStub.lua` registers `RothDevLib-1.0` only when LibStub is available.
-- `Export/Export.lua` and `Export/Packer.lua` read bounded DB/context state and produce share/export text. `LibDeflate` is an optional runtime lookup, not a TOC dependency.
-- `UI/MainFrame.lua`, `DetailView.lua`, `Report.lua`, `Monitor.lua`, `ExportFrame.lua`, and `UI/Slash.lua` are consumers. `/rdev` is registered at `UI/Slash.lua:10-11`; addon-compartment callbacks are in `UI/AddonCompartment.lua`.
+- `Core/DB.lua` owns defaults, settings, grouped entries, sessions, indexes and trimming.
+- `Core/CallSafety.lua` owns public safe/unsafe wrappers and Doctor-token cleanup; `Core/Core.lua` retains namespace and self-check ownership.
+- `Core/Internal.lua` owns guarded internal execution; it must preserve arbitrary return tuples and always release its exact Doctor token.
+- `Doctor/Doctor.lua` owns the context stack. `Leave(expectedToken)` removes exactly that scope so delayed cleanup cannot pop an unrelated later context.
+- `Integration/Callbacks.lua` snapshots registrations before dispatch. New registrations wait for the next dispatch, replacements/unregistrations before a callback turn are respected, and every callback receives its own detached bounded payload.
+- `Integration/Bus.lua` owns bounded transient breadcrumbs/metrics.
+- `Capture/Engine.lua` owns initial handler construction, ownership state, entry construction and storage routing. `Capture/Safety.lua` owns the richer hard/suppressed/integration intake and fallback diagnostics.
+- `Capture/BugGrabber.lua` is the only hard-error fallback when RothDevLib loses handler ownership. It baselines existing history unless `importBugGrabberHistory == true`.
+- `Export/Export.lua` and `Export/Packer.lua` produce bounded reports. `LibDeflate` is optional.
+- UI modules are consumers; they do not own capture state.
 
-## State and dependencies
+## Ownership contract
 
-`RothDevLibDB` is the only TOC-declared durable table. Settings, grouped signatures, session data, ignore lists, bounded indexes, and exported diagnostics are written through `RDL.DB`; capture boot queues and module state are transient until DB readiness. Do not treat `RDL.Bus` ring buffers, UI frames, CPU/memory samplers, or Doctor snapshots as durable API.
+The global error handler is shared process state:
 
-The four embedded libraries are bundled and loaded before addon code. There is no required external addon dependency. Other in-house addons may consume the public Integration API or `LibStub("RothDevLib-1.0", true)`, but `!RothDevLib` does not load them. Preserve third-party library notices when changing vendored files.
+1. RothDevLib chain-wraps the current handler once during EarlyInit.
+2. It forwards to the previous handler in chain mode.
+3. If a later addon replaces it, RothDevLib records the new owner and attaches BugGrabber fallback when available.
+4. It does **not** automatically reclaim, poll or fight the later owner.
+5. `/rdev reclaim` is the only supported explicit reclaim path.
+
+Do not reintroduce:
+
+- `_G.seterrorhandler = function() end`;
+- periodic ownership reclaim;
+- reclaim from the `seterrorhandler` post-hook;
+- a mutating “probe” that temporarily swaps the handler;
+- `AddLuaErrorHandler` from ordinary addon execution (selected Blizzard source asserts secure execution);
+- ScriptErrorsFrame private polling or method hooks.
+
+## State and data boundaries
+
+`RothDevLibDB` is the only durable table. Persist only bounded ordinary copies. External tables, secret-capable values, frames, callbacks, timers and pooled objects must not survive into DB state.
+
+`Util:CopyDiagnosticValue` owns the generic copy boundary:
+
+- gate value/table access before Lua operations;
+- traverse with raw `next`/`rawget`, not foreign `__pairs`/`__index`;
+- bound depth, per-table entries, total nodes and string bytes;
+- preserve nil only as tuple position, not as an invented table value;
+- replace cycles, inaccessible values and unsupported runtime types with explicit markers.
+
+Callbacks are not an ownership shortcut. `RDL:Fire` provides independent detached copies; consumers must not depend on table identity or mutate DB state through callback payloads.
 
 ## Change routing
 
-- Change persistence, defaults, migration, trimming, or schema: `Core/DB.lua` (`DB:Init`, `EnsureReady`, `UpsertGroup`) and corresponding validation in `Core/DB.lua`.
-- Change event/lifecycle ordering: `Core/Events.lua`; keep early capture before `PLAYER_LOGIN` and keep calls wrapped by `ICall`/`Internal:Call`.
-- Change error ownership, handler reclaim, locals filtering, or taint capture: `Capture/ErrorHandler.lua`, then `Capture/Locals.lua`, `Reported.lua`, `Taint.lua`, or `Suppress.lua` as appropriate.
-- Add an integration capability: implement the bounded primitive in `Integration/Bus.lua`, expose it through `Integration/API.lua`, and document the consumer contract in `docs/INTEGRATION.md`.
-- Change export size/format: `Export/Export.lua` and `Export/Packer.lua`; keep output bounded and secret-safe.
-- Change display only: `UI/*`; do not let UI bypass DB/Bus/Capture ownership.
-- Change performance sampling: `Perf/CPU.lua`/`Perf/Mem.lua`; preserve sampling intervals and reset semantics.
-
-## Invariants/risks
-
-- The global error handler is shared process state. `Capture:EnsureHandler`, `ApplyHandlerLock`, and `TryReclaimHandler` must remain idempotent and must not recursively report their own failures.
-- `hooksecurefunc`, protected frames, `InCombatLockdown`, restricted/secret values, and addon-action taint are explicit risk boundaries. Keep capture/diagnostic calls protected with `pcall`/`Internal:Call`; never perform protected UI mutations from the error path.
-- Error ingestion and `DB:UpsertGroup` are hot paths. Keep group/session indexes bounded, preserve Storm throttling, and avoid per-event frame/UI creation.
-- Capture can run before SavedVariables are ready; the boot queue must flush only after `DB:IsReady()`.
-- UI and optional LibDeflate/LibStub integrations must degrade to no-op/diagnostic states when unavailable.
+- Persistence/schema/trimming: `Core/DB.lua`.
+- Initial ownership policy: `Capture/Policy.lua`.
+- Handler construction/ownership state: `Capture/Engine.lua`.
+- Current intake, manual reclaim and fallback selection: `Capture/Safety.lua`.
+- BugGrabber counters/history: `Capture/BugGrabber.lua`.
+- Public wrappers: `Core/CallSafety.lua`, `Integration/API.lua`, `Integration/LibStub.lua`.
+- Callback semantics: `Integration/Callbacks.lua`.
+- Context lifecycle: `Doctor/Doctor.lua`, `Core/Internal.lua`.
+- Performance wrappers: `Perf/CPU.lua`, `Perf/Mem.lua`; preserve the complete return tuple and keep telemetry best-effort.
+- Export format/budgets: `Export/*`.
+- Display only: `UI/*`.
 
 ## Verification
 
-Static checks from the repository root:
+Offline:
 
-```powershell
-rg -n "RothDevLibDB|InitAll|Capture:EarlyInit|EnsureHandler|SlashCmdList" _Addons/!RothDevLib
-Get-Content _Addons/!RothDevLib/!RothDevLib.toc
+```sh
+./tests/run.sh
+find Core Capture Doctor Integration Perf Util UI Export -name '*.lua' -print0 | xargs -0 -n1 texluac -p
 ```
 
-In-game smoke checks: `/rdev status`, `/rdev gate`, `/rdev test error`, `/rdev test warning`, `/rdev test taint`, `/rdev stress`, `/rdev reloadloop 2`, `/rdev export`, and `/rdev clear`. Verify standalone operation, BugGrabber coexistence, combat/leave-combat, bounded export, reload persistence, and zero self-generated blocked/forbidden actions. Confirm the resulting `RothDevLibDB` shape in the client SavedVariables file rather than assuming a UI message proves persistence.
+Required client matrix:
 
-## Unknowns
+- RothDevLib only: login/reload, hard/suppressed/report/warning/taint paths.
+- RothDevLib + BugGrabber/BugSack: no duplicate import or ownership churn.
+- Replace the handler after login: no automatic reclaim; fallback/unavailable state is accurate.
+- Explicit `/rdev reclaim`: one bounded user-requested attempt.
+- Combat and restriction transitions: zero RothDevLib-caused blocked/forbidden actions.
+- Stress/reload/export/DB persistence and SavedVariables inspection.
 
-Static review cannot prove current Retail frame names, Blizzard handler ownership, or the exact behavior of restricted values on every 12.x build. Those claims require the target client and the existing release-gate matrix in `todo.md`.
+Static review cannot certify client taint, secure execution, frame timing or actual Secret Value behavior. Record exact client build, Interface and addon commit for runtime PASS.

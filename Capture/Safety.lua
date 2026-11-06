@@ -1,7 +1,7 @@
 -- !RothDevLib/Capture/Safety.lua
 -- Central safety policy for capture paths retained from the legacy owner.
--- Loaded immediately after ErrorHandler.lua so its public methods replace the
--- unsafe intake edges without duplicating the ownership/fallback machinery.
+-- Loaded immediately after Engine.lua so its public methods replace the
+-- early intake edges without duplicating ownership machinery.
 
 local RDL = _G.RothDevLib
 local Capture = RDL and RDL.Capture
@@ -56,7 +56,11 @@ local function SafeCopy(value, opts)
 end
 
 local function OptionalText(value, maxBytes)
-  local copy = SafeCopy(value, { maxDepth = 1, maxEntries = 1, maxStringBytes = maxBytes or 256 })
+  local copy = SafeCopy(value, {
+    maxDepth = 1,
+    maxEntries = 1,
+    maxStringBytes = maxBytes or 256,
+  })
   if copy == nil then return nil end
   return SafeText(copy, "", maxBytes)
 end
@@ -72,6 +76,24 @@ end
 local function SafeLog(level, tag, message, data)
   if type(RDL.Log) ~= "function" then return end
   pcall(RDL.Log, RDL, level, tag, message, SafeCopy(data))
+end
+
+local function FunctionSource(fn)
+  if type(fn) ~= "function" then return "<?>" end
+  local debugTable = _G.debug
+  local getInfo = type(debugTable) == "table" and debugTable.getinfo or nil
+  if type(getInfo) ~= "function" then return "<?>" end
+
+  local ok, info = pcall(getInfo, fn, "S")
+  if not ok or type(info) ~= "table" then return "<?>" end
+  return SafeText(info.short_src, "<?>" , 512)
+end
+
+local function AddonFromSource(source)
+  if type(source) ~= "string" then return nil end
+  source = source:gsub("^@", "")
+  return source:match("Interface[/\\]AddOns[/\\]([^/\\]+)[/\\]")
+    or source:match("AddOns[/\\]([^/\\]+)[/\\]")
 end
 
 local function BuildErrorKeys(message, stack)
@@ -138,6 +160,12 @@ local function CaptureLocals()
   return SafeCopy(value, { maxDepth = 4, maxEntries = 80, maxStringBytes = 8192 })
 end
 
+local function ResetDoctor()
+  if RDL.Doctor and type(RDL.Doctor.Reset) == "function" then
+    pcall(RDL.Doctor.Reset, RDL.Doctor)
+  end
+end
+
 local function NotifyCaptured()
   local settings = GetSettings()
   if settings.chatNotifyOnError ~= true then return end
@@ -162,7 +190,8 @@ local function NotifyCaptured()
   end
 
   if type(_G.print) == "function" then
-    pcall(_G.print, "|cffff3333RothDevLib|r captured Lua error." .. link .. " Use |cffffff00/rdev|r")
+    pcall(_G.print, "|cffff3333RothDevLib|r captured Lua error." .. link
+      .. " Use |cffffff00/rdev|r")
   end
 end
 
@@ -174,64 +203,42 @@ local function IsAddonLoaded(name)
   return ok and loaded == true
 end
 
--- Current Retail fallback: Blizzard_ScriptErrors fans hard errors out through
--- AddLuaErrorHandler. Keep exactly one callback and ignore it while our own
--- global handler is active, otherwise chain mode would store the same error
--- twice after forwarding to Blizzard.
+-- Current Blizzard_ScriptErrors exposes AddLuaErrorHandler only to secure
+-- callers. Ordinary addons must not call it. When RothDevLib no longer owns the
+-- global handler, the supported fallback is BugGrabber import or an explicit
+-- unavailable state.
 function Capture:InstallFallbackHooks()
   self._fallback = self._fallback or {}
+  self._fallback.blizzardLuaHandlerUnsupported = true
+  self._fallback.blizzardLuaHandlerHooked = false
+  self._fallback.scriptErrorsHooked = false
+  self._fallback.scriptErrorsFrameSyncEnabled = false
+
   local settings = GetSettings()
+  local bug = self.BugGrabber
 
-  if settings.fallbackHookScriptErrors ~= false
-      and not self._fallback.blizzardLuaHandlerHooked
-      and type(_G.AddLuaErrorHandler) == "function" then
-    local ok = pcall(_G.AddLuaErrorHandler, function(message, stack, locals)
-      if not Capture or Capture._disabled or Capture.ownsHandler then return end
-      local entry = BuildAndStore("LUA_ERROR", message, stack, locals, nil, nil, {
-        source = "AddLuaErrorHandler",
-        fallback = true,
-      })
-      if entry then
-        SafeLog("ERROR", "LUA", "Fallback Lua error captured", {
-          addon = entry.addon,
-          func = entry.func,
-        })
-      end
-    end)
-    self._fallback.blizzardLuaHandlerHooked = ok == true
-  end
-
-  if settings.fallbackHookScriptErrors ~= false
-      and not self._fallback.blizzardLuaHandlerHooked
-      and not self._fallback.waitingScriptErrors
-      and type(_G.CreateFrame) == "function" then
-    local okFrame, watcher = pcall(_G.CreateFrame, "Frame")
-    if okFrame and watcher and type(watcher.RegisterEvent) == "function"
-        and type(watcher.SetScript) == "function" then
-      self._fallback.waitingScriptErrors = true
-      pcall(watcher.RegisterEvent, watcher, "ADDON_LOADED")
-      pcall(watcher.SetScript, watcher, "OnEvent", function(owner)
-        if type(_G.AddLuaErrorHandler) ~= "function" then return end
-        if type(owner.UnregisterEvent) == "function" then
-          pcall(owner.UnregisterEvent, owner, "ADDON_LOADED")
-        end
-        if type(owner.SetScript) == "function" then
-          pcall(owner.SetScript, owner, "OnEvent", nil)
-        end
-        Capture._fallback.waitingScriptErrors = false
-        Capture:InstallFallbackHooks()
-      end)
-    end
-  end
-
-  if settings.importBugGrabber ~= false and not self.ownsHandler
-      and self.BugGrabber and type(self.BugGrabber.Enable) == "function"
-      and type(self.BugGrabber.IsPresent) == "function" then
-    local okPresent, present = pcall(self.BugGrabber.IsPresent, self.BugGrabber)
+  if self.ownsHandler then
+    if bug and type(bug.Disable) == "function" then pcall(bug.Disable, bug) end
+    self._fallback.bugGrabberEnabled = false
+  elseif settings.importBugGrabber ~= false and bug
+      and type(bug.Enable) == "function" and type(bug.IsPresent) == "function" then
+    local okPresent, present = pcall(bug.IsPresent, bug)
     if okPresent and present then
-      pcall(self.BugGrabber.Enable, self.BugGrabber)
-      self._fallback.bugGrabberEnabled = true
+      local okEnable, enabled = pcall(bug.Enable, bug)
+      self._fallback.bugGrabberEnabled = okEnable and enabled == true
+    else
+      self._fallback.bugGrabberEnabled = false
     end
+  else
+    self._fallback.bugGrabberEnabled = false
+  end
+
+  if self.ownsHandler then
+    self._fallback.kind = "owned"
+  elseif self._fallback.bugGrabberEnabled then
+    self._fallback.kind = "buggrabber"
+  else
+    self._fallback.kind = "unavailable"
   end
 
   self.ownerInfo = self.ownerInfo or {}
@@ -239,11 +246,10 @@ function Capture:InstallFallbackHooks()
   self.ownerInfo.addons.BugGrabber = IsAddonLoaded("!BugGrabber") or IsAddonLoaded("BugGrabber")
   self.ownerInfo.addons.BugSack = IsAddonLoaded("BugSack")
   self.ownerInfo.addons.DebugTools = IsAddonLoaded("Blizzard_DebugTools")
+  self.ownerInfo.fallback = self._fallback.kind
 end
 
 -- Replacing seterrorhandler() with a no-op is intentionally unsupported.
--- ErrorHandler.lua runs EarlyInit at file load, so restore the real setter when
--- an old persisted lock setting already installed the no-op before this file.
 function Capture:ApplyHandlerLock()
   if self._locked and type(self._real_seterrorhandler) == "function" then
     _G.seterrorhandler = self._real_seterrorhandler
@@ -262,9 +268,104 @@ function Capture:ApplyHandlerLock()
   end
 end
 
--- Secret-safe hard-error intake. Handler closures created by ErrorHandler.lua
+-- Non-mutating status probe. The old probe temporarily replaced the process
+-- handler merely to test the setter, which could lose an error in that window.
+function Capture:ProbeSetErrorHandler()
+  local current = type(_G.geterrorhandler) == "function" and _G.geterrorhandler() or nil
+  local source = FunctionSource(current)
+  local result = {
+    ts = type(_G.time) == "function" and _G.time() or 0,
+    skipped = true,
+    reason = "non-mutating-policy",
+    global_src = FunctionSource(_G.seterrorhandler),
+    real_src = FunctionSource(self._real_seterrorhandler),
+    before_src = source,
+    before_addon = AddonFromSource(source),
+  }
+  self.ownerInfo = self.ownerInfo or {}
+  self.ownerInfo.setEHProbe = result
+  self._setEHProbe = result
+  return result
+end
+
+local function IsManualReclaim(reason)
+  return reason == "slash" or reason == "manual" or reason == "user"
+end
+
+-- Install once during EarlyInit and do not fight later owners. Automatic calls
+-- become ownership synchronization + fallback attachment. Only an explicit
+-- user action may reclaim and chain-wrap the current owner.
+function Capture:TryReclaimHandler(reason)
+  reason = SafeText(reason, "automatic", 64)
+
+  if not IsManualReclaim(reason) then
+    if type(self.SyncOwnership) == "function" then
+      pcall(self.SyncOwnership, self, reason)
+    end
+    if not self.ownsHandler then self:InstallFallbackHooks() end
+
+    self.ownerInfo = self.ownerInfo or {}
+    self.ownerInfo.autoReclaimSuppressed = true
+    self.ownerInfo.autoReclaimReason = reason
+    return self.ownsHandler == true
+  end
+
+  local current = type(_G.geterrorhandler) == "function" and _G.geterrorhandler() or nil
+  if self.ownsHandler and current == self._handler then
+    return true
+  end
+  if type(self.EnsureHandler) == "function" then
+    pcall(self.EnsureHandler, self, current, reason)
+  end
+
+  local setter = self._real_seterrorhandler
+  if type(setter) ~= "function" then setter = _G.seterrorhandler end
+  if type(setter) ~= "function" or type(self._handler) ~= "function" then
+    self:InstallFallbackHooks()
+    return false
+  end
+
+  local okSet = pcall(setter, self._handler)
+  local nowHandler = type(_G.geterrorhandler) == "function" and _G.geterrorhandler() or nil
+  local owned = okSet and nowHandler == self._handler
+  self.ownsHandler = owned and true or false
+
+  self.ownerInfo = self.ownerInfo or {}
+  self.ownerInfo.reclaim = self.ownerInfo.reclaim or {}
+  self.ownerInfo.reclaim[#self.ownerInfo.reclaim + 1] = {
+    ts = type(_G.time) == "function" and _G.time() or 0,
+    reason = reason,
+    ok = owned,
+    nowHandlerSrc = FunctionSource(nowHandler),
+  }
+  self.ownerInfo.nowHandlerSrc = FunctionSource(nowHandler)
+  self.ownerInfo.nowHandlerAddon = AddonFromSource(self.ownerInfo.nowHandlerSrc)
+
+  if type(self._SetOwnershipState) == "function" then
+    pcall(self._SetOwnershipState, self, owned and "owned" or "not-owned", reason)
+  end
+
+  if owned then
+    if self.BugGrabber and type(self.BugGrabber.Disable) == "function" then
+      pcall(self.BugGrabber.Disable, self.BugGrabber)
+    end
+    SafeLog("INFO", "CAPTURE", "Reclaimed Lua errorhandler by user request", {
+      mode = self._handlerMode,
+    })
+    return true
+  end
+
+  self:InstallFallbackHooks()
+  SafeLog("WARN", "CAPTURE", "Failed to reclaim Lua errorhandler", {
+    reason = reason,
+    now = self.ownerInfo.nowHandlerSrc,
+  })
+  return false
+end
+
+-- Secret-safe hard-error intake. Handler closures created by Engine.lua
 -- resolve this method dynamically, so replacing it here also fixes handlers
--- that were installed during EarlyInit before this module loaded.
+-- installed during EarlyInit before this module loaded.
 function Capture:OnLuaError(err, stack, noForward)
   if self._disabled then return false end
   if self._inHandler then
@@ -295,10 +396,7 @@ function Capture:OnLuaError(err, stack, noForward)
       })
     end
 
-    if RDL.Doctor and type(RDL.Doctor.Reset) == "function" then
-      pcall(RDL.Doctor.Reset, RDL.Doctor)
-    end
-
+    ResetDoctor()
     if captured then NotifyCaptured() end
   end, function(innerError)
     return SafeText(innerError, "<capture-error>", 2048)
@@ -306,11 +404,10 @@ function Capture:OnLuaError(err, stack, noForward)
 
   self._inHandler = false
   if not okRun then
+    ResetDoctor()
     SafeLog("ERROR", "CAPTURE", "OnLuaError failed", { error = runError })
   end
 
-  -- Exclusive mode may optionally forward. Chain mode passes noForward=true
-  -- and forwards exactly once in its already-installed wrapper.
   local settings = GetSettings()
   if not noForward and settings.forwardToDefaultErrorHandler == true
       and type(self.prevErrorHandler) == "function" then
@@ -345,8 +442,6 @@ function Capture:OnSuppressedError(err, stack, locals, addonName, funcName, extr
   return entry
 end
 
--- Direct callers of the low-level integration method receive the same boundary
--- as the public API. This also protects internal alerts assembled from API data.
 function Capture:OnIntegrationEvent(kind, addonName, code, message, data, level)
   if self._disabled then return nil end
 

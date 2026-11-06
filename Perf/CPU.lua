@@ -1,14 +1,6 @@
 -- !RothDevLib/Perf/CPU.lua
--- Phase 3: CPU profiling helpers.
---
--- Goals:
---   * Measure cost of wrapped callbacks (events, hooks, timers, loops).
---   * Emit lightweight metrics (Bus:Metric) without chat spam.
---   * Trigger structured ALERT entries on spikes.
---
--- Notes:
---   * debugprofilestop() exists in WoW and returns milliseconds.
---   * In case it's unavailable, we fall back to GetTime() * 1000.
+-- Lightweight synchronous call profiling. Profiling failures never alter the
+-- wrapped function's return tuple or turn a successful call into an error.
 
 local RDL = _G.RothDevLib
 if not RDL then return end
@@ -19,24 +11,47 @@ RDL.CPU = CPU
 CPU._stats = CPU._stats or {}
 CPU._lastAlert = CPU._lastAlert or {}
 
-local function NowMs()
-  if type(debugprofilestop) == "function" then
-    return debugprofilestop()
-  end
-  if type(GetTime) == "function" then
-    return GetTime() * 1000
-  end
-  return (time() or 0) * 1000
+local Unpack = table.unpack or unpack
+
+local function Pack(...)
+  return { n = select("#", ...), ... }
 end
 
-local function Clamp(n, lo, hi)
-  if n < lo then return lo end
-  if n > hi then return hi end
-  return n
+local function NowMs()
+  if type(_G.debugprofilestop) == "function" then
+    local ok, value = pcall(_G.debugprofilestop)
+    if ok and type(value) == "number" then return value end
+  end
+  if type(_G.GetTime) == "function" then
+    local ok, value = pcall(_G.GetTime)
+    if ok and type(value) == "number" then return value * 1000 end
+  end
+  if type(_G.time) == "function" then
+    local ok, value = pcall(_G.time)
+    if ok and type(value) == "number" then return value * 1000 end
+  end
+  return 0
 end
 
 local function GetSettings()
-  return (RDL.DB and RDL.DB.GetSettings and RDL.DB:GetSettings()) or nil
+  if RDL.DB and type(RDL.DB.GetSettings) == "function" then
+    local ok, settings = pcall(RDL.DB.GetSettings, RDL.DB)
+    if ok and type(settings) == "table" then return settings end
+  end
+  return nil
+end
+
+local function Option(opts, key)
+  if type(opts) ~= "table" then return nil end
+  local ok, value = pcall(rawget, opts, key)
+  if ok then return value end
+  return nil
+end
+
+local function Clamp(value, minimum, maximum)
+  if value < minimum then return minimum end
+  if value > maximum then return maximum end
+  return value
 end
 
 local function Key(addonName, funcName)
@@ -44,96 +59,105 @@ local function Key(addonName, funcName)
 end
 
 local function ShouldSample(opts, settings)
-  if opts and opts.sampleRate ~= nil then
-    local sr = tonumber(opts.sampleRate) or 1
-    if sr <= 0 then return false end
-    if sr >= 1 then return true end
-    return math.random() < sr
+  local configured = Option(opts, "sampleRate")
+  if configured == nil and type(settings) == "table" then
+    configured = rawget(settings, "cpuSampleRate")
   end
-  local sr = settings and tonumber(settings.cpuSampleRate)
-  if sr == nil then return true end
-  if sr <= 0 then return false end
-  if sr >= 1 then return true end
-  return math.random() < sr
+
+  local sampleRate = tonumber(configured)
+  if sampleRate == nil then sampleRate = 1 end
+  if sampleRate <= 0 then return false end
+  if sampleRate >= 1 then return true end
+  return math.random() < sampleRate
 end
 
-local function AlertThrottleOK(k, nowMs, minIntervalMs)
-  minIntervalMs = tonumber(minIntervalMs) or 0
-  if minIntervalMs <= 0 then return true end
-  local last = CPU._lastAlert[k]
-  if last and (nowMs - last) < minIntervalMs then return false end
-  CPU._lastAlert[k] = nowMs
+local function AlertThrottleOK(key, nowMs, minimumIntervalMs)
+  minimumIntervalMs = tonumber(minimumIntervalMs) or 0
+  if minimumIntervalMs <= 0 then return true end
+  local last = CPU._lastAlert[key]
+  if last and (nowMs - last) < minimumIntervalMs then return false end
+  CPU._lastAlert[key] = nowMs
   return true
 end
 
-local function UpdateStats(k, dt)
-  local s = CPU._stats[k]
-  if not s then
-    s = { n = 0, total = 0, max = 0, ema = 0, last = 0 }
-    CPU._stats[k] = s
+local function UpdateStats(key, elapsedMs)
+  local stats = CPU._stats[key]
+  if not stats then
+    stats = { n = 0, total = 0, max = 0, ema = 0, last = 0 }
+    CPU._stats[key] = stats
   end
 
-  s.n = (s.n or 0) + 1
-  s.total = (s.total or 0) + dt
-  s.last = dt
-  if dt > (s.max or 0) then s.max = dt end
+  stats.n = (stats.n or 0) + 1
+  stats.total = (stats.total or 0) + elapsedMs
+  stats.last = elapsedMs
+  if elapsedMs > (stats.max or 0) then stats.max = elapsedMs end
 
-  -- Exponential moving average (fast + stable)
-  local a = 0.15
-  if s.n <= 1 then s.ema = dt
-  else s.ema = (s.ema or dt) * (1 - a) + dt * a end
-
-  return s
+  local alpha = 0.15
+  if stats.n <= 1 then
+    stats.ema = elapsedMs
+  else
+    stats.ema = (stats.ema or elapsedMs) * (1 - alpha) + elapsedMs * alpha
+  end
+  return stats
 end
 
--- Public: Measure a function call and emit metrics/alerts.
--- Returns: fn(...) return values.
+local function Record(addonName, funcName, elapsedMs, opts, settings)
+  local key = Key(addonName, funcName)
+  local stats = UpdateStats(key, elapsedMs)
+
+  if RDL.Bus and type(RDL.Bus.Metric) == "function" then
+    local minimum = Option(opts, "metricMinInterval")
+      or (type(settings) == "table" and rawget(settings, "metricMinInterval"))
+      or 1
+    pcall(RDL.Bus.Metric, RDL.Bus, addonName, "cpu_ms:" .. tostring(funcName),
+      elapsedMs, "ms", { minInterval = minimum })
+  end
+
+  local spikeMs = tonumber(Option(opts, "spikeMs"))
+    or (type(settings) == "table" and tonumber(rawget(settings, "cpuSpikeMs")))
+    or 16
+  spikeMs = Clamp(spikeMs, 1, 5000)
+
+  if elapsedMs >= spikeMs and type(RDL.Alert) == "function" then
+    local alertMinimum = tonumber(Option(opts, "alertMinIntervalMs"))
+      or (type(settings) == "table" and tonumber(rawget(settings, "cpuAlertMinIntervalMs")))
+      or 2000
+    local now = NowMs()
+    if AlertThrottleOK("cpu:" .. key, now, alertMinimum) then
+      pcall(RDL.Alert, RDL, addonName, "CPU_SPIKE",
+        tostring(funcName) .. " took " .. string.format("%.2f", elapsedMs) .. "ms", {
+          ms = elapsedMs,
+          ema = stats.ema,
+          max = stats.max,
+          n = stats.n,
+        }, "WARN")
+    end
+  end
+end
+
 function CPU:Measure(addonName, funcName, fn, opts, ...)
   if type(fn) ~= "function" then return nil end
 
   local settings = GetSettings()
-  if settings and settings.enablePerfProfiling == false then
+  if settings and rawget(settings, "enablePerfProfiling") == false then
     return fn(...)
   end
   if not ShouldSample(opts, settings) then
     return fn(...)
   end
 
-  local t0 = NowMs()
-  local r1, r2, r3, r4, r5, r6 = fn(...)
-  local dt = NowMs() - t0
-  if dt < 0 then dt = 0 end
+  local startedAt = NowMs()
+  -- Do not catch target errors here. Profile/WrapProfiled keep the original
+  -- hard-error behavior of the wrapped function.
+  local result = Pack(fn(...))
+  local elapsedMs = NowMs() - startedAt
+  if elapsedMs < 0 then elapsedMs = 0 end
 
-  local k = Key(addonName, funcName)
-  local s = UpdateStats(k, dt)
-
-  -- Metric (throttled by Bus)
-  if RDL.Bus and RDL.Bus.Metric then
-    local mopts = { minInterval = (opts and opts.metricMinInterval) or (settings and settings.metricMinInterval) or 1 }
-    RDL.Bus:Metric(addonName, "cpu_ms:" .. tostring(funcName), dt, "ms", mopts)
-  end
-
-  -- Alert on spikes
-  local spikeMs = (opts and tonumber(opts.spikeMs)) or (settings and tonumber(settings.cpuSpikeMs)) or 16
-  spikeMs = Clamp(spikeMs, 1, 5000)
-
-  if dt >= spikeMs and RDL.Alert then
-    local now = NowMs()
-    local alertMin = (opts and tonumber(opts.alertMinIntervalMs)) or (settings and tonumber(settings.cpuAlertMinIntervalMs)) or 2000
-    if AlertThrottleOK("cpu:" .. k, now, alertMin) then
-      RDL:Alert(addonName, "CPU_SPIKE", tostring(funcName) .. " took " .. string.format("%.2f", dt) .. "ms", {
-        ms = dt,
-        ema = s and s.ema,
-        max = s and s.max,
-        n = s and s.n,
-      }, "WARN")
-    end
-  end
-
-  return r1, r2, r3, r4, r5, r6
+  -- Telemetry is best-effort and cannot affect function semantics.
+  pcall(Record, addonName, funcName, elapsedMs, opts, settings)
+  return Unpack(result, 1, result.n)
 end
 
--- Public: wrap a function to profile each call.
 function CPU:Wrap(addonName, funcName, fn, opts)
   if type(fn) ~= "function" then return fn end
   return function(...)
@@ -143,14 +167,10 @@ end
 
 function CPU:ResetStats()
   if self._stats then
-    for k in pairs(self._stats) do
-      self._stats[k] = nil
-    end
+    for key in pairs(self._stats) do self._stats[key] = nil end
   end
   if self._lastAlert then
-    for k in pairs(self._lastAlert) do
-      self._lastAlert[k] = nil
-    end
+    for key in pairs(self._lastAlert) do self._lastAlert[key] = nil end
   end
 end
 
