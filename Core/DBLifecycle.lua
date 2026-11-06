@@ -142,23 +142,25 @@ local function NormalizeGroups(db)
     end
   end
 
-  local count, removable = 0, {}
+  local count, candidates = 0, {}
   for signature, group in pairs(groups) do
     count = count + 1
-    if group.pinned ~= true then
-      removable[#removable + 1] = {
-        signature = signature,
-        lastSeen = FiniteNumber(group.lastSeen) and group.lastSeen or 0,
-      }
-    end
+    candidates[#candidates + 1] = {
+      signature = signature,
+      pinned = group.pinned == true,
+      lastSeen = FiniteNumber(group.lastSeen) and group.lastSeen or 0,
+    }
   end
-  table.sort(removable, function(a, b)
+  table.sort(candidates, function(a, b)
+    -- Preserve pinned groups before ordinary groups, but never let pinning turn
+    -- the persistence limit into an unbounded store.
+    if a.pinned ~= b.pinned then return a.pinned == false end
     if a.lastSeen == b.lastSeen then return a.signature < b.signature end
     return a.lastSeen < b.lastSeen
   end)
   local removeCount = math.max(0, count - db.settings.maxGroups)
-  for index = 1, math.min(removeCount, #removable) do
-    groups[removable[index].signature] = nil
+  for index = 1, math.min(removeCount, #candidates) do
+    groups[candidates[index].signature] = nil
   end
 end
 
@@ -221,6 +223,25 @@ local function NormalizeSessions(db)
   db.sessionIndex = normalizedIndex
 end
 
+local function PrepareRawDatabase()
+  if type(_G.RothDevLibDB) ~= "table" then _G.RothDevLibDB = {} end
+  local db = _G.RothDevLibDB
+  if type(db.settings) ~= "table" then db.settings = {} end
+  if type(db.groups) ~= "table" then db.groups = {} end
+  if type(db.sessions) ~= "table" then db.sessions = {} end
+  if type(db.sessionIndex) ~= "table" then db.sessionIndex = {} end
+  if type(db.ignore) ~= "table" then db.ignore = { sig = {}, addon = {} } end
+  if type(db.ignore.sig) ~= "table" then db.ignore.sig = {} end
+  if type(db.ignore.addon) ~= "table" then db.ignore.addon = {} end
+
+  -- Bound persisted work before the legacy owner scans sessions or merges
+  -- defaults. This remains player-independent and does not create a session.
+  NormalizeSettings(db.settings)
+  NormalizeGroups(db)
+  NormalizeSessions(db)
+  return db
+end
+
 local function NormalizeDatabase(self)
   local db = self.raw
   if type(db) ~= "table" then return false end
@@ -234,6 +255,40 @@ local function NormalizeDatabase(self)
   return true
 end
 
+local function HardTrimRuntimeGroups(self)
+  local db = self.raw
+  if type(db) ~= "table" or type(db.groups) ~= "table" then return end
+  local settings = type(db.settings) == "table" and db.settings or {}
+  local maximum = tonumber(settings.maxGroups) or 200
+  if maximum < 10 then maximum = 10 elseif maximum > 5000 then maximum = 5000 end
+
+  local candidates = {}
+  for signature, group in pairs(db.groups) do
+    if type(signature) == "string" and type(group) == "table" then
+      candidates[#candidates + 1] = {
+        signature = signature,
+        pinned = group.pinned == true,
+        lastSeen = FiniteNumber(group.lastSeen) and group.lastSeen or 0,
+      }
+    end
+  end
+  if #candidates <= maximum then return end
+
+  table.sort(candidates, function(a, b)
+    if a.pinned ~= b.pinned then return a.pinned == false end
+    if a.lastSeen == b.lastSeen then return a.signature < b.signature end
+    return a.lastSeen < b.lastSeen
+  end)
+  local removeCount = #candidates - maximum
+  for index = 1, removeCount do
+    local signature = candidates[index].signature
+    db.groups[signature] = nil
+    if type(self._RemoveSigFromAllSessionIndexes) == "function" then
+      self:_RemoveSigFromAllSessionIndexes(signature)
+    end
+  end
+end
+
 function DB:MarkPlayerReady()
   self._playerReady = true
 end
@@ -241,6 +296,7 @@ end
 function DB:Init()
   if not self._playerReady then return false end
   if not self:IsReady() then
+    PrepareRawDatabase()
     local ok, result = pcall(OriginalInit, self)
     if not ok then error(result, 0) end
   end
@@ -256,11 +312,18 @@ function DB:EnsureReady()
   return NormalizeDatabase(self) and true
 end
 
+
 -- Early entries captured before PLAYER_LOGIN have no session identity. Bind them
 -- to the first real player session only when they are finally committed.
 function DB:UpsertGroup(entry)
   if type(entry) == "table" and entry.sessionId == nil and self.sessionId ~= nil then
     entry.sessionId = self.sessionId
   end
-  return OriginalUpsertGroup(self, entry)
+  local group = OriginalUpsertGroup(self, entry)
+  HardTrimRuntimeGroups(self)
+  if type(entry) == "table" and type(entry.sig) == "string"
+      and type(self.raw) == "table" and type(self.raw.groups) == "table" then
+    return self.raw.groups[entry.sig]
+  end
+  return group
 end

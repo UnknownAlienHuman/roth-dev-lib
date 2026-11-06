@@ -1,6 +1,6 @@
 _G.RothDevLib = {}
 local RDL = RothDevLib
-local calls = { unitName = 0, init = 0, upsert = 0 }
+local calls = { unitName = 0, init = 0, upsert = 0, groupsAtInit = nil, sessionsAtInit = nil }
 function _G.time() return 100 end
 function _G.UnitClass() return 'Mage', 'MAGE', 8 end
 function _G.GetSpecialization() return 1 end
@@ -51,7 +51,6 @@ for index = 1, 11 do
   }
 end
 
-
 -- Compact model of the legacy DB owner. DBLifecycle must delay this player-
 -- dependent initialization without replacing the actual persistence owner.
 local DB = {}
@@ -60,6 +59,10 @@ function DB:IsReady() return self.raw ~= nil and type(self.raw.groups) == 'table
 function DB:GetSettings() return self.raw and self.raw.settings end
 function DB:Init()
   calls.init = calls.init + 1
+  calls.sessionsAtInit = #_G.RothDevLibDB.sessions
+  local groupCount = 0
+  for _ in pairs(_G.RothDevLibDB.groups) do groupCount = groupCount + 1 end
+  calls.groupsAtInit = groupCount
   if self:IsReady() then return end
   self.raw = _G.RothDevLibDB
   self.raw.settings = type(self.raw.settings) == 'table' and self.raw.settings or {}
@@ -89,6 +92,8 @@ function DB:EnsureReady()
 end
 function DB:UpsertGroup(entry)
   calls.upsert = calls.upsert + 1
+  entry.lastSeen = entry.lastSeen or entry.ts or time()
+  entry.pinned = entry.pinned == true
   self.raw.groups[entry.sig] = entry
   return entry
 end
@@ -110,6 +115,7 @@ DB:MarkPlayerReady()
 assert(DB:Init() == true)
 assert(DB.session and DB.session.character == 'Tester-Realm')
 assert(calls.unitName == 1 and calls.init == 1)
+assert(calls.groupsAtInit == 10 and calls.sessionsAtInit == 1)
 assert(DB.raw._schema == 4)
 assert(DB.raw.settings.maxGroups == 10)
 assert(DB.raw.settings.maxOccurrencesPerGroup == 1)
@@ -136,6 +142,9 @@ assert(boot.sessionId == nil)
 DB:UpsertGroup(boot)
 assert(boot.sessionId == DB.sessionId)
 assert(DB.raw.groups.boot == boot and calls.upsert == 1)
+local afterBootCount = 0
+for _ in pairs(DB.raw.groups) do afterBootCount = afterBootCount + 1 end
+assert(afterBootCount == 10)
 
 local session = DB.session
 assert(DB:Init() == true and DB.session == session)

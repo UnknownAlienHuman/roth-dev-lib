@@ -11,6 +11,7 @@ Target: **Retail 12.1.5 / Interface 120105**
 - [x] Recheck warning/taint/report store-status handling and fallback ticker teardown.
 - [x] Recheck ChatTap continuation parsing and disabled-setting timer cleanup.
 - [x] Separate early SavedVariables availability from PLAYER_LOGIN session construction and add lifecycle/load-order regression coverage.
+- [x] Enforce a hard total group cap including pinned entries and remove the duplicate suppression ADDON_LOADED owner.
 - [ ] Run the complete repository offline suite after the final static pass; focused lifecycle and capture matrices are green.
 
 ### Named-client validation

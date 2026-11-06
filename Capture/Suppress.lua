@@ -1,5 +1,7 @@
 -- !RothDevLib/Capture/Suppress.lua
 -- Non-invasive suppression of Blizzard error/taint presentation.
+-- Core/Events.lua owns late Blizzard-addon readiness; this module owns only the
+-- post hooks themselves.
 
 local RDL = _G.RothDevLib
 local Suppress = {}
@@ -11,11 +13,6 @@ local TAINT_POPUPS = {
 }
 
 local hookedScriptErrorFrames = setmetatable({}, { __mode = "k" })
-local SCRIPT_ERROR_ADDONS = {
-  Blizzard_DebugTools = true,
-  Blizzard_ScriptErrors = true,
-  Blizzard_ScriptErrorsFrame = true,
-}
 
 local function OrdinaryString(value)
   local guard = RDL.SecretGuard
@@ -27,7 +24,7 @@ local function OrdinaryString(value)
     if not ok or not accessible then return nil end
   end
 
-  if value == nil or type(value) ~= "string" then return nil end
+  if type(value) ~= "string" then return nil end
   return value
 end
 
@@ -68,7 +65,7 @@ end
 
 function Suppress:SuppressBlizzardPopups()
   if not self._staticPopupHooked and type(_G.hooksecurefunc) == "function"
-     and type(_G.StaticPopup_Show) == "function" then
+      and type(_G.StaticPopup_Show) == "function" then
     local ok = pcall(_G.hooksecurefunc, "StaticPopup_Show", function(which)
       HideTaintPopup(which)
     end)
@@ -104,25 +101,6 @@ function Suppress:SuppressScriptErrorsFrame()
   end
 end
 
-function Suppress:EnsureLoadWatcher()
-  if self._loadWatcher or type(_G.CreateFrame) ~= "function" then return end
-
-  local ok, watcher = pcall(_G.CreateFrame, "Frame")
-  if not ok or not watcher or type(watcher.RegisterEvent) ~= "function"
-     or type(watcher.SetScript) ~= "function" then
-    return
-  end
-
-  self._loadWatcher = watcher
-  watcher:RegisterEvent("ADDON_LOADED")
-  watcher:SetScript("OnEvent", function(_, _, addonName)
-    addonName = OrdinaryString(addonName)
-    if addonName and SCRIPT_ERROR_ADDONS[addonName] then
-      Suppress:SuppressScriptErrorsFrame()
-    end
-  end)
-end
-
 function Suppress:SuppressDefaultLuaWarning()
   -- Presentation only: Blizzard keeps ownership of LUA_WARNING and its frames.
   self:SuppressScriptErrorsFrame()
@@ -142,6 +120,5 @@ end
 
 function Suppress:SuppressAll()
   Run("SuppressBlizzardPopups", function() self:SuppressBlizzardPopups() end)
-  Run("SuppressLoadWatcher", function() self:EnsureLoadWatcher() end)
   Run("SuppressScriptErrorsFrame", function() self:SuppressScriptErrorsFrame() end)
 end

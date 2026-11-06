@@ -3,7 +3,6 @@ local hooks = {}
 local hiddenPopups = {}
 local unregisterCalls = 0
 local originalShow = function() end
-local loadWatcher
 
 _G.hooksecurefunc = function(name, fn)
   assert(name == 'StaticPopup_Show')
@@ -12,12 +11,7 @@ end
 _G.StaticPopup_Show = function() end
 _G.StaticPopup_Hide = function(which) hiddenPopups[#hiddenPopups + 1] = which end
 _G.UIParent = { UnregisterEvent = function() unregisterCalls = unregisterCalls + 1 end }
-_G.CreateFrame = function()
-  loadWatcher = { scripts = {} }
-  function loadWatcher:RegisterEvent(event) self.event = event end
-  function loadWatcher:SetScript(name, fn) self.scripts[name] = fn end
-  return loadWatcher
-end
+_G.CreateFrame = function() error('Suppress must not create a second ADDON_LOADED owner') end
 
 local frame = {
   shown = true,
@@ -43,7 +37,7 @@ assert(frame.Show == originalShow)
 assert(unregisterCalls == 0)
 assert(frame.shown == false)
 assert(type(frame.scripts.OnShow) == 'function')
-assert(loadWatcher and loadWatcher.event == 'ADDON_LOADED')
+assert(RothDevLib.Suppress._loadWatcher == nil)
 
 hiddenPopups = {}
 hooks.StaticPopup_Show('ADDON_ACTION_BLOCKED')
@@ -70,6 +64,7 @@ assert(frame.shown == false)
 RothDevLib.Suppress:SuppressAll()
 assert(unregisterCalls == 0)
 
+-- Core/Events calls SuppressAll again when a later ScriptErrors frame appears.
 local laterFrame = {
   shown = false,
   scripts = {},
@@ -78,7 +73,7 @@ local laterFrame = {
   Hide = function(self) self.shown = false end,
 }
 _G.ScriptErrorsFrame = laterFrame
-loadWatcher.scripts.OnEvent(loadWatcher, 'ADDON_LOADED', 'Blizzard_ScriptErrorsFrame')
+RothDevLib.Suppress:SuppressAll()
 assert(type(laterFrame.scripts.OnShow) == 'function')
 
 print('suppression tests: ok')

@@ -37,6 +37,9 @@
 - Separate early SavedVariables access from player-session readiness; construct sessions only at `PLAYER_LOGIN`.
 - Queue file-load errors without a session and bind them to the first real session when committed.
 - Normalize persisted settings/groups/session indexes once per DB root and trim stale/excess persisted data before normal use.
+- Enforce the global group cap even when groups are pinned; pinning changes eviction priority, not the memory/persistence bound.
+- Pre-normalize persisted sessions/groups before the legacy DB owner scans them, bounding login work as well as steady-state storage.
+- Remove the duplicate suppression `ADDON_LOADED` watcher; `Core/Events.lua` is the single late-Blizzard-readiness owner.
 
 ### UI
 

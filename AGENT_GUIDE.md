@@ -52,10 +52,10 @@ Before comparison, formatting, indexing, iteration, logging, callback delivery, 
 
 ### Lifecycle
 
-- Every registration/ticker has one owner and one terminal cleanup path.
+- Every registration/ticker has one owner and one terminal cleanup path. `Core/Events.lua` alone owns `ADDON_LOADED`; presentation modules expose idempotent attach methods instead of registering another watcher.
 - Doctor scopes are released by exact token.
 - Safe, internal, CPU and memory wrappers preserve the complete return tuple, including nil positions.
-- A failed or throttled store is not reported as captured.
+- A failed or throttled store is not reported as captured. Pinned records remain bounded; pinning only raises eviction priority.
 - BugGrabber attaches at the current counters by default; historical replay is opt-in.
 
 ## Change routing
