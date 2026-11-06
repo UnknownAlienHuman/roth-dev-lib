@@ -22,6 +22,7 @@ _G.C_RestrictedActions = {
 RDL.Log = function() end
 
 assert(loadfile('Util/Util.lua'))()
+assert(loadfile('Util/BoundedCopy.lua'))()
 assert(loadfile('Util/SecretGuard.lua'))()
 
 local built, stored
@@ -29,7 +30,7 @@ RDL.Capture.BuildEntry = function(kind, msg, stack, locals, addon, funcName, ext
   built = { kind = kind, msg = msg, addon = addon, extra = extra }
   return built
 end
-RDL.Capture.StoreEntry = function(entry) stored = entry end
+RDL.Capture.StoreEntry = function(entry) stored = entry; return 'stored' end
 
 assert(loadfile('Capture/Taint.lua'))()
 
@@ -41,6 +42,7 @@ assert(built.msg:find('addon=<inaccessible>', 1, true))
 assert(built.extra.event == '<inaccessible>')
 assert(built.extra.restriction.inCombat == '<inaccessible>')
 assert(built.extra.restriction.restrictions.Combat.state == '<inaccessible>')
+assert(built.extra.restriction.restrictions.Combat.active == '<inaccessible>')
 
 RDL.Capture:OnTaintEvent('MACRO_ACTION_BLOCKED', secret)
 assert(built.kind == 'TAINT_BLOCKED')
@@ -51,5 +53,9 @@ RDL.Capture:OnRestrictionStateChanged('ADDON_RESTRICTION_STATE_CHANGED', secret,
 assert(built.kind == 'TAINT_STATE')
 assert(built.extra.restrictionType == '<inaccessible>')
 assert(built.extra.state == '<inaccessible>')
+
+RDL.Capture.StoreEntry = function() return 'throttled' end
+local entry, status = RDL.Capture:OnTaintEvent('ADDON_ACTION_BLOCKED', 'Test', 'Fn')
+assert(entry == nil and status == 'throttled')
 
 print('taint intake tests: ok')

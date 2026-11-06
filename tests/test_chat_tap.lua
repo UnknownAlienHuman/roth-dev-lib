@@ -11,7 +11,8 @@ function _G.canaccessallvalues(...) return true end
 local now = 10
 function _G.time() return math.floor(now) end
 function _G.GetTime() return now end
-_G.C_Timer = { After = function() end }
+local timers = {}
+_G.C_Timer = { After = function(_, fn) timers[#timers + 1] = fn end }
 
 local hooks = {}
 function _G.hooksecurefunc(target, method, callback)
@@ -39,10 +40,12 @@ RDL.DB = {
 }
 RDL.Log = function() end
 assert(loadfile('Util/Util.lua'))()
+assert(loadfile('Util/BoundedCopy.lua'))()
 
 local captured
-RDL.Capture.OnSuppressedError = function(_, message, stack, locals, addon, func, extra)
+RDL.Capture.BuildEntry = function(kind, message, stack, locals, addon, func, extra)
   captured = {
+    kind = kind,
     message = message,
     stack = stack,
     addon = addon,
@@ -51,6 +54,7 @@ RDL.Capture.OnSuppressedError = function(_, message, stack, locals, addon, func,
   }
   return captured
 end
+RDL.Capture.StoreEntry = function() return 'stored' end
 
 assert(loadfile('Capture/ChatTap.lua'))()
 local tap = assert(RDL.Capture.ChatTap)
@@ -61,6 +65,7 @@ tap:OnChatMessage('Demo: error[event:PLAYER_LOGIN]: Interface/AddOns/Demo/Core.l
 tap:OnChatMessage('Interface/AddOns/Demo/Core.lua:7: in function <Core.lua:1>')
 tap:OnChatMessage('done')
 assert(captured)
+assert(captured.kind == 'SUPPRESSED')
 assert(captured.message:find('Demo: error', 1, true))
 assert(captured.stack:find('Interface/AddOns/Demo/Core.lua:7', 1, true))
 assert(captured.addon == 'Demo')
@@ -72,5 +77,15 @@ tap:Init()
 assert(hooks[frame])
 assert(frame.__RDL_ChatTapHooked == nil)
 assert(pcall(hooks[frame], frame, secret))
+
+-- A pending timer must discard capture when the setting is disabled.
+captured = nil
+settings.captureChatErrors = true
+tap:OnChatMessage('Demo: error: Interface/AddOns/Demo/Core.lua:9: later')
+assert(#timers > 0)
+settings.captureChatErrors = false
+now = now + 2
+timers[#timers]()
+assert(captured == nil and tap._active == nil)
 
 print('chat tap tests: ok')

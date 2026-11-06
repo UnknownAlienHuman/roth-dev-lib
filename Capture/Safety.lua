@@ -1,81 +1,103 @@
 -- !RothDevLib/Capture/Safety.lua
--- Central safety policy for capture paths retained from the legacy owner.
--- Loaded immediately after Engine.lua so its public methods replace the
--- early intake edges without duplicating ownership machinery.
+-- Bounded hard/suppressed/integration intake and fallback policy.
 
 local RDL = _G.RothDevLib
 local Capture = RDL and RDL.Capture
 if not Capture then return end
 
-local function U()
+-- Engine installs the handler before this file loads. Guard its small bootstrap
+-- implementation immediately so any load-time intake fault still clears the
+-- recursion flags and preserves prior-handler delivery.
+do
+  local bootstrapOnLuaError = Capture.OnLuaError
+  if type(bootstrapOnLuaError) == "function" then
+    Capture.OnLuaError = function(self, errorValue, stack, noForward)
+      local ok, captured, key, messageKey = xpcall(function()
+        return bootstrapOnLuaError(self, errorValue, stack, noForward)
+      end, function() return false end)
+
+      self._inHandler = false
+      self._inChainWrapper = false
+      if ok then return captured, key, messageKey end
+
+      if not noForward and type(self.prevErrorHandler) == "function" then
+        pcall(self.prevErrorHandler, errorValue)
+      end
+      return false
+    end
+  end
+end
+
+local function Util()
   return RDL.Util
 end
 
 local function SafeText(value, fallback, maxBytes)
-  local util = U()
+  local util = Util()
   local ordinary = value
-  if util and util.Scrub then
+  if util and type(util.Scrub) == "function" then
     local ok, scrubbed = pcall(util.Scrub, util, value)
-    if ok then ordinary = scrubbed else ordinary = "<unavailable>" end
+    ordinary = ok and scrubbed or "<unavailable>"
   end
 
-  local text = fallback
-  if text == nil then text = "" end
-  if ordinary ~= nil and util and util.SafeToString then
+  local text = type(fallback) == "string" and fallback or ""
+  if ordinary ~= nil and util and type(util.SafeToString) == "function" then
     local ok, rendered = pcall(util.SafeToString, util, ordinary)
-    if ok then text = rendered end
-  elseif ordinary ~= nil and type(ordinary) == "string" then
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(ordinary) == "string" then
     text = ordinary
   end
 
-  if util and util.FilterSecretEscapes then
+  if util and type(util.FilterSecretEscapes) == "function" then
     local ok, filtered = pcall(util.FilterSecretEscapes, util, text)
-    if ok then text = filtered end
-  end
-  if type(text) ~= "string" then
-    text = fallback
-    if type(text) ~= "string" then text = "" end
+    if ok and type(filtered) == "string" then text = filtered end
   end
 
   maxBytes = tonumber(maxBytes) or 8192
+  if maxBytes < 1 then maxBytes = 1 end
   if #text > maxBytes then text = text:sub(1, maxBytes) .. "<truncated>" end
   return text
 end
 
-local function SafeCopy(value, opts)
-  local util = U()
-  if util and util.CopyDiagnosticValue then
-    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, opts or {
+local function SafeCopy(value, options)
+  local util = Util()
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, options or {
       maxDepth = 4,
       maxEntries = 80,
+      maxNodes = 500,
       maxStringBytes = 4096,
     })
     if ok then return copy end
   end
+  if value == nil then return nil end
   return SafeText(value, "<unavailable>", 4096)
 end
 
 local function OptionalText(value, maxBytes)
+  if value == nil then return nil end
   local copy = SafeCopy(value, {
     maxDepth = 1,
     maxEntries = 1,
+    maxNodes = 4,
     maxStringBytes = maxBytes or 256,
   })
   if copy == nil then return nil end
   return SafeText(copy, "", maxBytes)
 end
 
-local function GetSettings()
+local function Settings()
   if RDL.DB and type(RDL.DB.GetSettings) == "function" then
-    local ok, settings = pcall(RDL.DB.GetSettings, RDL.DB)
-    if ok and type(settings) == "table" then return settings end
+    local ok, value = pcall(RDL.DB.GetSettings, RDL.DB)
+    if ok and type(value) == "table" then return value end
   end
   return {}
 end
 
 local function SafeLog(level, tag, message, data)
-  if type(RDL.Log) ~= "function" then return end
-  pcall(RDL.Log, RDL, level, tag, message, SafeCopy(data))
+  if type(RDL.Log) == "function" then
+    pcall(RDL.Log, RDL, level, tag, message, SafeCopy(data))
+  end
 end
 
 local function FunctionSource(fn)
@@ -83,7 +105,6 @@ local function FunctionSource(fn)
   local debugTable = _G.debug
   local getInfo = type(debugTable) == "table" and debugTable.getinfo or nil
   if type(getInfo) ~= "function" then return "<?>" end
-
   local ok, info = pcall(getInfo, fn, "S")
   if not ok or type(info) ~= "table" then return "<?>" end
   return SafeText(info.short_src, "<?>" , 512)
@@ -98,17 +119,21 @@ end
 
 local function BuildErrorKeys(message, stack)
   local msg = SafeText(message, "", 64 * 1024)
+    :gsub("\\", "/")
+    :gsub("Interface/AddOns/", "")
+    :gsub("table:%s*0x[%x]+", "table:<?>")
   local trace = SafeText(stack, "", 128 * 1024)
-
-  msg = msg:gsub("\\", "/")
+    :gsub("\\", "/")
     :gsub("Interface/AddOns/", "")
     :gsub("table:%s*0x[%x]+", "table:<?>")
-  trace = trace:gsub("\\", "/")
-    :gsub("Interface/AddOns/", "")
-    :gsub("table:%s*0x[%x]+", "table:<?>")
-
   return msg .. "\031" .. trace, msg
 end
+
+local ACCEPTED_STATUS = {
+  stored = true,
+  queued = true,
+  ignored = true,
+}
 
 local function BuildAndStore(kind, message, stack, locals, addonName, funcName, extra)
   if type(Capture.BuildEntry) ~= "function" or type(Capture.StoreEntry) ~= "function" then
@@ -120,7 +145,7 @@ local function BuildAndStore(kind, message, stack, locals, addonName, funcName, 
     SafeText(kind, "INTEGRATION", 64),
     SafeText(message, "", 64 * 1024),
     SafeText(stack, "", 128 * 1024),
-    SafeCopy(locals, { maxDepth = 4, maxEntries = 80, maxStringBytes = 8192 }),
+    SafeCopy(locals, { maxDepth = 4, maxEntries = 80, maxNodes = 500, maxStringBytes = 8192 }),
     OptionalText(addonName, 128),
     OptionalText(funcName, 256),
     SafeCopy(extra)
@@ -133,31 +158,30 @@ local function BuildAndStore(kind, message, stack, locals, addonName, funcName, 
     return nil, "build-failed"
   end
 
-  local okStore, result = pcall(Capture.StoreEntry, entry)
+  local okStore, status = pcall(Capture.StoreEntry, entry)
   if not okStore then
     SafeLog("ERROR", "CAPTURE", "StoreEntry failed", {
-      error = SafeText(result, "<error>", 2048),
+      error = SafeText(status, "<error>", 2048),
       kind = kind,
     })
     return nil, "store-failed"
   end
-  return entry, result
+  if not ACCEPTED_STATUS[status] then return nil, status or "store-failed" end
+  return entry, status
 end
 
 local function CaptureStack(level, fallback)
   local trace = SafeText(fallback, "", 128 * 1024)
   if trace ~= "" or type(_G.debugstack) ~= "function" then return trace end
-
   local ok, value = pcall(_G.debugstack, level or 3, 40, 40)
-  if ok then return SafeText(value, "", 128 * 1024) end
-  return ""
+  return ok and SafeText(value, "", 128 * 1024) or ""
 end
 
 local function CaptureLocals()
   if type(Capture.CaptureLocals) ~= "function" then return nil end
   local ok, value = pcall(Capture.CaptureLocals, 3)
   if not ok then return nil end
-  return SafeCopy(value, { maxDepth = 4, maxEntries = 80, maxStringBytes = 8192 })
+  return SafeCopy(value, { maxDepth = 4, maxEntries = 80, maxNodes = 500, maxStringBytes = 8192 })
 end
 
 local function ResetDoctor()
@@ -167,7 +191,7 @@ local function ResetDoctor()
 end
 
 local function NotifyCaptured()
-  local settings = GetSettings()
+  local settings = Settings()
   if settings.chatNotifyOnError ~= true then return end
 
   if type(_G.UnitAffectingCombat) == "function" then
@@ -188,7 +212,6 @@ local function NotifyCaptured()
     local ok, value = pcall(RDL.UI.MakeSigLink, RDL.UI, Capture._lastStoredSig, "open")
     if ok then link = " " .. SafeText(value, "", 2048) end
   end
-
   if type(_G.print) == "function" then
     pcall(_G.print, "|cffff3333RothDevLib|r captured Lua error." .. link
       .. " Use |cffffff00/rdev|r")
@@ -199,14 +222,10 @@ local function IsAddonLoaded(name)
   local addons = _G.C_AddOns
   local checker = addons and addons.IsAddOnLoaded
   if type(checker) ~= "function" then return false end
-  local ok, loaded = pcall(checker, name)
+  local ok, _, loaded = pcall(checker, name)
   return ok and loaded == true
 end
 
--- Current Blizzard_ScriptErrors exposes AddLuaErrorHandler only to secure
--- callers. Ordinary addons must not call it. When RothDevLib no longer owns the
--- global handler, the supported fallback is BugGrabber import or an explicit
--- unavailable state.
 function Capture:InstallFallbackHooks()
   self._fallback = self._fallback or {}
   self._fallback.blizzardLuaHandlerUnsupported = true
@@ -214,32 +233,26 @@ function Capture:InstallFallbackHooks()
   self._fallback.scriptErrorsHooked = false
   self._fallback.scriptErrorsFrameSyncEnabled = false
 
-  local settings = GetSettings()
+  local settings = Settings()
   local bug = self.BugGrabber
+  local shouldEnable = false
 
-  if self.ownsHandler then
-    if bug and type(bug.Disable) == "function" then pcall(bug.Disable, bug) end
-    self._fallback.bugGrabberEnabled = false
-  elseif settings.importBugGrabber ~= false and bug
+  if not self.ownsHandler and settings.importBugGrabber ~= false and bug
       and type(bug.Enable) == "function" and type(bug.IsPresent) == "function" then
     local okPresent, present = pcall(bug.IsPresent, bug)
-    if okPresent and present then
-      local okEnable, enabled = pcall(bug.Enable, bug)
-      self._fallback.bugGrabberEnabled = okEnable and enabled == true
-    else
-      self._fallback.bugGrabberEnabled = false
-    end
+    shouldEnable = okPresent and present == true
+  end
+
+  if shouldEnable then
+    local okEnable, enabled = pcall(bug.Enable, bug)
+    self._fallback.bugGrabberEnabled = okEnable and enabled == true
   else
+    if bug and type(bug.Disable) == "function" then pcall(bug.Disable, bug) end
     self._fallback.bugGrabberEnabled = false
   end
 
-  if self.ownsHandler then
-    self._fallback.kind = "owned"
-  elseif self._fallback.bugGrabberEnabled then
-    self._fallback.kind = "buggrabber"
-  else
-    self._fallback.kind = "unavailable"
-  end
+  self._fallback.kind = self.ownsHandler and "owned"
+    or (self._fallback.bugGrabberEnabled and "buggrabber" or "unavailable")
 
   self.ownerInfo = self.ownerInfo or {}
   self.ownerInfo.addons = self.ownerInfo.addons or {}
@@ -249,14 +262,14 @@ function Capture:InstallFallbackHooks()
   self.ownerInfo.fallback = self._fallback.kind
 end
 
--- Replacing seterrorhandler() with a no-op is intentionally unsupported.
 function Capture:ApplyHandlerLock()
+  -- Cleanup only: undo a lock left by an older loaded revision. New code never
+  -- installs the no-op setter.
   if self._locked and type(self._real_seterrorhandler) == "function" then
     _G.seterrorhandler = self._real_seterrorhandler
   end
   self._locked = false
-
-  local settings = GetSettings()
+  local settings = Settings()
   if settings.lockErrorHandler == true then
     settings.lockErrorHandler = false
     if not self._lockPolicyLogged then
@@ -268,8 +281,6 @@ function Capture:ApplyHandlerLock()
   end
 end
 
--- Non-mutating status probe. The old probe temporarily replaced the process
--- handler merely to test the setter, which could lose an error in that window.
 function Capture:ProbeSetErrorHandler()
   local current = type(_G.geterrorhandler) == "function" and _G.geterrorhandler() or nil
   local source = FunctionSource(current)
@@ -292,18 +303,11 @@ local function IsManualReclaim(reason)
   return reason == "slash" or reason == "manual" or reason == "user"
 end
 
--- Install once during EarlyInit and do not fight later owners. Automatic calls
--- become ownership synchronization + fallback attachment. Only an explicit
--- user action may reclaim and chain-wrap the current owner.
 function Capture:TryReclaimHandler(reason)
   reason = SafeText(reason, "automatic", 64)
-
   if not IsManualReclaim(reason) then
-    if type(self.SyncOwnership) == "function" then
-      pcall(self.SyncOwnership, self, reason)
-    end
+    if type(self.SyncOwnership) == "function" then pcall(self.SyncOwnership, self, reason) end
     if not self.ownsHandler then self:InstallFallbackHooks() end
-
     self.ownerInfo = self.ownerInfo or {}
     self.ownerInfo.autoReclaimSuppressed = true
     self.ownerInfo.autoReclaimReason = reason
@@ -311,12 +315,8 @@ function Capture:TryReclaimHandler(reason)
   end
 
   local current = type(_G.geterrorhandler) == "function" and _G.geterrorhandler() or nil
-  if self.ownsHandler and current == self._handler then
-    return true
-  end
-  if type(self.EnsureHandler) == "function" then
-    pcall(self.EnsureHandler, self, current, reason)
-  end
+  if self.ownsHandler and current == self._handler then return true end
+  if type(self.EnsureHandler) == "function" then pcall(self.EnsureHandler, self, current, reason) end
 
   local setter = self._real_seterrorhandler
   if type(setter) ~= "function" then setter = _G.seterrorhandler end
@@ -328,7 +328,7 @@ function Capture:TryReclaimHandler(reason)
   local okSet = pcall(setter, self._handler)
   local nowHandler = type(_G.geterrorhandler) == "function" and _G.geterrorhandler() or nil
   local owned = okSet and nowHandler == self._handler
-  self.ownsHandler = owned and true or false
+  self.ownsHandler = owned == true
 
   self.ownerInfo = self.ownerInfo or {}
   self.ownerInfo.reclaim = self.ownerInfo.reclaim or {}
@@ -340,7 +340,6 @@ function Capture:TryReclaimHandler(reason)
   }
   self.ownerInfo.nowHandlerSrc = FunctionSource(nowHandler)
   self.ownerInfo.nowHandlerAddon = AddonFromSource(self.ownerInfo.nowHandlerSrc)
-
   if type(self._SetOwnershipState) == "function" then
     pcall(self._SetOwnershipState, self, owned and "owned" or "not-owned", reason)
   end
@@ -363,39 +362,31 @@ function Capture:TryReclaimHandler(reason)
   return false
 end
 
--- Secret-safe hard-error intake. Handler closures created by Engine.lua
--- resolve this method dynamically, so replacing it here also fixes handlers
--- installed during EarlyInit before this module loaded.
-function Capture:OnLuaError(err, stack, noForward)
+function Capture:OnLuaError(errorValue, stack, noForward)
   if self._disabled then return false end
   if self._inHandler then
-    if type(self.prevErrorHandler) == "function" then
-      pcall(self.prevErrorHandler, err)
-    end
+    if type(self.prevErrorHandler) == "function" then pcall(self.prevErrorHandler, errorValue) end
     return false
   end
 
   self._inHandler = true
   local captured = false
   local errorKey, errorMessageKey
-
   local okRun, runError = xpcall(function()
-    local message = SafeText(err, "<unavailable>", 64 * 1024)
+    local message = SafeText(errorValue, "<unavailable>", 64 * 1024)
     local trace = CaptureStack(3, stack)
-    local locals = CaptureLocals()
     errorKey, errorMessageKey = BuildErrorKeys(message, trace)
 
-    local entry, status = BuildAndStore("LUA_ERROR", message, trace, locals, nil, nil, {
+    local entry, status = BuildAndStore("LUA_ERROR", message, trace, CaptureLocals(), nil, nil, {
       source = "errorhandler",
     })
-    if entry and status ~= "failed" then
-      captured = true
+    captured = entry ~= nil and (status == "stored" or status == "queued")
+    if captured then
       SafeLog("ERROR", "LUA", "Lua error captured", {
         addon = entry.addon,
         func = entry.func,
       })
     end
-
     ResetDoctor()
     if captured then NotifyCaptured() end
   end, function(innerError)
@@ -403,37 +394,35 @@ function Capture:OnLuaError(err, stack, noForward)
   end)
 
   self._inHandler = false
+  self._inChainWrapper = false
   if not okRun then
     ResetDoctor()
     SafeLog("ERROR", "CAPTURE", "OnLuaError failed", { error = runError })
   end
 
-  local settings = GetSettings()
-  if not noForward and settings.forwardToDefaultErrorHandler == true
+  if not noForward and Settings().forwardToDefaultErrorHandler == true
       and type(self.prevErrorHandler) == "function" then
-    pcall(self.prevErrorHandler, err)
+    pcall(self.prevErrorHandler, errorValue)
   end
-
   return captured, errorKey, errorMessageKey
 end
 
-function Capture:OnSuppressedError(err, stack, locals, addonName, funcName, extra)
+function Capture:OnSuppressedError(errorValue, stack, locals, addonName, funcName, extra)
   if self._disabled then return nil end
-
   local safeExtra = SafeCopy(extra)
   if type(safeExtra) ~= "table" then safeExtra = {} end
   safeExtra.suppressed = true
 
-  local entry = BuildAndStore(
+  local entry, status = BuildAndStore(
     "SUPPRESSED",
-    SafeText(err, "<unavailable>", 64 * 1024),
+    SafeText(errorValue, "<unavailable>", 64 * 1024),
     CaptureStack(3, stack),
     locals,
     addonName,
     funcName,
     safeExtra
   )
-  if entry then
+  if entry and (status == "stored" or status == "queued") then
     SafeLog("WARN", "SUPPRESSED", "Suppressed error captured", {
       addon = entry.addon,
       func = entry.func,
@@ -451,24 +440,20 @@ function Capture:OnIntegrationEvent(kind, addonName, code, message, data, level)
   if safeAddon == "" then safeAddon = "<?>" end
   local safeCode = OptionalText(code, 256)
   local safeLevel = OptionalText(level, 32)
-  local safeData = SafeCopy(data)
 
   local msg = SafeText(message, "", 64 * 1024)
   if safeCode and safeCode ~= "" then msg = safeCode .. ": " .. msg end
   if safeLevel and safeLevel ~= "" then msg = "[" .. safeLevel .. "] " .. msg end
 
-  local entry = BuildAndStore(safeKind, msg, CaptureStack(3), nil, safeAddon, nil, {
+  local entry, status = BuildAndStore(safeKind, msg, CaptureStack(3), nil, safeAddon, nil, {
     code = safeCode,
     level = safeLevel,
-    data = safeData,
+    data = SafeCopy(data),
     source = "integration",
   })
-  if not entry then return nil end
-
-  local logLevel = safeKind == "ALERT" and "WARN" or "ERROR"
-  SafeLog(logLevel, safeKind, "Integration event captured", {
-    addon = safeAddon,
-    code = safeCode,
-  })
+  if entry and (status == "stored" or status == "queued") then
+    SafeLog(safeKind == "ALERT" and "WARN" or "ERROR", safeKind,
+      "Integration event captured", { addon = safeAddon, code = safeCode })
+  end
   return entry
 end

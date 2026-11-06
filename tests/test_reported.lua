@@ -15,14 +15,15 @@ RDL.DB = { GetSettings = function() return { maxLocalsSize = 512 } end }
 RDL.Log = function() end
 
 assert(loadfile('Util/Util.lua'))()
+assert(loadfile('Util/BoundedCopy.lua'))()
 assert(loadfile('Util/SecretGuard.lua'))()
 
 local built, stored
 RDL.Capture.BuildEntry = function(kind, msg, stack, locals, addon, funcName, extra)
   built = { kind = kind, msg = msg, stack = stack, locals = locals, addon = addon, funcName = funcName, extra = extra }
-  return { sig = 'generated' }
+  return { sig = 'generated', kind = kind, addon = addon, func = funcName }
 end
-RDL.Capture.StoreEntry = function(entry) stored = entry end
+RDL.Capture.StoreEntry = function(entry) stored = entry; return 'stored' end
 
 assert(loadfile('Capture/Reported.lua'))()
 
@@ -35,9 +36,10 @@ local opts = {
   signature = secret,
   func = secret,
 }
-RDL.Capture:OnReported(secret, secret, secret, opts)
+local entry, status = RDL.Capture:OnReported(secret, secret, secret, opts)
 opts.data.n = 2
 opts.extra.mutable.x = 2
+assert(status == 'stored' and entry == stored)
 assert(built.kind == '<inaccessible>')
 assert(built.addon == '<inaccessible>')
 assert(built.msg == '[WARN] <inaccessible>: <inaccessible>')
@@ -45,12 +47,26 @@ assert(built.locals:find('hidden=<inaccessible>', 1, true))
 assert(built.extra.data.hidden == '<inaccessible>')
 assert(built.extra.data.n == 1)
 assert(built.extra.mutable.x == 1)
-assert(stored.sig == '<inaccessible>')
+assert(stored.sig == 'generated')
 assert(built.funcName == '<inaccessible>')
+
+RDL.Capture:OnReported('ALERT', 'Test', 'false fields', {
+  extra = { data = false, event = false, tag = false },
+  data = { replaced = true },
+  event = 'replaced',
+  tag = 'replaced',
+})
+assert(built.extra.data == false)
+assert(built.extra.event == false)
+assert(built.extra.tag == false)
 
 local hostileOpts = setmetatable({}, { __pairs = function() error(secret, 0) end })
 assert(pcall(RDL.Capture.OnReported, RDL.Capture, nil, nil, nil, hostileOpts) == true)
 assert(built.kind == 'SUPPRESSED')
 assert(built.addon == '<?>')
+
+RDL.Capture.StoreEntry = function() return 'failed' end
+entry, status = RDL.Capture:OnReported('LUA_ERROR', 'Test', 'boom', {})
+assert(entry == nil and status == 'failed')
 
 print('reported intake tests: ok')

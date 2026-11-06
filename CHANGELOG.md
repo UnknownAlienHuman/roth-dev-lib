@@ -28,6 +28,12 @@
 - Give callbacks deterministic mutation semantics and an independent detached payload per consumer.
 - Preserve arbitrary function return tuples through safe wrappers, profiling wrappers, Doctor scopes and internal calls.
 - Add token-aware Doctor cleanup, including a one-frame cleanup fallback for hard errors handled by another owner.
+- Guard the pre-`Safety.lua` handler window so capture faults clear recursion state and retain prior-handler delivery.
+- Treat only `stored`, `queued` and `ignored` as successful intake statuses; throttled/failed writes are not reported as captured.
+- Tear down the BugGrabber fallback immediately when ownership or settings make it ineligible.
+- Preserve inaccessible restriction-state values instead of coercing them to `false`.
+- Reject inaccessible external signature overrides rather than using them as grouping keys.
+- Preserve warning tuple arity and recognize ChatTap stack continuations before generic headers.
 
 ### UI
 
@@ -39,5 +45,6 @@
 
 - Add manifest/load-order coverage for `LoadSavedVariablesFirst` and capture ordering.
 - Add regression coverage for raw JSON traversal, hostile metamethods, JSON node budgets and raw BugGrabber list scanning.
+- Add focused regression coverage for bootstrap handler recovery, fallback teardown, store statuses, warning arity, restriction-state markers, report signatures and ChatTap continuation/timer behavior.
 - All modified production Lua files pass `texluac -p`.
 - In-game matrix: not run in this environment.

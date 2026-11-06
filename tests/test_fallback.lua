@@ -13,12 +13,11 @@ function _G.AddLuaErrorHandler()
   registrations = registrations + 1
   error('ordinary addons must not register secure ScriptErrors handlers')
 end
-_G.C_AddOns = { IsAddOnLoaded = function() return false end }
+_G.C_AddOns = { IsAddOnLoaded = function() return false, false end }
 _G.RothDevLib = { Capture = {} }
 local RDL = RothDevLib
-RDL.DB = { GetSettings = function()
-  return { fallbackHookScriptErrors = true, importBugGrabber = true }
-end }
+local settings = { fallbackHookScriptErrors = true, importBugGrabber = true }
+RDL.DB = { GetSettings = function() return settings end }
 RDL.Log = function() end
 assert(loadfile('Util/Util.lua'))()
 assert(loadfile('Util/BoundedCopy.lua'))()
@@ -38,9 +37,16 @@ assert(enabled == 1)
 assert(RDL.Capture._fallback.kind == 'buggrabber')
 assert(RDL.Capture._fallback.blizzardLuaHandlerHooked == false)
 
-RDL.Capture.ownsHandler = true
+-- Disabling import must tear down an already-running importer ticker.
+settings.importBugGrabber = false
 RDL.Capture:InstallFallbackHooks()
 assert(disabled == 1)
+assert(RDL.Capture._fallback.kind == 'unavailable')
+
+settings.importBugGrabber = true
+RDL.Capture.ownsHandler = true
+RDL.Capture:InstallFallbackHooks()
+assert(disabled == 2)
 assert(RDL.Capture._fallback.kind == 'owned')
 assert(registrations == 0)
 

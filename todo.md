@@ -7,9 +7,10 @@ Target: **Retail 12.1.5 / Interface 120105**
 
 ### Static follow-up
 
-- [ ] Harden the tiny pre-`Safety.lua` error-handler window so an intake fault cannot strand `_inHandler` or skip the prior handler.
-- [ ] Recheck warning/taint/report store-status handling and fallback ticker teardown.
-- [ ] Run the complete offline suite after the final static pass.
+- [x] Harden the tiny pre-`Safety.lua` error-handler window so an intake fault cannot strand `_inHandler` or skip the prior handler.
+- [x] Recheck warning/taint/report store-status handling and fallback ticker teardown.
+- [x] Recheck ChatTap continuation parsing and disabled-setting timer cleanup.
+- [ ] Run the complete repository offline suite after the final static pass; the focused third-pass matrix is green.
 
 ### Named-client validation
 
@@ -34,6 +35,8 @@ Target: **Retail 12.1.5 / Interface 120105**
 - Rebuilt ChatTap and BugGrabber import around bounded ordinary-value snapshots.
 - Added bounded ordinary-value boundaries for public API, reports, taint/restriction data, JSON, callbacks and breadcrumbs.
 - Added raw JSON/table traversal plus depth, entry, scan, node, string and output budgets.
+- Guarded bootstrap hard-error intake and made successful-store status explicit across hard, suppressed, report, warning, taint and chat paths.
+- Preserved inaccessible restriction states, rejected inaccessible external signature identities and fixed ChatTap stack-line/header ordering.
 - Defined callback dispatch mutation semantics and isolated each callback payload from DB state and other consumers.
 - Preserved arbitrary return tuples through Core, Internal, Doctor, CPU and memory wrappers.
 - Added token-aware Doctor cleanup for normal, suppressed and externally handled hard-error paths.

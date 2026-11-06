@@ -1,226 +1,186 @@
 -- !RothDevLib/Capture/Taint.lua
--- Restricted-action capture with an explicit ordinary-value boundary.
+-- Bounded restricted-action and restriction-state intake.
 
 local RDL = _G.RothDevLib
 local Capture = RDL and RDL.Capture
 if not Capture then return end
 
-local function U()
-  return RDL.Util
-end
+local ACCEPTED_STATUS = { stored = true, queued = true, ignored = true }
 
-local function SafeCopy(value, opts)
-  local util = U()
-  if util and util.CopyDiagnosticValue then
-    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, opts or {
-      maxDepth = 3,
-      maxEntries = 40,
-      maxStringBytes = 2048,
+local function SafeCopy(value, options)
+  local util = RDL.Util
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, options or {
+      maxDepth = 4,
+      maxEntries = 80,
+      maxNodes = 400,
+      maxStringBytes = 4096,
     })
     if ok then return copy end
   end
   return nil
 end
 
-local function SafeText(value, fallback, maxBytes)
-  local util = U()
-  local ordinary = value
-  if util and util.Scrub then
-    local ok, scrubbed = pcall(util.Scrub, util, value)
-    if ok then ordinary = scrubbed else ordinary = "<unavailable>" end
+local function SafeText(value, fallback, maximum)
+  local util = RDL.Util
+  local text = type(fallback) == "string" and fallback or ""
+  if util and type(util.SafeToString) == "function" then
+    local ok, rendered = pcall(util.SafeToString, util, value)
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(value) == "string" then
+    text = value
   end
-
-  local text = fallback or "<?>"
-  if ordinary ~= nil and util and util.SafeToString then
-    local ok, rendered = pcall(util.SafeToString, util, ordinary)
-    if ok then text = rendered end
-  elseif ordinary ~= nil and type(ordinary) == "string" then
-    text = ordinary
-  end
-
-  if util and util.FilterSecretEscapes then
+  if util and type(util.FilterSecretEscapes) == "function" then
     local ok, filtered = pcall(util.FilterSecretEscapes, util, text)
-    if ok then text = filtered end
+    if ok and type(filtered) == "string" then text = filtered end
   end
-  if type(text) ~= "string" then text = fallback or "<?>" end
-
-  maxBytes = tonumber(maxBytes) or 2048
-  if #text > maxBytes then text = text:sub(1, maxBytes) .. "<truncated>" end
+  maximum = tonumber(maximum) or 4096
+  if #text > maximum then text = text:sub(1, maximum) .. "<truncated>" end
   return text
 end
 
 local function SafeCall(fn, ...)
-  local guard = RDL.SecretGuard
-  if guard and guard.CanAccess and not guard:CanAccess(fn) then return nil end
   if type(fn) ~= "function" then return nil end
-
   local ok, value = pcall(fn, ...)
   if not ok then return nil end
-  return SafeCopy(value, { maxDepth = 1, maxEntries = 1, maxStringBytes = 256 })
+  return SafeCopy(value, { maxDepth = 1, maxEntries = 4, maxNodes = 8, maxStringBytes = 256 })
 end
 
-local function SafeStack(level, top, bottom)
+local function Stack()
   if type(_G.debugstack) ~= "function" then return "" end
-  local ok, stack = pcall(_G.debugstack, level, top, bottom)
-  if not ok then return "" end
-  return SafeText(stack, "", 64 * 1024)
+  local ok, value = pcall(_G.debugstack, 3, 40, 40)
+  return ok and SafeText(value, "", 128 * 1024) or ""
 end
 
-local function MapRestrictionTypeName(value)
-  local ordinary = SafeCopy(value, { maxDepth = 1, maxEntries = 1, maxStringBytes = 64 })
-  local enum = _G.Enum and _G.Enum.AddOnRestrictionType
-  if type(enum) ~= "table" then return SafeText(ordinary, "unknown", 64) end
-  if ordinary == enum.Combat then return "Combat" end
-  if ordinary == enum.Encounter then return "Encounter" end
-  if ordinary == enum.ChallengeMode then return "ChallengeMode" end
-  if ordinary == enum.PvPMatch then return "PvPMatch" end
-  if ordinary == enum.Map then return "Map" end
-  return SafeText(ordinary, "unknown", 64)
+local function EnumName(enumTable, value, names)
+  local ordinary = SafeCopy(value, { maxDepth = 1, maxEntries = 1, maxNodes = 2, maxStringBytes = 64 })
+  if type(enumTable) == "table" then
+    for index = 1, #names do
+      local name = names[index]
+      local ok, enumValue = pcall(rawget, enumTable, name)
+      if ok and enumValue ~= nil and ordinary == enumValue then return name end
+    end
+  end
+  return SafeText(ordinary, "<?>" , 64)
 end
 
-local function MapRestrictionStateName(value)
-  local ordinary = SafeCopy(value, { maxDepth = 1, maxEntries = 1, maxStringBytes = 64 })
-  local enum = _G.Enum and _G.Enum.AddOnRestrictionState
-  if type(enum) ~= "table" then return SafeText(ordinary, "unknown", 64) end
-  if ordinary == enum.Inactive then return "Inactive" end
-  if ordinary == enum.Activating then return "Activating" end
-  if ordinary == enum.Active then return "Active" end
-  return SafeText(ordinary, "unknown", 64)
+local function RestrictionTypeName(value)
+  return EnumName(_G.Enum and _G.Enum.AddOnRestrictionType, value, {
+    "Combat", "Encounter", "ChallengeMode", "PvPMatch", "Map",
+  })
 end
 
-local function GetRestrictionSnapshot()
-  local snapshot = { inCombat = SafeCall(_G.InCombatLockdown) }
+local function RestrictionStateName(value)
+  return EnumName(_G.Enum and _G.Enum.AddOnRestrictionState, value, {
+    "Inactive", "Activating", "Active",
+  })
+end
+
+local function RestrictionSnapshot()
+  local snapshot = {
+    inCombat = SafeCall(_G.InCombatLockdown),
+  }
 
   local restricted = _G.C_RestrictedActions
   local enumType = _G.Enum and _G.Enum.AddOnRestrictionType
-  if type(restricted) ~= "table" or type(enumType) ~= "table" then
-    return snapshot
-  end
+  if type(restricted) ~= "table" or type(enumType) ~= "table" then return snapshot end
 
   local getState = restricted.GetAddOnRestrictionState
   local isActive = restricted.IsAddOnRestrictionActive
-  if type(getState) ~= "function" and type(isActive) ~= "function" then
-    return snapshot
-  end
+  if type(getState) ~= "function" and type(isActive) ~= "function" then return snapshot end
 
   snapshot.restrictions = {}
-  local order = {
-    { key = "Combat", value = enumType.Combat },
-    { key = "Encounter", value = enumType.Encounter },
-    { key = "ChallengeMode", value = enumType.ChallengeMode },
-    { key = "PvPMatch", value = enumType.PvPMatch },
-    { key = "Map", value = enumType.Map },
-  }
-
-  for index = 1, #order do
-    local item = order[index]
-    local record = {}
-    if type(getState) == "function" then
-      local state = SafeCall(getState, item.value)
-      if state ~= nil then
-        record.state = state
-        record.stateName = MapRestrictionStateName(state)
+  local names = { "Combat", "Encounter", "ChallengeMode", "PvPMatch", "Map" }
+  for index = 1, #names do
+    local name = names[index]
+    local okValue, enumValue = pcall(rawget, enumType, name)
+    if okValue and enumValue ~= nil then
+      local record = {}
+      if type(getState) == "function" then
+        local state = SafeCall(getState, enumValue)
+        if state ~= nil then
+          record.state = state
+          record.stateName = RestrictionStateName(state)
+        end
       end
+      if type(isActive) == "function" then
+        local active = SafeCall(isActive, enumValue)
+        if active ~= nil then record.active = active end
+      end
+      snapshot.restrictions[name] = record
     end
-    if type(isActive) == "function" then
-      local active = SafeCall(isActive, item.value)
-      if active ~= nil then record.active = active end
-    end
-    snapshot.restrictions[item.key] = record
   end
-
   return snapshot
 end
 
-local function BuildAndStore(kind, message, stack, addon, extra)
+local function BuildAndStore(kind, message, addonName, extra)
   if type(Capture.BuildEntry) ~= "function" or type(Capture.StoreEntry) ~= "function" then
-    return nil
+    return nil, "unavailable"
   end
-
-  local okBuild, entry = pcall(Capture.BuildEntry, kind, message, stack, nil, addon, nil, extra)
-  if not okBuild or type(entry) ~= "table" then
-    if RDL.Log then
-      RDL:Log("ERROR", "TAINT", "BuildEntry failed", {
-        error = SafeText(entry, "<error>", 2048),
-      })
-    end
-    return nil
-  end
-
-  local okStore, result = pcall(Capture.StoreEntry, entry)
-  if not okStore then
-    if RDL.Log then
-      RDL:Log("ERROR", "TAINT", "StoreEntry failed", {
-        error = SafeText(result, "<error>", 2048),
-      })
-    end
-    return nil
-  end
-  return entry
+  local okBuild, entry = pcall(Capture.BuildEntry, kind, message, Stack(), nil,
+    addonName, nil, SafeCopy(extra))
+  if not okBuild or type(entry) ~= "table" then return nil, "build-failed" end
+  local okStore, status = pcall(Capture.StoreEntry, entry)
+  if not okStore or not ACCEPTED_STATUS[status] then return nil, status or "store-failed" end
+  return entry, status
 end
 
 function Capture:OnTaintEvent(event, addonName, blockedText)
-  if self._disabled then return end
+  if self._disabled then return nil end
 
-  local eventName = SafeText(event, "UNKNOWN_RESTRICTED_ACTION", 64)
+  local safeEvent = SafeText(event, "<?>" , 64)
   local source = "addon"
-  local addon = SafeText(addonName, "<?>", 128)
-  local blocked = SafeText(blockedText, "<?>", 2048)
-
-  if eventName == "MACRO_ACTION_BLOCKED" or eventName == "MACRO_ACTION_FORBIDDEN" then
+  local addon = SafeText(addonName, "<?>" , 128)
+  local blocked = SafeText(blockedText, "<?>" , 512)
+  if safeEvent == "MACRO_ACTION_BLOCKED" or safeEvent == "MACRO_ACTION_FORBIDDEN" then
     source = "macro"
-    blocked = SafeText(addonName, "<?>", 2048)
+    blocked = SafeText(addonName, "<?>" , 512)
     addon = "BlizzardMacro"
   end
 
-  local isBlocked = eventName == "ADDON_ACTION_BLOCKED" or eventName == "MACRO_ACTION_BLOCKED"
-  local kind = isBlocked and "TAINT_BLOCKED" or "TAINT_FORBIDDEN"
+  local blockedKind = safeEvent == "ADDON_ACTION_BLOCKED" or safeEvent == "MACRO_ACTION_BLOCKED"
+  local kind = blockedKind and "TAINT_BLOCKED" or "TAINT_FORBIDDEN"
   local message = kind .. ": source=" .. source .. " addon=" .. addon .. " func=" .. blocked
-  local stack = SafeStack(2, 50, 50)
-  local entry = BuildAndStore(kind, message, stack, addon, {
-    event = eventName,
+  local entry, status = BuildAndStore(kind, message, addon, {
+    event = safeEvent,
     source = source,
     blocked = blocked,
-    restriction = GetRestrictionSnapshot(),
+    restriction = RestrictionSnapshot(),
   })
-  if not entry then return nil end
 
-  if RDL.Log then
-    RDL:Log("WARN", "TAINT", "Restricted action event captured", {
-      event = eventName,
+  if entry and (status == "stored" or status == "queued") and type(RDL.Log) == "function" then
+    pcall(RDL.Log, RDL, "WARN", "TAINT", "Restricted action event captured", {
+      event = safeEvent,
       source = source,
       addon = addon,
     })
   end
-  return entry
+  return entry, status
 end
 
 function Capture:OnRestrictionStateChanged(event, restrictionType, state)
-  if self._disabled then return end
+  if self._disabled then return nil end
 
-  local eventName = SafeText(event, "ADDON_RESTRICTION_STATE_CHANGED", 64)
-  local safeType = SafeCopy(restrictionType, { maxDepth = 1, maxEntries = 1, maxStringBytes = 64 })
-  local safeState = SafeCopy(state, { maxDepth = 1, maxEntries = 1, maxStringBytes = 64 })
-  local typeName = MapRestrictionTypeName(safeType)
-  local stateName = MapRestrictionStateName(safeState)
-  local message = eventName .. ": type=" .. typeName .. " state=" .. stateName
-  local stack = SafeStack(2, 30, 30)
+  local safeEvent = SafeText(event, "ADDON_RESTRICTION_STATE_CHANGED", 64)
+  local typeValue = SafeCopy(restrictionType, { maxDepth = 1, maxEntries = 1, maxNodes = 2, maxStringBytes = 64 })
+  local stateValue = SafeCopy(state, { maxDepth = 1, maxEntries = 1, maxNodes = 2, maxStringBytes = 64 })
+  local typeName = RestrictionTypeName(typeValue)
+  local stateName = RestrictionStateName(stateValue)
+  local message = safeEvent .. ": type=" .. typeName .. " state=" .. stateName
 
-  local entry = BuildAndStore("TAINT_STATE", message, stack, "BlizzardRestrictedActions", {
-    event = eventName,
-    restrictionType = safeType,
+  local entry, status = BuildAndStore("TAINT_STATE", message, "BlizzardRestrictedActions", {
+    event = safeEvent,
+    restrictionType = typeValue,
     restrictionTypeName = typeName,
-    state = safeState,
+    state = stateValue,
     stateName = stateName,
-    restriction = GetRestrictionSnapshot(),
+    restriction = RestrictionSnapshot(),
   })
-  if not entry then return nil end
-
-  if RDL.Log then
-    RDL:Log("WARN", "TAINT", "Restriction state changed", {
+  if entry and (status == "stored" or status == "queued") and type(RDL.Log) == "function" then
+    pcall(RDL.Log, RDL, "WARN", "TAINT", "Restriction state changed", {
       type = typeName,
       state = stateName,
     })
   end
-  return entry
+  return entry, status
 end
