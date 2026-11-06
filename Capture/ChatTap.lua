@@ -141,25 +141,54 @@ local function RecentlyCaptured(message, stack)
   return false
 end
 
+local function TrimDedup(self, now, window, maximum, keepKey)
+  maximum = tonumber(maximum) or 200
+  if maximum ~= maximum then maximum = 200 end
+  maximum = math.floor(maximum)
+  if maximum < 1 then maximum = 1 elseif maximum > 5000 then maximum = 5000 end
+
+  local entries = {}
+  for key, timestamp in pairs(self._dedup) do
+    if type(timestamp) ~= "number" or timestamp ~= timestamp
+        or now - timestamp > window * 10 then
+      self._dedup[key] = nil
+    else
+      entries[#entries + 1] = { key = key, timestamp = timestamp }
+    end
+  end
+
+  local excess = #entries - maximum
+  if excess <= 0 then return end
+
+  table.sort(entries, function(a, b)
+    if a.timestamp == b.timestamp then return a.key < b.key end
+    return a.timestamp < b.timestamp
+  end)
+  for index = 1, #entries do
+    if excess <= 0 then break end
+    local key = entries[index].key
+    if key ~= keepKey then
+      self._dedup[key] = nil
+      excess = excess - 1
+    end
+  end
+end
+
 local function DedupHit(self, signature)
   local settings = Settings()
   local window = tonumber(settings.chatTapDedupSec) or 0.6
+  if window ~= window then window = 0.6 end
   if window <= 0 then return false end
 
   local now = Now()
   local previous = self._dedup[signature]
   self._dedup[signature] = now
-  if previous and now - previous < window then return true end
+  local hit = type(previous) == "number" and now - previous < window
 
-  local maximum = tonumber(settings.chatTapDedupMax) or 200
-  local count = 0
-  for _ in pairs(self._dedup) do count = count + 1 end
-  if count > maximum then
-    for key, timestamp in pairs(self._dedup) do
-      if now - timestamp > window * 10 then self._dedup[key] = nil end
-    end
-  end
-  return false
+  -- Stale pruning alone is not a hard bound during a burst of unique errors.
+  -- Evict the oldest entries as a second step and preserve the current key.
+  TrimDedup(self, now, window, settings.chatTapDedupMax, signature)
+  return hit
 end
 
 local function Finalize(self)

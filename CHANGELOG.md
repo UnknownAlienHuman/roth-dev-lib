@@ -22,8 +22,11 @@
 - Install the error handler once; stop automatic reclaim/watchdog fights after another addon becomes owner. Explicit `/rdev reclaim` remains available.
 - Do not call secure-only `AddLuaErrorHandler` or hook private ScriptErrorsFrame internals. Fallback is bounded BugGrabber import or an explicit unavailable state.
 - Baseline existing BugGrabber counters by default and use content-stable keys, preventing historical replay and list-reorder duplicates.
+- Import the first occurrence of a new BugGrabber error immediately after the one-time attach baseline instead of silently waiting for its counter to reach two.
+- Keep BugGrabber counter state when a bounded raw-key scan is incomplete; stale-key pruning now requires proof of a complete scan.
 - Scan BugGrabber records without the foreign length operator, so hostile `__len` code cannot run.
 - Rebuild ChatTap and BugGrabber import as bounded, secret-safe external intake paths.
+- Enforce the configured ChatTap dedup limit during bursts of recent unique errors, not only after entries become stale.
 - Stop replacing Blizzard frame methods, mutating `StaticPopupDialogs`, or unregistering Blizzard-owned events.
 - Give callbacks deterministic mutation semantics and an independent detached payload per consumer.
 - Preserve arbitrary function return tuples through safe wrappers, profiling wrappers, Doctor scopes and internal calls.
@@ -35,6 +38,8 @@
 - Reject inaccessible external signature overrides rather than using them as grouping keys.
 - Preserve warning tuple arity and recognize ChatTap stack continuations before generic headers.
 - Separate early SavedVariables access from player-session readiness; construct sessions only at `PLAYER_LOGIN`.
+- Treat DB/session startup as the root initialization gate: failed DB initialization no longer starts consumers or leaves a false `_initialized` state.
+- Use one idempotent final teardown for `ADDONS_UNLOADING` and `PLAYER_LOGOUT`, including pending ChatTap invalidation.
 - Queue file-load errors without a session and bind them to the first real session when committed.
 - Normalize persisted settings/groups/session indexes once per DB root and trim stale/excess persisted data before normal use.
 - Enforce the global group cap even when groups are pinned; pinning changes eviction priority, not the memory/persistence bound.
@@ -52,5 +57,6 @@
 - Add manifest/load-order coverage for `LoadSavedVariablesFirst` and capture ordering.
 - Add regression coverage for raw JSON traversal, hostile metamethods, JSON node budgets and raw BugGrabber list scanning.
 - Add focused regression coverage for bootstrap handler recovery, fallback teardown, store statuses, warning arity, restriction-state markers, report signatures and ChatTap continuation/timer behavior.
+- Add regressions for first-occurrence BugGrabber import, incomplete-scan retention, ChatTap dedup hard bounds, failed-root initialization and idempotent unload/logout teardown.
 - All modified production Lua files pass `texluac -p`.
 - In-game matrix: not run in this environment.

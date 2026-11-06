@@ -39,6 +39,7 @@ end
 SafeRegisterEvent("ADDON_LOADED")
 SafeRegisterEvent("PLAYER_LOGIN")
 SafeRegisterEvent("PLAYER_LOGOUT")
+SafeRegisterEvent("ADDONS_UNLOADING")
 SafeRegisterEvent("LUA_WARNING")
 SafeRegisterEvent("ADDON_ACTION_BLOCKED")
 SafeRegisterEvent("ADDON_ACTION_FORBIDDEN")
@@ -47,15 +48,39 @@ SafeRegisterEvent("MACRO_ACTION_FORBIDDEN")
 SafeRegisterEvent("ADDON_RESTRICTION_STATE_CHANGED")
 SafeRegisterEvent("PLAYER_REGEN_ENABLED")
 
+local function FailInitialization(stage, detail)
+  RDL._initializing = false
+  RDL._initialized = false
+  RDL._initFailure = {
+    ts = type(_G.time) == "function" and _G.time() or 0,
+    stage = SafeText(stage),
+    detail = SafeText(detail),
+  }
+  if type(RDL.Log) == "function" then
+    pcall(RDL.Log, RDL, "ERROR", "BOOT", "RothDevLib initialization failed", RDL._initFailure)
+  end
+  return false
+end
+
 local function InitAll()
-  if RDL._initialized or RDL._initializing then return end
+  if RDL._initialized then return true end
+  if RDL._initializing then return false end
   RDL._initializing = true
 
-  -- This is the first boundary that may construct player/session state.
-  if RDL.DB and RDL.DB.MarkPlayerReady then
-    ICall("DB:MarkPlayerReady", RDL.DB.MarkPlayerReady, RDL.DB)
+  -- DB/session readiness is the root invariant. Do not mark the addon initialized
+  -- or start consumers if the authoritative persistence owner failed to start.
+  local db = RDL.DB
+  if not (db and type(db.MarkPlayerReady) == "function" and type(db.Init) == "function") then
+    return FailInitialization("DB", "owner-unavailable")
   end
-  if RDL.DB and RDL.DB.Init then ICall("DB:Init", RDL.DB.Init, RDL.DB) end
+
+  local markOK, markResult = ICall("DB:MarkPlayerReady", db.MarkPlayerReady, db)
+  if not markOK then return FailInitialization("DB:MarkPlayerReady", markResult) end
+
+  local initOK, ready = ICall("DB:Init", db.Init, db)
+  if not initOK or ready ~= true then
+    return FailInitialization("DB:Init", initOK and "not-ready" or ready)
+  end
 
   if RDL.Logger and RDL.Logger.Init then ICall("Logger:Init", RDL.Logger.Init, RDL.Logger) end
   if RDL.Doctor and RDL.Doctor.Init then ICall("Doctor:Init", RDL.Doctor.Init, RDL.Doctor) end
@@ -93,11 +118,35 @@ local function InitAll()
     end
   end
 
+  RDL._initFailure = nil
   RDL._initialized = true
   RDL._initializing = false
   if type(RDL.Log) == "function" then
-    RDL:Log("INFO", "BOOT", "RothDevLib initialized", { version = RDL.version })
+    pcall(RDL.Log, RDL, "INFO", "BOOT", "RothDevLib initialized", { version = RDL.version })
   end
+  return true
+end
+
+local shutdownDone = false
+local function Shutdown(reason)
+  if shutdownDone then return false end
+  shutdownDone = true
+
+  local capture = RDL.Capture
+  if capture and capture.ChatTap then
+    capture.ChatTap._active = nil
+    capture.ChatTap._timerToken = (tonumber(capture.ChatTap._timerToken) or 0) + 1
+  end
+  if capture and capture.BugGrabber and capture.BugGrabber.Disable then
+    ICall("BugGrabber:Disable", capture.BugGrabber.Disable, capture.BugGrabber)
+  end
+  if RDL.Mem and RDL.Mem.StopWatcher then
+    ICall("Mem:StopWatcher", RDL.Mem.StopWatcher, RDL.Mem)
+  end
+  if RDL.DB and RDL.DB.OnShutdown then
+    ICall("DB:OnShutdown", RDL.DB.OnShutdown, RDL.DB, reason)
+  end
+  return true
 end
 
 frame:SetScript("OnEvent", function(_, event, ...)
@@ -127,7 +176,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
   end
 
   if event == "PLAYER_LOGIN" then
-    InitAll()
+    if not InitAll() then return end
     if RDL.SelfCheckEarly then
       ICall("RDL:SelfCheckEarly", RDL.SelfCheckEarly, RDL, "PLAYER_LOGIN")
     end
@@ -138,18 +187,8 @@ frame:SetScript("OnEvent", function(_, event, ...)
     return
   end
 
-  if event == "PLAYER_LOGOUT" then
-    if RDL.Capture and RDL.Capture.BugGrabber
-        and RDL.Capture.BugGrabber.Disable then
-      ICall("BugGrabber:Disable", RDL.Capture.BugGrabber.Disable,
-        RDL.Capture.BugGrabber)
-    end
-    if RDL.Mem and RDL.Mem.StopWatcher then
-      ICall("Mem:StopWatcher", RDL.Mem.StopWatcher, RDL.Mem)
-    end
-    if RDL.DB and RDL.DB.OnShutdown then
-      ICall("DB:OnShutdown", RDL.DB.OnShutdown, RDL.DB)
-    end
+  if event == "PLAYER_LOGOUT" or event == "ADDONS_UNLOADING" then
+    Shutdown(event)
     return
   end
 

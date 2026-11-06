@@ -49,37 +49,60 @@ assert(bug:IsPresent())
 assert(bug:Enable() == true and bug._enabled == true and bug._ticker ~= nil)
 bug:Disable()
 
--- Default attach establishes a baseline instead of replaying history.
+-- Default attach establishes one baseline instead of replaying history.
 assert(bug:ImportNew() == 0)
-assert(stored == 0)
+assert(stored == 0 and bug._baselineComplete == true)
+
+-- Once attached, the first occurrence of a new logical error must import now,
+-- not only after BugGrabber increments its counter a second time.
+_G.BugGrabberDB.errors[3] = {
+  message = 'fresh',
+  stack = 'Interface/AddOns/Demo/Fresh.lua:11',
+  counter = 1,
+}
+assert(bug:ImportNew() == 1)
+assert(stored == 1 and built[1].message == 'fresh')
+_G.BugGrabberDB.errors[3] = nil
+assert(bug:ImportNew() == 0)
 
 _G.BugGrabberDB.errors[1].counter = 3
 assert(bug:ImportNew() == 1)
-assert(stored == 1)
-assert(built[1].message == 'boom')
-assert(built[1].locals.hidden == '<inaccessible>')
+assert(stored == 2)
+assert(built[2].message == 'boom')
+assert(built[2].locals.hidden == '<inaccessible>')
 
 -- Reordering the list must not replay counters because keys are content-based.
 _G.BugGrabberDB.errors[1], _G.BugGrabberDB.errors[2] =
   _G.BugGrabberDB.errors[2], _G.BugGrabberDB.errors[1]
 assert(bug:ImportNew() == 0)
-assert(stored == 1)
+assert(stored == 2)
 
--- Explicit history import remains available for a fresh importer.
+-- Explicit history import remains available and starts a fresh mode contract.
 settings.importBugGrabberHistory = true
-bug._counterByKey = {}
 assert(bug:ImportNew() == 4)
-assert(stored == 5)
+assert(stored == 6)
 
--- A budget-limited partial scan must not delete counters for unseen records.
+-- Returning to normal mode baselines once without replaying imported history.
 settings.importBugGrabberHistory = false
-bug._counterByKey = {}
-assert(bug:ImportNew() == 0)
+assert(bug:ImportNew() == 0 and bug._baselineComplete == true)
 local otherKey
 for key in pairs(bug._counterByKey) do
   if key:find('other', 1, true) then otherKey = key end
 end
 assert(otherKey and bug._counterByKey[otherKey] == 1)
+
+-- An incomplete raw-key scan must never prune counters it did not observe.
+bug._counterByKey.__sentinel = 7
+for index = 1, 20 do errors['metadata' .. index] = true end
+settings.bugGrabberScanMax = 5
+assert(bug:ImportNew() == 0)
+assert(bug._counterByKey.__sentinel == 7)
+for index = 1, 20 do errors['metadata' .. index] = nil end
+settings.bugGrabberScanMax = 100
+assert(bug:ImportNew() == 0)
+assert(bug._counterByKey.__sentinel == nil)
+
+-- A budget-limited partial import must not delete counters for unseen records.
 settings.bugGrabberImportMaxPerPoll = 1
 _G.BugGrabberDB.errors[1].counter = _G.BugGrabberDB.errors[1].counter + 2
 _G.BugGrabberDB.errors[2].counter = _G.BugGrabberDB.errors[2].counter + 1
@@ -95,5 +118,6 @@ assert(bug:ImportNew() == 0)
 RDL.Capture.ownsHandler = true
 bug._enabled = true
 assert(bug:ImportNew() == 0 and bug._enabled == false)
+assert(bug._baselineComplete == false and next(bug._counterByKey) == nil)
 
 print('BugGrabber importer tests: ok')

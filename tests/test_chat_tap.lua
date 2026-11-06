@@ -33,6 +33,8 @@ local settings = {
   captureChatErrors = true,
   chatTapHookAllFrames = false,
   chatTapWindowSec = 1,
+  chatTapDedupSec = 0.6,
+  chatTapDedupMax = 10,
 }
 RDL.DB = {
   GetSettings = function() return settings end,
@@ -72,6 +74,16 @@ assert(captured.addon == 'Demo')
 assert(captured.func == 'event:PLAYER_LOGIN')
 assert(captured.extra.source == 'chat')
 assert(RDL.DB.session.chatTapCaptured == 1)
+
+-- Unique bursts must keep the dedup cache within its configured hard cap even
+-- when every timestamp is recent and stale pruning removes nothing.
+for index = 1, 25 do
+  tap:OnChatMessage('Demo: error: Interface/AddOns/Demo/Core.lua:' .. index .. ': unique-' .. index)
+  tap:OnChatMessage('done')
+end
+local dedupCount = 0
+for _ in pairs(tap._dedup) do dedupCount = dedupCount + 1 end
+assert(dedupCount <= settings.chatTapDedupMax)
 
 tap:Init()
 assert(hooks[frame])

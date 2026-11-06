@@ -10,6 +10,8 @@ local Bug = {
   _enabled = false,
   _ticker = nil,
   _counterByKey = {},
+  _baselineComplete = false,
+  _historyMode = nil,
 }
 Capture.BugGrabber = Bug
 
@@ -117,18 +119,25 @@ end
 
 -- Do not use #list: BugGrabberDB is foreign input and a hostile __len
 -- metamethod must never run inside the fallback importer. Scan raw positive
--- integer keys once and cap the result at the configured maximum.
-local function ListLength(list, maximum)
+-- integer keys once and cap the index window at the configured maximum.
+-- Returns: count, pruneSafe, baselineSafe.
+local function ListBounds(list, maximum)
   list = IsReadableTable(list)
-  if not list then return 0 end
+  if not list then return 0, false, false end
 
   local largest, scanned, rawKey = 0, 0, nil
   while true do
     local ok, nextKey = pcall(next, list, rawKey)
-    if not ok or nextKey == nil then break end
+    if not ok then return largest, false, false end
+    if nextKey == nil then return largest, true, true end
+
     rawKey = nextKey
     scanned = scanned + 1
-    if scanned > maximum then return maximum end
+    if scanned > maximum then
+      -- We can safely baseline the bounded numeric window, but cannot prove
+      -- that every foreign key was observed, so stale-key pruning is unsafe.
+      return maximum, false, true
+    end
 
     local ordinaryKey = Scrub(nextKey)
     if type(ordinaryKey) == "number" and ordinaryKey >= 1
@@ -137,7 +146,6 @@ local function ListLength(list, maximum)
       largest = ordinaryKey
     end
   end
-  return largest
 end
 
 local function NormalizeRecord(raw)
@@ -172,6 +180,12 @@ local function RecordKey(record)
   return record.message .. "\031" .. (record.stack or "")
 end
 
+local function ResetAttachment(self)
+  self._counterByKey = {}
+  self._baselineComplete = false
+  self._historyMode = nil
+end
+
 function Bug:IsPresent()
   if GetBugDB() ~= nil then return true end
   local direct = Scrub(_G.BugGrabber)
@@ -183,10 +197,12 @@ function Bug:Disable()
   local ticker = self._ticker
   self._ticker = nil
   if ticker and type(ticker.Cancel) == "function" then pcall(ticker.Cancel, ticker) end
+  ResetAttachment(self)
 end
 
 function Bug:Enable()
   if self._enabled and self._ticker then return true end
+  ResetAttachment(self)
 
   local timer = _G.C_Timer
   if type(timer) ~= "table" or type(timer.NewTicker) ~= "function" then
@@ -222,11 +238,21 @@ function Bug:ImportNew()
   local budget = math.floor(SafeNumber(settings.bugGrabberImportMaxPerPoll, 200, 1, 1000))
   local scanMaximum = math.floor(SafeNumber(settings.bugGrabberScanMax, 5000, 1, 20000))
   local importHistory = settings.importBugGrabberHistory == true
+
+  -- A mode transition starts a fresh attachment contract. History mode imports
+  -- the current counters; normal mode baselines exactly once, then imports the
+  -- first occurrence of every new logical error.
+  if self._historyMode ~= importHistory then
+    self._historyMode = importHistory
+    self._counterByKey = {}
+    self._baselineComplete = importHistory
+  end
+
   local list = GetErrorList(GetBugDB())
   if not list then return 0 end
 
-  local count = ListLength(list, scanMaximum)
-  local fullyScanned = count < scanMaximum or SafeGet(list, scanMaximum + 1) == nil
+  local count, pruneSafe, baselineSafe = ListBounds(list, scanMaximum)
+  local initialBaseline = not importHistory and not self._baselineComplete
   local seen, imported = {}, 0
   local scanCompleted = true
 
@@ -241,9 +267,9 @@ function Bug:ImportNew()
       seen[key] = true
 
       local previousRaw = self._counterByKey[key]
-      if previousRaw == nil and not importHistory then
-        -- Attach at the current authoritative counter. This avoids replaying
-        -- errors RothDevLib may already have captured while it owned the chain.
+      if initialBaseline then
+        -- Only the initial bounded scan is history. After this scan, an unseen
+        -- key is a new error and counter=1 must be imported immediately.
         self._counterByKey[key] = record.counter
         previousRaw = record.counter
       end
@@ -284,7 +310,11 @@ function Bug:ImportNew()
     end
   end
 
-  if fullyScanned and scanCompleted then
+  if initialBaseline and scanCompleted and baselineSafe then
+    self._baselineComplete = true
+  end
+
+  if pruneSafe and scanCompleted then
     for key in pairs(self._counterByKey) do
       if not seen[key] then self._counterByKey[key] = nil end
     end
