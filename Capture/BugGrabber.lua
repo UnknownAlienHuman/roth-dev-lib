@@ -10,6 +10,9 @@ local Bug = {
   _enabled = false,
   _ticker = nil,
   _counterByKey = {},
+  _touchByKey = {},
+  _generation = 0,
+  _droppedCounterKeys = 0,
   _baselineComplete = false,
   _historyMode = nil,
 }
@@ -60,6 +63,7 @@ local function SafeCopy(value)
       maxEntries = 80,
       maxNodes = 500,
       maxStringBytes = 8192,
+      maxTotalBytes = 128 * 1024,
     })
     if ok then return copy end
   end
@@ -174,16 +178,67 @@ local function NormalizeRecord(raw)
   }
 end
 
--- BugGrabber counters are attached to a logical error, not to its current list
--- index. A stable content key survives list reordering and compaction.
+-- Use the same bounded logical signature family as RothDevLib grouping. Never
+-- retain the complete external message+stack as a long-lived table key.
 local function RecordKey(record)
-  return record.message .. "\031" .. (record.stack or "")
+  local util = RDL.Util
+  if util and type(util.MakeSignature) == "function" then
+    local ok, signature = pcall(util.MakeSignature, util,
+      "LUA_ERROR", record.message, record.stack)
+    if ok and type(signature) == "string" and signature ~= "" then
+      return SafeText(signature, "", 4096)
+    end
+  end
+  return SafeText(record.message, "", 2048)
+    .. "\031" .. SafeText(record.stack, "", 4096)
 end
 
 local function ResetAttachment(self)
   self._counterByKey = {}
+  self._touchByKey = {}
+  self._generation = 0
+  self._droppedCounterKeys = 0
   self._baselineComplete = false
   self._historyMode = nil
+end
+
+local function TouchCounter(self, key, counter, generation)
+  self._counterByKey[key] = counter
+  self._touchByKey[key] = generation
+end
+
+local function RemoveCounter(self, key)
+  self._counterByKey[key] = nil
+  self._touchByKey[key] = nil
+end
+
+local function TrimCounterState(self, maximum, protected)
+  maximum = math.floor(SafeNumber(maximum, 5000, 1, 20000))
+  local candidates = {}
+  for key in pairs(self._counterByKey) do
+    candidates[#candidates + 1] = {
+      key = key,
+      touched = tonumber(self._touchByKey[key]) or 0,
+      protected = protected and protected[key] == true or false,
+    }
+  end
+  local excess = #candidates - maximum
+  if excess <= 0 then return 0 end
+
+  table.sort(candidates, function(a, b)
+    if a.protected ~= b.protected then return a.protected == false end
+    if a.touched == b.touched then return a.key < b.key end
+    return a.touched < b.touched
+  end)
+
+  local removed = 0
+  for index = 1, #candidates do
+    if removed >= excess then break end
+    RemoveCounter(self, candidates[index].key)
+    removed = removed + 1
+  end
+  self._droppedCounterKeys = (tonumber(self._droppedCounterKeys) or 0) + removed
+  return removed
 end
 
 function Bug:IsPresent()
@@ -245,16 +300,22 @@ function Bug:ImportNew()
   if self._historyMode ~= importHistory then
     self._historyMode = importHistory
     self._counterByKey = {}
+    self._touchByKey = {}
+    self._generation = 0
+    self._droppedCounterKeys = 0
     self._baselineComplete = importHistory
   end
 
   local list = GetErrorList(GetBugDB())
   if not list then return 0 end
 
+  self._generation = (tonumber(self._generation) or 0) + 1
+  local generation = self._generation
   local count, pruneSafe, baselineSafe = ListBounds(list, scanMaximum)
   local initialBaseline = not importHistory and not self._baselineComplete
   local seen, imported = {}, 0
   local scanCompleted = true
+  local throttled = false
 
   for index = 1, count do
     if budget <= 0 then
@@ -265,13 +326,20 @@ function Bug:ImportNew()
     if record then
       local key = RecordKey(record)
       seen[key] = true
+      self._touchByKey[key] = generation
 
       local previousRaw = self._counterByKey[key]
       if initialBaseline then
         -- Only the initial bounded scan is history. After this scan, an unseen
         -- key is a new error and counter=1 must be imported immediately.
-        self._counterByKey[key] = record.counter
+        TouchCounter(self, key, record.counter, generation)
         previousRaw = record.counter
+      elseif previousRaw == nil and not importHistory then
+        -- Unknown keys after the attach baseline are new, but a source may have
+        -- incremented several times between polls. Import one occurrence instead
+        -- of replaying the complete foreign counter as history.
+        previousRaw = math.max(0, record.counter - 1)
+        TouchCounter(self, key, previousRaw, generation)
       end
 
       local previous = math.floor(SafeNumber(previousRaw, 0, 0, 1000000))
@@ -294,18 +362,23 @@ function Bug:ImportNew()
 
           local okStore, status = pcall(Capture.StoreEntry, entry)
           if not okStore or status == "failed" then break end
-          if status == "throttled" then return imported end
+          if status == "throttled" then
+            throttled = true
+            scanCompleted = false
+            break
+          end
           if status == "stored" or status == "queued" or status == "ignored" then
             imported = imported + 1
             budget = budget - 1
-            self._counterByKey[key] = previous + step
+            TouchCounter(self, key, previous + step, generation)
           else
             break
           end
         end
+        if throttled then break end
       elseif delta < 0 then
         -- Source rotation/reset: accept the new baseline without replaying.
-        self._counterByKey[key] = record.counter
+        TouchCounter(self, key, record.counter, generation)
       end
     end
   end
@@ -316,8 +389,24 @@ function Bug:ImportNew()
 
   if pruneSafe and scanCompleted then
     for key in pairs(self._counterByKey) do
-      if not seen[key] then self._counterByKey[key] = nil end
+      if not seen[key] then RemoveCounter(self, key) end
     end
   end
+  TrimCounterState(self, scanMaximum, seen)
   return imported
+end
+
+function Bug:GetStateStats()
+  local count = 0
+  local maximumKeyBytes = 0
+  for key in pairs(self._counterByKey) do
+    count = count + 1
+    if type(key) == "string" and #key > maximumKeyBytes then maximumKeyBytes = #key end
+  end
+  return {
+    keys = count,
+    dropped = tonumber(self._droppedCounterKeys) or 0,
+    maximumKeyBytes = maximumKeyBytes,
+    generation = tonumber(self._generation) or 0,
+  }
 end
