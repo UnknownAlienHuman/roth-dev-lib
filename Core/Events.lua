@@ -40,6 +40,7 @@ SafeRegisterEvent("ADDON_LOADED")
 SafeRegisterEvent("PLAYER_LOGIN")
 SafeRegisterEvent("PLAYER_LOGOUT")
 SafeRegisterEvent("ADDONS_UNLOADING")
+SafeRegisterEvent("SAVED_VARIABLES_TOO_LARGE")
 SafeRegisterEvent("LUA_WARNING")
 SafeRegisterEvent("ADDON_ACTION_BLOCKED")
 SafeRegisterEvent("ADDON_ACTION_FORBIDDEN")
@@ -149,6 +150,25 @@ local function Shutdown(reason)
   return true
 end
 
+local function HandlePersistenceFailure(addonName)
+  if addonName ~= RDL.addonName and addonName ~= RDL.name
+      and addonName ~= "!RothDevLib" then
+    return false
+  end
+
+  local db = RDL.DB
+  if not (db and type(db.HandlePersistenceFailure) == "function") then return false end
+  local ok, handled = pcall(db.HandlePersistenceFailure, db, addonName)
+  if ok then return handled == true end
+
+  if type(_G.print) == "function" then
+    pcall(_G.print,
+      "|cffff3333RothDevLib|r SavedVariables recovery failed; use "
+      .. "|cffffff00/rdev clear|r and |cffffff00/reload|r.")
+  end
+  return false
+end
+
 frame:SetScript("OnEvent", function(_, event, ...)
   if event == "ADDON_LOADED" then
     local name = ...
@@ -189,6 +209,11 @@ frame:SetScript("OnEvent", function(_, event, ...)
 
   if event == "PLAYER_LOGOUT" or event == "ADDONS_UNLOADING" then
     Shutdown(event)
+    return
+  end
+
+  if event == "SAVED_VARIABLES_TOO_LARGE" then
+    HandlePersistenceFailure(...)
     return
   end
 

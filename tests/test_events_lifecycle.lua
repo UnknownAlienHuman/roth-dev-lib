@@ -1,4 +1,4 @@
-_G.RothDevLib = { addonName = '!RothDevLib', version = 'test' }
+_G.RothDevLib = { addonName = '!RothDevLib', name = 'RothDevLib', version = 'test' }
 local RDL = RothDevLib
 local order, registered = {}, {}
 local frame = {}
@@ -7,6 +7,7 @@ function frame:SetScript(name, fn) self[name] = fn end
 _G.CreateFrame = function() return frame end
 _G.time = function() return 100 end
 _G.C_Timer = { After = function(_, fn) fn() end }
+_G.print = function() end
 
 local function mark(name)
   return function() order[#order + 1] = name end
@@ -21,6 +22,10 @@ RDL.DB = {
   end,
   EnsureReady = mark('db-ensure'),
   OnShutdown = mark('db-shutdown'),
+  HandlePersistenceFailure = function(_, addonName)
+    order[#order + 1] = 'persistence:' .. addonName
+    return true
+  end,
 }
 RDL.Logger = { Init = mark('logger-init') }
 RDL.Doctor = { Init = mark('doctor-init') }
@@ -52,7 +57,7 @@ RDL.Log = mark('log')
 
 assert(loadfile('Core/Events.lua'))()
 assert(registered.ADDON_LOADED and registered.PLAYER_LOGIN and registered.LUA_WARNING)
-assert(registered.ADDONS_UNLOADING)
+assert(registered.ADDONS_UNLOADING and registered.SAVED_VARIABLES_TOO_LARGE)
 local dispatch = assert(frame.OnEvent)
 
 dispatch(frame, 'ADDON_LOADED', '!RothDevLib')
@@ -85,6 +90,13 @@ local count = #order
 dispatch(frame, 'PLAYER_LOGIN')
 -- InitAll is idempotent; only post-login self-check/reload continuation repeat.
 assert(#order == count + 2)
+
+-- Persistence failure is handled only for this addon's SavedVariables owner.
+order = {}
+dispatch(frame, 'SAVED_VARIABLES_TOO_LARGE', 'OtherAddon')
+assert(#order == 0)
+dispatch(frame, 'SAVED_VARIABLES_TOO_LARGE', '!RothDevLib')
+assert(table.concat(order, ',') == 'persistence:!RothDevLib')
 
 order = {}
 dispatch(frame, 'LUA_WARNING', 'demo')
