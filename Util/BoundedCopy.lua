@@ -72,6 +72,8 @@ local function Options(opts)
     maxEntries = ClampInteger(RawOption(opts, "maxEntries"), 80, 1, 2000),
     maxNodes = ClampInteger(RawOption(opts, "maxNodes"), 500, 1, 20000),
     maxStringBytes = ClampInteger(RawOption(opts, "maxStringBytes"), 4096, 64, 1024 * 1024),
+    maxTotalBytes = ClampInteger(RawOption(opts, "maxTotalBytes"),
+      256 * 1024, 1024, 8 * 1024 * 1024),
   }
 end
 
@@ -118,16 +120,34 @@ function Util:CopyDiagnosticValue(value, opts)
   local config = Options(opts)
   local seen = {}
   local nodeCount = 0
+  local byteCount = 0
+  local byteLimitHit = false
+
+  local function Reserve(bytes)
+    if byteLimitHit then return false end
+    bytes = tonumber(bytes) or 0
+    if bytes < 0 then bytes = 0 end
+    if byteCount + bytes > config.maxTotalBytes then
+      byteLimitHit = true
+      return false
+    end
+    byteCount = byteCount + bytes
+    return true
+  end
 
   local function Copy(current, depth)
+    if byteLimitHit then return "<byte-limit>" end
     nodeCount = nodeCount + 1
     if nodeCount > config.maxNodes then return "<node-limit>" end
+    if not Reserve(8) then return "<byte-limit>" end
     if not CanAccessValue(current) then return "<inaccessible>" end
     if current == nil then return nil end
 
     local currentType = type(current)
     if currentType == "string" then
-      return FilterString(Util, current, config.maxStringBytes)
+      local filtered = FilterString(Util, current, config.maxStringBytes)
+      if not Reserve(#filtered) then return "<byte-limit>" end
+      return filtered
     end
     if currentType == "number" then
       if current ~= current then return "<nan>" end
@@ -136,7 +156,11 @@ function Util:CopyDiagnosticValue(value, opts)
       return current
     end
     if currentType == "boolean" then return current end
-    if currentType ~= "table" then return MarkerForUnsupported(Util, current) end
+    if currentType ~= "table" then
+      local marker = MarkerForUnsupported(Util, current)
+      if not Reserve(#marker) then return "<byte-limit>" end
+      return marker
+    end
 
     if not CanAccessTable(current) then return "<inaccessible-table>" end
     if depth >= config.maxDepth then return "<depth>" end
@@ -148,6 +172,11 @@ function Util:CopyDiagnosticValue(value, opts)
     local truncated, truncationReason = false, nil
 
     while count < config.maxEntries do
+      if byteLimitHit then
+        truncated, truncationReason = true, "byte-limit"
+        break
+      end
+
       local ok, nextKey, nextValue = pcall(next, current, rawKey)
       if not ok then
         truncated, truncationReason = true, "iteration-error"
@@ -169,8 +198,18 @@ function Util:CopyDiagnosticValue(value, opts)
         uniqueKey = tostring(safeKey) .. "#" .. suffix
         suffix = suffix + 1
       end
+      local keyBytes = type(uniqueKey) == "string" and #uniqueKey or 8
+      if not Reserve(keyBytes + 8) then
+        truncated, truncationReason = true, "byte-limit"
+        break
+      end
+
       usedKeys[uniqueKey] = true
       out[uniqueKey] = Copy(nextValue, depth + 1)
+      if byteLimitHit then
+        truncated, truncationReason = true, "byte-limit"
+        break
+      end
     end
 
     if not truncated then
@@ -236,6 +275,7 @@ function Util:SafeSerializeTable(value, depth)
     maxEntries = 80,
     maxNodes = 500,
     maxStringBytes = 4096,
+    maxTotalBytes = 256 * 1024,
   })
   return SerializeCopy(self, copy, startDepth, {})
 end

@@ -27,17 +27,31 @@ local bounded = U:CopyDiagnosticValue(root, {
   maxEntries = 100,
   maxNodes = 12,
 })
-local function ContainsMarker(value, seen)
-  if value == '<node-limit>' then return true end
+local function ContainsMarker(value, target, seen)
+  if value == target then return true end
   if type(value) ~= 'table' then return false end
   seen = seen or {}
   if seen[value] then return false end
   seen[value] = true
   for _, item in pairs(value) do
-    if ContainsMarker(item, seen) then return true end
+    if ContainsMarker(item, target, seen) then return true end
   end
   return false
 end
-assert(ContainsMarker(bounded))
+assert(ContainsMarker(bounded, '<node-limit>'))
+
+local broad = {}
+for index = 1, 100 do broad['key' .. index] = string.rep('x', 128) end
+local byteBounded = U:CopyDiagnosticValue(broad, {
+  maxDepth = 4,
+  maxEntries = 100,
+  maxNodes = 500,
+  maxStringBytes = 256,
+  maxTotalBytes = 1024,
+})
+assert(ContainsMarker(byteBounded, '<byte-limit>')
+  or byteBounded.__rdl_truncated == 'byte-limit')
+local serialized = U:SafeSerializeTable(byteBounded)
+assert(#serialized < 4096)
 
 print('utility traversal-bound tests: ok')
