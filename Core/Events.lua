@@ -118,6 +118,14 @@ local function FailInitialization(stage, detail)
   return false
 end
 
+local function SyncCaptureRuntimeStatus(capture)
+  capture._fallback = type(capture._fallback) == "table" and capture._fallback or {}
+  local chatTap = capture.ChatTap
+  capture._fallback.chatTapHooked = type(chatTap) == "table" and chatTap._hooked == true
+  capture.ownerInfo = type(capture.ownerInfo) == "table" and capture.ownerInfo or {}
+  capture.ownerInfo.fallback = capture._fallback.kind
+end
+
 local function InitAll()
   if RDL._initialized then return true end
   if RDL._initializing or shutdownDone then return false end
@@ -154,6 +162,7 @@ local function InitAll()
   end
   local captureOK, captureResult = ICall("Capture:Init", capture.Init, capture)
   if not captureOK then return FailInitialization("Capture:Init", captureResult) end
+  SyncCaptureRuntimeStatus(capture)
 
   if type(capture.FlushBootQueue) ~= "function" then
     return FailInitialization("Capture:FlushBootQueue", "unavailable")
@@ -199,6 +208,7 @@ local function InitAll()
     pcall(RDL.Log, RDL, "INFO", "BOOT", "RothDevLib initialized", {
       version = RDL.version,
       captureOwned = captureResult == true,
+      chatTapHooked = capture._fallback and capture._fallback.chatTapHooked == true,
       bootEntriesFlushed = tonumber(flushResult) or 0,
       warnings = #RDL._initWarnings,
     })
@@ -255,6 +265,7 @@ local function RefreshLateFallback(addonName)
   local ok, result = ICall("Capture:InstallFallbackHooks",
     capture.InstallFallbackHooks, capture)
   if not ok then RecordInitWarning("Capture:InstallFallbackHooks", result) end
+  if ok then SyncCaptureRuntimeStatus(capture) end
   return ok
 end
 

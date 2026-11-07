@@ -43,20 +43,28 @@ RDL.Mem = { StartWatcher = mark('mem-start'), StopWatcher = mark('mem-stop') }
 local captureInitAttempts = 0
 RDL.Capture = {
   EarlyInit = mark('capture-early'),
-  Init = function()
+  Init = function(self)
     order[#order + 1] = 'capture-init'
     captureInitAttempts = captureInitAttempts + 1
     if captureInitAttempts == 1 then error('capture init failed') end
+    -- Simulate the old Engine bug: pcall(ChatTap.Init) was treated as a hook
+    -- even when the actual module reports no installed hook.
+    self._fallback.chatTapHooked = true
     return false -- not owning the handler is a valid initialized fallback state
   end,
   FlushBootQueue = mark('capture-flush', 2),
-  InstallFallbackHooks = mark('fallback-refresh'),
+  InstallFallbackHooks = function(self)
+    order[#order + 1] = 'fallback-refresh'
+    self._fallback.kind = 'buggrabber'
+    return true
+  end,
   OnLuaWarning = function(_, value) order[#order + 1] = 'warning:' .. value end,
   OnTaintEvent = mark('taint'),
   OnRestrictionStateChanged = mark('restriction'),
   OnLeaveCombat = mark('leave-combat'),
   BugGrabber = { Disable = mark('bug-disable') },
-  ChatTap = { _active = { pending = true }, _timerToken = 4 },
+  ChatTap = { _active = { pending = true }, _timerToken = 4, _hooked = false },
+  _fallback = { kind = 'unavailable', chatTapHooked = true },
   ownsHandler = false,
 }
 RDL.Suppress = { SuppressAll = mark('suppress') }
@@ -118,6 +126,8 @@ assert(not joined:find('minimap-init', 1, true)) -- delayed and generation-gated
 assert(RDL._initialized == true and RDL._initFailure == nil)
 assert(type(RDL._initWarnings) == 'table' and #RDL._initWarnings == 1)
 assert(RDL._initWarnings[1].stage == 'UI:UpdateTitle')
+assert(RDL.Capture._fallback.chatTapHooked == false)
+assert(RDL.Capture.ownerInfo.fallback == 'unavailable')
 assert(#delayed == 1)
 delayed[1]()
 assert(order[#order] == 'minimap-init')
@@ -127,6 +137,8 @@ assert(order[#order] == 'minimap-init')
 order = {}
 dispatch(frame, 'ADDON_LOADED', '!BugGrabber')
 assert(table.concat(order, ',') == 'fallback-refresh')
+assert(RDL.Capture.ownerInfo.fallback == 'buggrabber')
+assert(RDL.Capture._fallback.chatTapHooked == false)
 RDL.Capture.ownsHandler = true
 order = {}
 dispatch(frame, 'ADDON_LOADED', 'BugSack')
