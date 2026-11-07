@@ -1,16 +1,16 @@
-# !RothDevLib — addon documentation
+# !RothDevLib addon documentation
 
-!RothDevLib is a developer tool for World of Warcraft (12.x) that provides a single diagnostics pipeline:
-- hard Lua errors (global `seterrorhandler()`),
-- taints (`ADDON_ACTION_BLOCKED/FORBIDDEN`),
-- Lua warnings,
-- suppressed/wrapped errors (via explicit reporting and safe wrappers),
-- execution context (Doctor) + breadcrumbs/metrics,
-- structured exports (JSON + byte-budgeted LLM pack).
+Version **1.0.0-alpha.20.0** targets WoW Retail **12.1.5** (`120105`).
 
-If you want reliable correlation for issues hidden behind `xpcall` wrappers, integrate your addon using LibStub and report errors explicitly.
+RothDevLib provides one bounded diagnostics pipeline for hard Lua errors, warnings, restricted-action signals, explicitly reported failures, execution context, breadcrumbs, lightweight profiling and structured exports.
+
+Open it with `/rdev`, the addon-compartment entry or the minimap launcher. The database groups repeated occurrences by signature, so the active count represents groups rather than raw event volume.
+
+External values are normalized before storage: inaccessible/secret values become markers, payload tables are copied and all major buffers/exports are bounded. Blizzard presentation is hidden only through settings-aware post-hooks; foreign frame methods and event registrations remain untouched.
 
 See:
-- `INTEGRATION.md` (English)
-- `INTEGRATION_RU.md` (Russian)
-- `ADDON_RU.md` (full user manual in Russian)
+
+- [Integration guide](INTEGRATION.md)
+- [Russian integration guide](INTEGRATION_RU.md)
+- [Russian user guide](ADDON_RU.md)
+- [Runtime release gate](../todo.md)

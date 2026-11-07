@@ -1,11 +1,5 @@
 -- !RothDevLib/Integration/LibStub.lua
--- Optional LibStub registration for embedded-library style integrations.
---
--- Goals:
---   * Allow other addons to depend on RothDevLib as a library:
---       local RDL = LibStub("RothDevLib-1.0", true)
---   * Keep a single authoritative instance (the global _G.RothDevLib singleton).
---   * Provide a minimal stable surface with forward compatibility.
+-- Optional LibStub facade over the authoritative _G.RothDevLib singleton.
 
 local core = _G.RothDevLib
 if not core then return end
@@ -13,8 +7,7 @@ if not core then return end
 local LibStub = _G.LibStub
 if type(LibStub) ~= "table" or type(LibStub.NewLibrary) ~= "function" then return end
 
-local MAJOR, MINOR = "RothDevLib-1.0", 2
-
+local MAJOR, MINOR = "RothDevLib-1.0", 3
 local lib = LibStub:NewLibrary(MAJOR, MINOR)
 if not lib then
   lib = LibStub(MAJOR, true)
@@ -31,133 +24,164 @@ end
 
 local function Proxy(method)
   return function(self, ...)
-    local c = _G.RothDevLib or self._core
-    if not c then return nil end
-    local fn = c[method]
+    local current = _G.RothDevLib or self._core
+    if not current then return nil end
+    local fn = current[method]
     if type(fn) ~= "function" then return nil end
-    return fn(c, ...)
+    return fn(current, ...)
   end
 end
 
--- Core wrappers -------------------------------------------------------
+-- Core wrappers
+lib.Log = Proxy("Log")
+lib.SafeCall = Proxy("SafeCall")
+lib.SafeCallCtx = Proxy("SafeCallCtx")
+lib.WrapSafe = Proxy("WrapSafe")
+lib.WrapSafeCtx = Proxy("WrapSafeCtx")
+lib.WrapUnsafe = Proxy("WrapUnsafe")
 
-lib.Log = lib.Log or Proxy("Log")
-lib.SafeCall = lib.SafeCall or Proxy("SafeCall")
-lib.SafeCallCtx = lib.SafeCallCtx or Proxy("SafeCallCtx")
-lib.WrapSafe = lib.WrapSafe or Proxy("WrapSafe")
-lib.WrapSafeCtx = lib.WrapSafeCtx or Proxy("WrapSafeCtx")
-lib.WrapUnsafe = lib.WrapUnsafe or Proxy("WrapUnsafe")
+-- Profiling
+lib.Profile = Proxy("Profile")
+lib.WrapProfiled = Proxy("WrapProfiled")
+lib.MemDelta = Proxy("MemDelta")
+lib.WrapMemDelta = Proxy("WrapMemDelta")
+lib.MemSample = Proxy("MemSample")
 
--- Perf (Phase 3)
-lib.Profile = lib.Profile or Proxy("Profile")
-lib.WrapProfiled = lib.WrapProfiled or Proxy("WrapProfiled")
-lib.MemDelta = lib.MemDelta or Proxy("MemDelta")
-lib.WrapMemDelta = lib.WrapMemDelta or Proxy("WrapMemDelta")
-lib.MemSample = lib.MemSample or Proxy("MemSample")
+-- Integration bus
+lib.InitAddon = Proxy("InitAddon")
+lib.Breadcrumb = Proxy("Breadcrumb")
+lib.Metric = Proxy("Metric")
+lib.Alert = Proxy("Alert")
+lib.Assert = Proxy("Assert")
+lib.Enter = Proxy("Enter")
+lib.Leave = Proxy("Leave")
+lib.NewAddon = Proxy("NewAddon")
 
--- Integration bus wrappers -------------------------------------------
+-- Explicit report intake
+lib.Report = Proxy("Report")
+lib.ReportError = Proxy("ReportError")
+lib.ReportWarning = Proxy("ReportWarning")
+lib.ReportTaint = Proxy("ReportTaint")
+lib.ReportSuppressed = Proxy("ReportSuppressed")
 
-lib.InitAddon = lib.InitAddon or Proxy("InitAddon")
-lib.Breadcrumb = lib.Breadcrumb or Proxy("Breadcrumb")
-lib.Metric = lib.Metric or Proxy("Metric")
-lib.Alert = lib.Alert or Proxy("Alert")
-lib.Assert = lib.Assert or Proxy("Assert")
-lib.Enter = lib.Enter or Proxy("Enter")
-lib.Leave = lib.Leave or Proxy("Leave")
-lib.NewAddon = lib.NewAddon or Proxy("NewAddon")
+local function OrdinaryTable(value)
+  local guard = core.SecretGuard
+  if guard and guard.CanAccess and not guard:CanAccess(value) then return nil end
+  if type(value) ~= "table" then return nil end
+  if guard and guard.CanAccessTable and not guard:CanAccessTable(value) then return nil end
+  return value
+end
 
--- Explicit report intake (see Integration/API.lua)
-lib.Report = lib.Report or Proxy("Report")
-lib.ReportError = lib.ReportError or Proxy("ReportError")
-lib.ReportWarning = lib.ReportWarning or Proxy("ReportWarning")
-lib.ReportTaint = lib.ReportTaint or Proxy("ReportTaint")
-lib.ReportSuppressed = lib.ReportSuppressed or Proxy("ReportSuppressed")
+local function AddonName(value)
+  local util = core.Util
+  local ordinary = value
+  if util and util.Scrub then
+    local ok, scrubbed = pcall(util.Scrub, util, value)
+    if not ok then return nil end
+    ordinary = scrubbed
+  else
+    local guard = core.SecretGuard
+    if guard and guard.CanAccess and not guard:CanAccess(value) then return nil end
+  end
+  if ordinary == nil then return nil end
 
--- Embedding -----------------------------------------------------------
---
--- Embed(target, addonName[, opts])
---   Adds bound helper methods to `target` so calls don't need addonName.
---
--- Example:
---   local Dev = LibStub("RothDevLib-1.0", true)
---   if Dev then Dev:Embed(MyAddon, "MyAddon") end
---   MyAddon:RDL_Breadcrumb("event", "PLAYER_LOGIN")
+  local name
+  if util and util.SafeToString then
+    local ok, rendered = pcall(util.SafeToString, util, ordinary)
+    if ok then name = rendered end
+  elseif type(ordinary) == "string" then
+    name = ordinary
+  end
 
+  if type(name) ~= "string" or name == "" then return nil end
+  if name == "<inaccessible>" or name == "<secret>" then return nil end
+  if #name > 128 then name = name:sub(1, 128) end
+  return name
+end
+local function Install(target, methods)
+  local ok = pcall(function()
+    for name, fn in pairs(methods) do target[name] = fn end
+  end)
+  return ok
+end
+
+-- Embed(target, addonName[, opts]) adds namespaced bound helpers.
 function lib:Embed(target, addonName, opts)
-  if type(target) ~= "table" then return nil end
-  if type(addonName) ~= "string" or addonName == "" then return nil end
+  target = OrdinaryTable(target)
+  addonName = AddonName(addonName)
+  if not target or not addonName then return nil end
 
-  local coreNow = _G.RothDevLib or self._core
-  if not coreNow then return nil end
+  local current = _G.RothDevLib or self._core
+  if not current then return nil end
+  local okInit = pcall(current.InitAddon, current, addonName, opts)
+  if not okInit then return nil end
 
-  coreNow:InitAddon(addonName, opts)
+  local methods = {
+    RDL_Breadcrumb = function(_, category, message, data)
+      return current:Breadcrumb(addonName, category, message, data)
+    end,
+    RDL_Metric = function(_, name, value, unit, metricOpts)
+      return current:Metric(addonName, name, value, unit, metricOpts)
+    end,
+    RDL_Alert = function(_, code, message, data, level)
+      return current:Alert(addonName, code, message, data, level)
+    end,
+    RDL_Assert = function(_, condition, code, message, data)
+      return current:Assert(addonName, condition, code, message, data)
+    end,
+    RDL_SafeCall = function(_, funcName, fn, ...)
+      return current:SafeCall(addonName, funcName, fn, ...)
+    end,
+    RDL_SafeCallCtx = function(_, funcName, ctx, fn, ...)
+      return current:SafeCallCtx(addonName, funcName, ctx, fn, ...)
+    end,
+    RDL_WrapSafe = function(_, funcName, fn, staticCtx)
+      return current:WrapSafe(addonName, funcName, fn, staticCtx)
+    end,
+    RDL_WrapSafeCtx = function(_, funcName, fn, ctxFn)
+      return current:WrapSafeCtx(addonName, funcName, fn, ctxFn)
+    end,
+    RDL_WrapUnsafe = function(_, funcName, fn, ctxFn)
+      return current:WrapUnsafe(addonName, funcName, fn, ctxFn)
+    end,
+    RDL_Profile = function(_, funcName, fn, profileOpts, ...)
+      return current:Profile(addonName, funcName, fn, profileOpts, ...)
+    end,
+    RDL_WrapProfiled = function(_, funcName, fn, profileOpts)
+      return current:WrapProfiled(addonName, funcName, fn, profileOpts)
+    end,
+    RDL_MemDelta = function(_, funcName, fn, memOpts, ...)
+      return current:MemDelta(addonName, funcName, fn, memOpts, ...)
+    end,
+    RDL_WrapMemDelta = function(_, funcName, fn, memOpts)
+      return current:WrapMemDelta(addonName, funcName, fn, memOpts)
+    end,
+    RDL_MemSample = function(_, tag, sampleOpts)
+      return current:MemSample(addonName, tag, sampleOpts)
+    end,
+    RDL_Enter = function(_, funcName, ctx)
+      return current:Enter(addonName, funcName, ctx)
+    end,
+    RDL_Leave = function()
+      return current:Leave()
+    end,
+    RDL_Report = function(_, kind, message, reportOpts)
+      return current:Report(addonName, kind, message, reportOpts)
+    end,
+    RDL_Error = function(_, message, reportOpts)
+      return current:ReportError(addonName, message, reportOpts)
+    end,
+    RDL_Warning = function(_, message, reportOpts)
+      return current:ReportWarning(addonName, message, reportOpts)
+    end,
+    RDL_Taint = function(_, message, reportOpts)
+      return current:ReportTaint(addonName, message, reportOpts)
+    end,
+    RDL_Suppressed = function(_, message, reportOpts)
+      return current:ReportSuppressed(addonName, message, reportOpts)
+    end,
+  }
 
-  -- Bound methods use namespaced keys to avoid collisions.
-  target.RDL_Breadcrumb = function(_, category, message, data)
-    return coreNow:Breadcrumb(addonName, category, message, data)
-  end
-  target.RDL_Metric = function(_, name, value, unit, mopts)
-    return coreNow:Metric(addonName, name, value, unit, mopts)
-  end
-  target.RDL_Alert = function(_, code, message, data, level)
-    return coreNow:Alert(addonName, code, message, data, level)
-  end
-  target.RDL_Assert = function(_, condition, code, message, data)
-    return coreNow:Assert(addonName, condition, code, message, data)
-  end
-  target.RDL_SafeCall = function(_, funcName, fn, ...)
-    return coreNow:SafeCall(addonName, funcName, fn, ...)
-  end
-  target.RDL_SafeCallCtx = function(_, funcName, ctx, fn, ...)
-    return coreNow:SafeCallCtx(addonName, funcName, ctx, fn, ...)
-  end
-  target.RDL_WrapSafe = function(_, funcName, fn, staticCtx)
-    return coreNow:WrapSafe(addonName, funcName, fn, staticCtx)
-  end
-  target.RDL_WrapSafeCtx = function(_, funcName, fn, ctxFn)
-    return coreNow:WrapSafeCtx(addonName, funcName, fn, ctxFn)
-  end
-  target.RDL_WrapUnsafe = function(_, funcName, fn, ctxFn)
-    return coreNow:WrapUnsafe(addonName, funcName, fn, ctxFn)
-  end
-
-  -- Perf helpers
-  target.RDL_Profile = function(_, funcName, fn, popts, ...)
-    return coreNow:Profile(addonName, funcName, fn, popts, ...)
-  end
-  target.RDL_WrapProfiled = function(_, funcName, fn, popts)
-    return coreNow:WrapProfiled(addonName, funcName, fn, popts)
-  end
-  target.RDL_MemDelta = function(_, funcName, fn, mopts, ...)
-    return coreNow:MemDelta(addonName, funcName, fn, mopts, ...)
-  end
-  target.RDL_WrapMemDelta = function(_, funcName, fn, mopts)
-    return coreNow:WrapMemDelta(addonName, funcName, fn, mopts)
-  end
-  target.RDL_MemSample = function(_, tag, sopts)
-    return coreNow:MemSample(addonName, tag, sopts)
-  end
-  target.RDL_Enter = function(_, funcName, ctx)
-    return coreNow:Enter(addonName, funcName, ctx)
-  end
-  target.RDL_Leave = function(_) return coreNow:Leave() end
-
-  -- Explicit reports (external intake)
-  target.RDL_Report = function(_, kind, message, ropts)
-    return coreNow:Report(addonName, kind, message, ropts)
-  end
-  target.RDL_Error = function(_, message, ropts)
-    return coreNow:ReportError(addonName, message, ropts)
-  end
-  target.RDL_Warning = function(_, message, ropts)
-    return coreNow:ReportWarning(addonName, message, ropts)
-  end
-  target.RDL_Taint = function(_, message, ropts)
-    return coreNow:ReportTaint(addonName, message, ropts)
-  end
-  target.RDL_Suppressed = function(_, message, ropts)
-    return coreNow:ReportSuppressed(addonName, message, ropts)
-  end
-
+  if not Install(target, methods) then return nil end
   return target
 end

@@ -2,56 +2,102 @@
 
 ## Start here
 
-The executable contract is [`!RothDevLib.toc`](!RothDevLib.toc), not the archived planning documents. Its load order is deliberate: embedded LibStub/CallbackHandler/LibDataBroker/LibDBIcon, `Core/*` and utilities, Export, Perf, Doctor, Integration, Capture, UI, and finally `Core/Events.lua`. `Core/Events.lua:InitAll` is the lifecycle entry point; `Core/Core.lua` creates the `RDL` namespace and `Core/DB.lua` owns the `RothDevLibDB` SavedVariables table.
+The executable contract is [`!RothDevLib.toc`](!RothDevLib.toc). Read it before changing code. The declared order is intentional:
 
-The runtime path is:
+1. embedded libraries;
+2. namespace, version, DB, lifecycle/persistence bounds and internal calls;
+3. Secret Value guards, bounded copy/JSON and public call safety;
+4. export, profiling, Doctor and integration;
+5. capture policy/engine/intake modules;
+6. UI and the final lifecycle dispatcher.
 
-`ADDON_LOADED("!RothDevLib")` -> `DB:EnsureReady`/`Capture:EarlyInit` -> `PLAYER_LOGIN` -> `InitAll` -> DB, Logger, Doctor, Validation, Bus, memory watcher, Capture, UI, and minimap initialization. `PLAYER_LOGOUT` stops persistent/session work; `PLAYER_REGEN_ENABLED` flushes leave-combat capture work.
+`## LoadSavedVariablesFirst: 1` is required. `Capture/Policy.lua` and `Core/IgnoreBounds.lua` may inspect/repair only the persisted root during file loading; `Core/DBLifecycle.lua` prevents player/session construction until `PLAYER_LOGIN`. Early captured entries remain in the bounded boot queue and receive a real session only when committed.
 
-## Runtime map
+## Runtime ownership
 
-- `Core/DB.lua` initializes defaults, settings, groups, session indexes, bounded trimming, and clear/export-facing reads.
-- `Capture/ErrorHandler.lua` is the high-risk ingestion path. It captures Lua errors/warnings, locals, stack/addon attribution, taint/restriction events, boot-queue entries, and forwards structured entries to `DB:UpsertGroup`.
-- `Doctor/Doctor.lua`, `Doctor/Breadcrumbs.lua`, and `Doctor/Validation.lua` provide context, breadcrumbs, gates, stress tests, and reload-loop checks used by Capture and UI.
-- `Integration/Bus.lua` is the low-allocation cross-addon ring-buffer bus. `Integration/API.lua` exposes `RDL:InitAddon`, `Breadcrumb`, `Metric`, `Profile`, `MemDelta`, `Report*`, `Enter`, and `NewAddon`. `Integration/LibStub.lua` registers `RothDevLib-1.0` only when LibStub is available.
-- `Export/Export.lua` and `Export/Packer.lua` read bounded DB/context state and produce share/export text. `LibDeflate` is an optional runtime lookup, not a TOC dependency.
-- `UI/MainFrame.lua`, `DetailView.lua`, `Report.lua`, `Monitor.lua`, `ExportFrame.lua`, and `UI/Slash.lua` are consumers. `/rdev` is registered at `UI/Slash.lua:10-11`; addon-compartment callbacks are in `UI/AddonCompartment.lua`.
+- `Core/Core.lua`: namespace bootstrap and integrity fingerprints only.
+- `Core/CallSafety.lua`: public wrappers and portable packed argument/return tuples.
+- `Core/Internal.lua`: guarded internal calls and exact Doctor cleanup.
+- `Core/DB.lua`: authoritative persistence/group/session implementation.
+- `Core/DBLifecycle.lua`: PLAYER_LOGIN gate, schema repair, compact persistence and oversized-SavedVariables recovery.
+- `Core/IgnoreBounds.lua`: persisted signature/addon ignore caps; no session construction.
+- `Util/BoundedCopy.lua`: raw bounded snapshots with depth/entry/node/string/total-byte budgets.
+- `Util/JSON.lua`: deterministic raw traversal with array/scan/output budgets.
+- `Util/Logger.lua`: per-line and total-byte-bounded in-memory logging.
+- `Doctor/Doctor.lua`: capped token-aware context stack with detached contexts.
+- `Integration/Callbacks.lua`: deterministic snapshot dispatch with per-event/total caps.
+- `Integration/Bus.lua`: bounded breadcrumb rings and capped addon/metric identities.
+- `Perf/CPU.lua`, `Perf/Mem.lua`: capped profiling identities; telemetry never changes target semantics.
+- `Capture/Policy.lua`: one-time compatibility policy before handler installation.
+- `Capture/Engine.lua`: handler construction, ownership state, entry construction and storage routing.
+- `Capture/Safety.lua`: bounded hard/suppressed/integration intake and fallback selection.
+- `Capture/BugGrabber.lua`: the only supported hard-error fallback after handler ownership is lost; retained state is capped.
+- `Capture/ChatTap.lua`, `Capture/Locals.lua`, `Capture/Storm.lua`: bounded heuristic intake, calibration and flood-control state.
+- UI modules are consumers; they do not own capture or persistence policy.
 
-## State and dependencies
+## Non-negotiable invariants
 
-`RothDevLibDB` is the only TOC-declared durable table. Settings, grouped signatures, session data, ignore lists, bounded indexes, and exported diagnostics are written through `RDL.DB`; capture boot queues and module state are transient until DB readiness. Do not treat `RDL.Bus` ring buffers, UI frames, CPU/memory samplers, or Doctor snapshots as durable API.
+### Global error handler
 
-The four embedded libraries are bundled and loaded before addon code. There is no required external addon dependency. Other in-house addons may consume the public Integration API or `LibStub("RothDevLib-1.0", true)`, but `!RothDevLib` does not load them. Preserve third-party library notices when changing vendored files.
+1. Chain-wrap the current handler once during `EarlyInit`.
+2. Forward to the prior handler in chain mode.
+3. Observe later replacement without automatically reclaiming or polling.
+4. Allow one explicit `/rdev reclaim` attempt.
+5. Never replace `_G.seterrorhandler`, call secure-only `AddLuaErrorHandler`, or hook/poll private ScriptErrorsFrame internals.
+
+### Foreign data
+
+Before comparison, formatting, indexing, iteration, logging, callback delivery, export or persistence:
+
+- gate Secret Value and table access;
+- copy into bounded ordinary values;
+- traverse foreign tables with raw `next`/`rawget`, never `pairs`, `#`, `__index`, `__pairs` or `__len`;
+- cap depth, entries, total nodes, individual strings and total bytes;
+- represent inaccessible/cyclic/unsupported data with explicit markers;
+- never retain foreign tables, frames, timers, callbacks or pooled objects in `RothDevLibDB`.
+
+### Retained state
+
+A count limit is not a memory limit unless identities and payload bytes are bounded too. Every long-lived registry must have an explicit ceiling and saturation behavior. Current owners include DB groups/sessions/ignore rules, Bus identities, profiling identities, callback registrations, Doctor scopes, Locals calibration, ChatTap dedup, BugGrabber counters, Storm buckets and Logger bytes.
+
+### Lifecycle and persistence
+
+- Every registration/ticker has one owner and one terminal cleanup path. `Core/Events.lua` alone owns `ADDON_LOADED`; final teardown is one idempotent `ADDONS_UNLOADING`/`PLAYER_LOGOUT` path.
+- DB/session readiness is the root initialization gate. Consumers never start after a failed DB init.
+- `SAVED_VARIABLES_TOO_LARGE` is one emergency-compaction path, never a retry loop. Writes remain suspended until explicit clear/reload recovery.
+- Doctor scopes are released by exact token and are capped even when callers leak them.
+- Safe/internal/CPU/memory wrappers preserve complete argument and return tuples, including trailing nils, without relying on `xpcall` vararg extensions.
+- A failed or throttled store is not reported as captured. Pinned records remain bounded; pinning only raises eviction priority.
+- BugGrabber attaches at current counters by default; historical replay is opt-in and newly observed foreign counters do not replay their full history.
 
 ## Change routing
 
-- Change persistence, defaults, migration, trimming, or schema: `Core/DB.lua` (`DB:Init`, `EnsureReady`, `UpsertGroup`) and corresponding validation in `Core/DB.lua`.
-- Change event/lifecycle ordering: `Core/Events.lua`; keep early capture before `PLAYER_LOGIN` and keep calls wrapped by `ICall`/`Internal:Call`.
-- Change error ownership, handler reclaim, locals filtering, or taint capture: `Capture/ErrorHandler.lua`, then `Capture/Locals.lua`, `Reported.lua`, `Taint.lua`, or `Suppress.lua` as appropriate.
-- Add an integration capability: implement the bounded primitive in `Integration/Bus.lua`, expose it through `Integration/API.lua`, and document the consumer contract in `docs/INTEGRATION.md`.
-- Change export size/format: `Export/Export.lua` and `Export/Packer.lua`; keep output bounded and secret-safe.
-- Change display only: `UI/*`; do not let UI bypass DB/Bus/Capture ownership.
-- Change performance sampling: `Perf/CPU.lua`/`Perf/Mem.lua`; preserve sampling intervals and reset semantics.
+- schema/defaults/grouping: `Core/DB.lua`
+- readiness, migration, occurrence compaction and failure recovery: `Core/DBLifecycle.lua`
+- persisted ignore policy: `Core/IgnoreBounds.lua`
+- public/internal wrappers: `Core/CallSafety.lua`, `Core/Internal.lua`, `Integration/API.lua`, `Integration/LibStub.lua`
+- diagnostic copy/encoding/logging: `Util/BoundedCopy.lua`, `Util/JSON.lua`, `Util/Logger.lua`
+- handler ownership: `Capture/Policy.lua`, `Capture/Engine.lua`, `Capture/Safety.lua`
+- fallback/intake state: `Capture/BugGrabber.lua`, `Capture/ChatTap.lua`, `Capture/Locals.lua`, `Capture/Storm.lua`, `Capture/Reported.lua`, `Capture/Taint.lua`, `Capture/Warnings.lua`
+- callbacks/bus/profiling: `Integration/Callbacks.lua`, `Integration/Bus.lua`, `Perf/*`
+- UI only: `UI/*`
 
-## Invariants/risks
-
-- The global error handler is shared process state. `Capture:EnsureHandler`, `ApplyHandlerLock`, and `TryReclaimHandler` must remain idempotent and must not recursively report their own failures.
-- `hooksecurefunc`, protected frames, `InCombatLockdown`, restricted/secret values, and addon-action taint are explicit risk boundaries. Keep capture/diagnostic calls protected with `pcall`/`Internal:Call`; never perform protected UI mutations from the error path.
-- Error ingestion and `DB:UpsertGroup` are hot paths. Keep group/session indexes bounded, preserve Storm throttling, and avoid per-event frame/UI creation.
-- Capture can run before SavedVariables are ready; the boot queue must flush only after `DB:IsReady()`.
-- UI and optional LibDeflate/LibStub integrations must degrade to no-op/diagnostic states when unavailable.
+Do not add another generic framework, owner, event bus or compatibility layer when one of these files already owns the concern.
 
 ## Verification
 
-Static checks from the repository root:
-
-```powershell
-rg -n "RothDevLibDB|InitAll|Capture:EarlyInit|EnsureHandler|SlashCmdList" _Addons/!RothDevLib
-Get-Content _Addons/!RothDevLib/!RothDevLib.toc
+```sh
+./tests/run.sh
+find Core Capture Doctor Integration Perf Util UI Export -name '*.lua' -print0 | xargs -0 -n1 texluac -p
 ```
 
-In-game smoke checks: `/rdev status`, `/rdev gate`, `/rdev test error`, `/rdev test warning`, `/rdev test taint`, `/rdev stress`, `/rdev reloadloop 2`, `/rdev export`, and `/rdev clear`. Verify standalone operation, BugGrabber coexistence, combat/leave-combat, bounded export, reload persistence, and zero self-generated blocked/forbidden actions. Confirm the resulting `RothDevLibDB` shape in the client SavedVariables file rather than assuming a UI message proves persistence.
+GitHub Actions runs both gates on every branch/PR. Required client matrix:
 
-## Unknowns
+- RothDevLib only: login/reload and hard/suppressed/report/warning/taint paths;
+- RothDevLib + BugGrabber/BugSack: no replay, duplicates or ownership churn;
+- later handler replacement: fallback/unavailable state, no automatic reclaim;
+- explicit `/rdev reclaim`;
+- combat/restriction transitions with zero RothDevLib-caused blocked/forbidden actions;
+- stress, reload loop, bounded export and SavedVariables inspection.
 
-Static review cannot prove current Retail frame names, Blizzard handler ownership, or the exact behavior of restricted values on every 12.x build. Those claims require the target client and the existing release-gate matrix in `todo.md`.
+Static review cannot certify client taint, secure execution, frame timing or actual Secret Value behavior. Record exact client build, Interface and addon commit for runtime PASS.

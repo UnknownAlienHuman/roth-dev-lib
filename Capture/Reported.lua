@@ -1,140 +1,160 @@
 -- !RothDevLib/Capture/Reported.lua
--- External report intake.
---
--- Purpose:
---   Allow other addons to report errors/warnings/taints (or any custom kind) into RothDevLib
---   even when they do not propagate to the global Lua error handler.
---
--- Design:
---   * Low overhead: no hooks; this is only called explicitly by integrating addons.
---   * Best-effort normalization: accepts caller-provided stack/locals, otherwise captures a stack.
---   * Secret-safe: filters Secret Values (|K...|k) in message/stack/locals.
+-- Bounded external report intake for addons that catch their own failures.
 
 local RDL = _G.RothDevLib
 local Capture = RDL and RDL.Capture
 if not Capture then return end
 
+local ACCEPTED_STATUS = { stored = true, queued = true, ignored = true }
+
 local function Settings()
-  return (RDL.DB and RDL.DB.GetSettings and RDL.DB:GetSettings()) or {}
+  if RDL.DB and type(RDL.DB.GetSettings) == "function" then
+    local ok, value = pcall(RDL.DB.GetSettings, RDL.DB)
+    if ok and type(value) == "table" then return value end
+  end
+  return {}
 end
 
-local function Scrub(s)
-  local U = RDL.Util
-  if U and U.Scrub then
-    return U:Scrub(s)
+local function SafeCopy(value, options)
+  local util = RDL.Util
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, options or {
+      maxDepth = 5,
+      maxEntries = 100,
+      maxNodes = 600,
+      maxStringBytes = 8192,
+    })
+    if ok then return copy end
   end
-  return s
+  return nil
 end
 
-local function FilterLocals(locals)
-  if locals == nil then return nil end
-
-  if RDL.SecretGuard and RDL.SecretGuard.FilterLocals then
-    locals = RDL.SecretGuard:FilterLocals(locals)
-  elseif type(locals) == "string" then
-    locals = locals:gsub("|K[^|]*|k", "<filtered>")
+local function SafeText(value, fallback, maximum)
+  local util = RDL.Util
+  local text = type(fallback) == "string" and fallback or ""
+  if util and type(util.SafeToString) == "function" then
+    local ok, rendered = pcall(util.SafeToString, util, value)
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(value) == "string" then
+    text = value
   end
-
-  local s = Settings()
-  local maxSize = tonumber(s.maxLocalsSize) or 8192
-  if type(locals) == "string" and #locals > maxSize then
-    locals = locals:sub(1, maxSize) .. "\n...[truncated]"
+  if util and type(util.FilterSecretEscapes) == "function" then
+    local ok, filtered = pcall(util.FilterSecretEscapes, util, text)
+    if ok and type(filtered) == "string" then text = filtered end
   end
-  return locals
+  maximum = tonumber(maximum) or 8192
+  if #text > maximum then text = text:sub(1, maximum) .. "<truncated>" end
+  return text
 end
 
 local function NormalizeStack(stack, stackLevel)
-  if type(stack) == "string" and stack ~= "" then
-    return Scrub(stack)
+  local supplied = SafeCopy(stack, { maxDepth = 1, maxEntries = 1, maxNodes = 2, maxStringBytes = 128 * 1024 })
+  if type(supplied) == "string" and supplied ~= "" then
+    return SafeText(supplied, "", 128 * 1024)
   end
 
-  local lvl = tonumber(stackLevel) or 4
-  local ok, s = pcall(function()
-    return debugstack(lvl, 40, 40)
-  end)
-
-  if ok and type(s) == "string" then
-    return Scrub(s)
-  end
-  return ""
+  local level = tonumber(SafeCopy(stackLevel)) or 4
+  if level < 1 then level = 1 elseif level > 100 then level = 100 end
+  if type(_G.debugstack) ~= "function" then return "" end
+  local ok, value = pcall(_G.debugstack, level, 40, 40)
+  return ok and SafeText(value, "", 128 * 1024) or ""
 end
 
--- Public API for explicit report intake.
---
--- Capture:OnReported(kind, addonName, message, opts)
---
--- opts:
---   stack: string (preferred) - stack trace
---   stackLevel: number - if stack not provided, capture from this stack level (default 4)
---   locals: string|table - locals dump (string preferred)
---   func: string - function/context label shown in UI
---   code: string - optional error code
---   level: string - optional severity string (INFO/WARN/ERROR)
---   data: any - payload for export/debug
---   extra: table - extra metadata (merged)
-function Capture:OnReported(kind, addonName, message, opts)
-  if self._disabled then return end
-
-  kind = tostring(kind or "SUPPRESSED")
-  addonName = tostring(addonName or "<?>")
-
-  opts = opts or {}
-
-  local msg = message
-  if msg == nil then msg = "" end
-  msg = tostring(msg)
-  msg = Scrub(msg)
-
-  -- If the caller passes `code`/`level`, prefix similarly to OnIntegrationEvent.
-  if opts.code then
-    msg = tostring(opts.code) .. ": " .. msg
+local function NormalizeLocals(value)
+  local copy = SafeCopy(value, {
+    maxDepth = 4,
+    maxEntries = 80,
+    maxNodes = 500,
+    maxStringBytes = tonumber(Settings().maxLocalsSize) or 8192,
+  })
+  if copy == nil then return nil end
+  if type(copy) == "string" then
+    return SafeText(copy, "", tonumber(Settings().maxLocalsSize) or 8192)
   end
-  if opts.level then
-    msg = "[" .. tostring(opts.level) .. "] " .. msg
+
+  local util = RDL.Util
+  if util and type(util.SafeSerializeTable) == "function" then
+    local ok, text = pcall(util.SafeSerializeTable, util, copy)
+    if ok then return SafeText(text, "", tonumber(Settings().maxLocalsSize) or 8192) end
   end
+  return SafeText(copy, "<unavailable>", tonumber(Settings().maxLocalsSize) or 8192)
+end
+
+local function BuildAndStore(kind, addonName, message, options)
+  if type(Capture.BuildEntry) ~= "function" or type(Capture.StoreEntry) ~= "function" then
+    return nil, "unavailable"
+  end
+
+  local opts = SafeCopy(options)
+  if type(opts) ~= "table" then opts = {} end
+
+  local safeKind = SafeText(kind, "SUPPRESSED", 64)
+  if safeKind == "" or safeKind == "nil" then safeKind = "SUPPRESSED" end
+  local safeAddon = SafeText(addonName, "<?>" , 128)
+  if safeAddon == "" or safeAddon == "nil" then safeAddon = "<?>" end
+  local msg = SafeText(message, "", 64 * 1024)
+
+  local code = opts.code and SafeText(opts.code, "", 256) or nil
+  local level = opts.level and SafeText(opts.level, "", 32) or nil
+  if code and code ~= "" then msg = code .. ": " .. msg end
+  if level and level ~= "" then msg = "[" .. level .. "] " .. msg end
 
   local stack = NormalizeStack(opts.stack or opts.traceback, opts.stackLevel)
-  local locals = FilterLocals(opts.locals)
-  local lmeta = nil
-  if locals == nil and RDL.Locals and RDL.Locals.CaptureBest then
-    local okL, l, m = pcall(function()
-      -- Call path is typically: addon -> RDL:Report -> Capture:OnReported.
-      return RDL.Locals:CaptureBest({ addon = addonName, stack = stack, baseLevel = 3 })
-    end)
-    if okL then
-      locals = l
-      lmeta = m
+  local locals = NormalizeLocals(opts.locals)
+  local localsProbe
+  if locals == nil and RDL.Locals and type(RDL.Locals.CaptureBest) == "function" then
+    local ok, captured, meta = pcall(RDL.Locals.CaptureBest, RDL.Locals, {
+      addon = safeAddon,
+      stack = stack,
+      baseLevel = 3,
+    })
+    if ok then
+      locals = NormalizeLocals(captured)
+      localsProbe = SafeCopy(meta)
     end
   end
 
-  -- Structured metadata: always tag the source.
-  local extra = {}
-  if type(opts.extra) == "table" then
-    for k, v in pairs(opts.extra) do extra[k] = v end
+  local extra = SafeCopy(opts.extra)
+  if type(extra) ~= "table" then extra = {} end
+  if extra.source == nil then extra.source = "report" end
+  if extra.code == nil then extra.code = code end
+  if extra.level == nil then extra.level = level end
+  if extra.data == nil then extra.data = SafeCopy(opts.data) end
+  if extra.event == nil then extra.event = SafeCopy(opts.event) end
+  if extra.tag == nil then extra.tag = SafeCopy(opts.tag) end
+  if extra.localsProbe == nil then extra.localsProbe = localsProbe end
+
+  local funcName = opts.func or opts.funcName
+  if funcName ~= nil then funcName = SafeText(funcName, "", 256) end
+
+  local okBuild, entry = pcall(Capture.BuildEntry, safeKind, msg, stack, locals,
+    safeAddon, funcName, extra)
+  if not okBuild or type(entry) ~= "table" then return nil, "build-failed" end
+
+  local signature = opts.signature
+  if signature == nil then signature = opts.sig end
+  if signature ~= nil then
+    local safeSignature = SafeText(signature, "", 4096)
+    if safeSignature ~= "" and safeSignature ~= "<inaccessible>"
+        and safeSignature ~= "<secret>" and safeSignature ~= "<unavailable>" then
+      entry.sig = safeSignature
+    end
   end
 
-  extra.source = extra.source or "report"
-  extra.code = extra.code or opts.code
-  extra.level = extra.level or opts.level
-  extra.data = extra.data or opts.data
-  extra.event = extra.event or opts.event
-  extra.tag = extra.tag or opts.tag
-  extra.localsProbe = extra.localsProbe or lmeta
+  local okStore, status = pcall(Capture.StoreEntry, entry)
+  if not okStore or not ACCEPTED_STATUS[status] then return nil, status or "store-failed" end
+  return entry, status
+end
 
-  local funcName = opts.func or opts.funcName or nil
-
-  local entry = Capture.BuildEntry(kind, msg, stack, locals, addonName, funcName, extra)
-
-  -- Optional: allow caller to provide a stable signature for grouping.
-  if opts.signature or opts.sig then
-    entry.sig = tostring(opts.signature or opts.sig)
+function Capture:OnReported(kind, addonName, message, options)
+  if self._disabled then return nil end
+  local entry, status = BuildAndStore(kind, addonName, message, options)
+  if entry and (status == "stored" or status == "queued") and type(RDL.Log) == "function" then
+    pcall(RDL.Log, RDL, "INFO", "REPORT", "External report captured", {
+      kind = entry.kind,
+      addon = entry.addon,
+      func = entry.func,
+    })
   end
-
-  Capture.StoreEntry(entry)
-
-  if RDL and RDL.Log then
-    pcall(function()
-      RDL:Log("INFO", "REPORT", "External report captured", { kind = kind, addon = addonName, func = funcName })
-    end)
-  end
+  return entry, status
 end
