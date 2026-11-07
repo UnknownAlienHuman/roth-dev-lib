@@ -26,10 +26,18 @@ out = J:Encode(duplicateKeys)
 assert(out:find('"1":"string"', 1, true), out)
 assert(out:find('"[number]1":"number"', 1, true), out)
 
+-- The global output limit applies while children are emitted, not only after a
+-- large subtree/parts array has already been assembled.
 local huge = {}
 for i = 1, 100 do huge[i] = string.rep('x', 1000) end
 out = J:Encode(huge, { maxOutputBytes = 4096 })
 assert(out == '{"error":"json_output_limit"}', out)
+
+-- Object identities are bounded independently of value strings and output.
+local hugeKey = {}
+hugeKey[string.rep('k', 10000)] = 'value'
+out = J:Encode(hugeKey, { maxKeyBytes = 64, maxOutputBytes = 4096 })
+assert(#out < 256 and out:find('<truncated>', 1, true), out)
 
 local scan = {}
 for i = 1, 25 do scan[i] = i end

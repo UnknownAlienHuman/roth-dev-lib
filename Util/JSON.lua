@@ -1,6 +1,7 @@
 -- !RothDevLib/Util/JSON.lua
--- Deterministic diagnostic JSON encoder with raw bounded traversal.
--- Foreign __pairs/__index/__len metamethods are never invoked.
+-- Deterministic diagnostic JSON encoder with raw bounded traversal and one
+-- streaming output budget. Foreign __pairs/__index/__len metamethods are never
+-- invoked and no subtree is assembled outside the global output ceiling.
 
 local RDL = _G.RothDevLib
 if not RDL then return end
@@ -112,6 +113,7 @@ local function NormalizeOptions(options)
     maxScanEntries = 5000,
     maxNodes = 5000,
     maxStringBytes = 64 * 1024,
+    maxKeyBytes = 1024,
     maxOutputBytes = 1024 * 1024,
     pretty = false,
     indentStep = 2,
@@ -129,17 +131,19 @@ local function NormalizeOptions(options)
     config.maxNodes, 1, 100000)
   config.maxStringBytes = ClampInteger(RawOption(options, "maxStringBytes"),
     config.maxStringBytes, 256, 1024 * 1024)
+  config.maxKeyBytes = ClampInteger(RawOption(options, "maxKeyBytes"),
+    config.maxKeyBytes, 64, 64 * 1024)
   config.maxOutputBytes = ClampInteger(RawOption(options, "maxOutputBytes"),
     config.maxOutputBytes, 4096, 8 * 1024 * 1024)
   config.indentStep = ClampInteger(RawOption(options, "indentStep"),
     config.indentStep, 0, 8)
   config.pretty = Scrub(RawOption(options, "pretty")) == true
-  return config
-end
 
-local function CheckOutputSize(size, config)
-  if size > config.maxOutputBytes then error(OUTPUT_LIMIT, 0) end
-  return size
+  -- A key or scalar string can never contribute more useful bytes than the
+  -- complete document budget. Clamp early to bound transient escaping work.
+  config.maxStringBytes = math.min(config.maxStringBytes, config.maxOutputBytes)
+  config.maxKeyBytes = math.min(config.maxKeyBytes, config.maxStringBytes, config.maxOutputBytes)
+  return config
 end
 
 local function TruncateUTF8(value, maximum)
@@ -163,6 +167,23 @@ local function TruncateUTF8(value, maximum)
   return value:sub(1, lastComplete) .. "<truncated>"
 end
 
+local function FilterString(value)
+  local filtered = value
+  local util = RDL.Util
+  if util and type(util.FilterSecretEscapes) == "function" then
+    local ok, result = pcall(util.FilterSecretEscapes, util, value)
+    if ok and type(result) == "string" then filtered = result end
+  else
+    filtered = value:gsub("|K[^|]*|k", "<filtered>")
+  end
+
+  -- Truncation may cut a |K...|k escape before its terminator. Never emit the
+  -- remaining opaque payload as plain diagnostic text.
+  local incomplete = filtered:find("|K", 1, true)
+  if incomplete then filtered = filtered:sub(1, incomplete - 1) .. "<filtered>" end
+  return filtered
+end
+
 local function RenderUnsupported(value)
   local util = RDL.Util
   if util and type(util.SafeToString) == "function" then
@@ -172,19 +193,10 @@ local function RenderUnsupported(value)
   return "<unsupported>"
 end
 
-local function EscapeString(value, config)
+local function EscapedString(value, maximum)
   local text = Scrub(value)
   if type(text) ~= "string" then text = RenderUnsupported(text) end
-
-  local util = RDL.Util
-  if util and type(util.FilterSecretEscapes) == "function" then
-    local ok, filtered = pcall(util.FilterSecretEscapes, util, text)
-    if ok and type(filtered) == "string" then text = filtered end
-  else
-    text = text:gsub("|K[^|]*|k", "<filtered>")
-  end
-
-  text = TruncateUTF8(text, config.maxStringBytes)
+  text = FilterString(TruncateUTF8(text, maximum))
   text = text:gsub("\\", "\\\\")
     :gsub('"', '\\"')
     :gsub("\b", "\\b")
@@ -195,24 +207,22 @@ local function EscapeString(value, config)
     :gsub("[%z\1-\31]", function(char)
       return string.format("\\u%04x", string.byte(char))
     end)
-
-  local encoded = '"' .. text .. '"'
-  CheckOutputSize(#encoded, config)
-  return encoded
+  return '"' .. text .. '"'
 end
 
-local function IndentString(count)
-  return string.rep(" ", count)
+local function Emit(state, text)
+  local nextBytes = state.outputBytes + #text
+  if nextBytes > state.config.maxOutputBytes then error(OUTPUT_LIMIT, 0) end
+  state.outputBytes = nextBytes
+  state.chunks[#state.chunks + 1] = text
 end
 
-local function JoinParts(opening, parts, separator, closing, config)
-  local total = #opening + #closing
-  for index = 1, #parts do
-    if index > 1 then total = total + #separator end
-    total = total + #parts[index]
-    CheckOutputSize(total, config)
-  end
-  return opening .. table.concat(parts, separator) .. closing
+local function EmitString(state, value, maximum)
+  Emit(state, EscapedString(value, maximum or state.config.maxStringBytes))
+end
+
+local function EmitIndent(state, count)
+  if count > 0 then Emit(state, string.rep(" ", count)) end
 end
 
 local function InspectArray(value, config)
@@ -242,20 +252,20 @@ local function InspectArray(value, config)
   return true, maximum, nil
 end
 
-local function KeyRecord(key)
+local function KeyRecord(key, config)
   if not CanAccessValue(key) or IsSecretValue(key) then return nil end
   local ordinary = Scrub(key)
   local keyType = type(ordinary)
   local keyText
 
   if keyType == "string" then
-    keyText = ordinary
+    keyText = TruncateUTF8(FilterString(TruncateUTF8(ordinary, config.maxKeyBytes)), config.maxKeyBytes)
   elseif keyType == "number" and IsFiniteNumber(ordinary) then
     keyText = tostring(ordinary)
   elseif keyType == "boolean" then
     keyText = ordinary and "true" or "false"
   else
-    keyText = RenderUnsupported(ordinary)
+    keyText = TruncateUTF8(RenderUnsupported(ordinary), config.maxKeyBytes)
   end
 
   local rank = keyType == "string" and "1"
@@ -269,17 +279,20 @@ local function KeyRecord(key)
   }
 end
 
-local function ResolveDuplicateObjectKeys(records)
+local function ResolveDuplicateObjectKeys(records, config)
   local used = {}
   for index = 1, #records do
     local record = records[index]
     local base = record.key
     local candidate = base
     if used[candidate] then
-      candidate = "[" .. record.keyType .. "]" .. base
+      local prefix = "[" .. record.keyType .. "]"
+      candidate = TruncateUTF8(prefix .. base, config.maxKeyBytes)
       local suffix = 2
       while used[candidate] do
-        candidate = "[" .. record.keyType .. "]" .. base .. "#" .. suffix
+        local suffixText = "#" .. suffix
+        local available = math.max(1, config.maxKeyBytes - #prefix - #suffixText)
+        candidate = prefix .. TruncateUTF8(base, available) .. suffixText
         suffix = suffix + 1
       end
     end
@@ -305,37 +318,38 @@ end
 
 local EncodeValue
 
-local function EncodeArray(value, arrayLength, config, state, depth, seen, indent)
+local function EncodeArray(value, arrayLength, state, depth, seen, indent)
+  local config = state.config
   local pretty = config.pretty
-  local newline = pretty and "\n" or ""
-  local separator = pretty and ",\n" or ","
   local childIndent = indent + config.indentStep
-  local prefix = pretty and IndentString(childIndent) or ""
-  local parts = {}
   local limit = math.min(arrayLength, config.maxArrayLen)
+  local itemCount = limit + (arrayLength > limit and 1 or 0)
+
+  Emit(state, "[")
+  if itemCount > 0 and pretty then Emit(state, "\n") end
 
   for index = 1, limit do
+    if index > 1 then Emit(state, pretty and ",\n" or ",") end
+    if pretty then EmitIndent(state, childIndent) end
     local ok, item = RawGet(value, index)
-    if not ok then item = "<read-error>" end
-    parts[#parts + 1] = prefix .. EncodeValue(item, config, state, depth + 1, seen, childIndent)
-  end
-  if arrayLength > limit then
-    parts[#parts + 1] = prefix .. EscapeString("<truncated>", config)
+    EncodeValue(ok and item or "<read-error>", state, depth + 1, seen, childIndent)
   end
 
-  if #parts == 0 then return "[]" end
-  local opening = "[" .. newline
-  local closing = newline .. (pretty and IndentString(indent) or "") .. "]"
-  return JoinParts(opening, parts, separator, closing, config)
+  if arrayLength > limit then
+    if limit > 0 then Emit(state, pretty and ",\n" or ",") end
+    if pretty then EmitIndent(state, childIndent) end
+    EmitString(state, "<truncated>")
+  end
+
+  if itemCount > 0 and pretty then
+    Emit(state, "\n")
+    EmitIndent(state, indent)
+  end
+  Emit(state, "]")
 end
 
-local function EncodeObject(value, config, state, depth, seen, indent)
-  local pretty = config.pretty
-  local newline = pretty and "\n" or ""
-  local separator = pretty and ",\n" or ","
-  local keySeparator = pretty and ": " or ":"
-  local childIndent = indent + config.indentStep
-  local prefix = pretty and IndentString(childIndent) or ""
+local function EncodeObject(value, state, depth, seen, indent)
+  local config = state.config
   local records = {}
   local rawKey = nil
   local scanned, emitted = 0, 0
@@ -359,81 +373,118 @@ local function EncodeObject(value, config, state, depth, seen, indent)
       break
     end
 
-    local record = KeyRecord(nextKey)
-    if not record then return EscapeString("<inaccessible-table>", config) end
+    local record = KeyRecord(nextKey, config)
+    if not record then
+      EmitString(state, "<inaccessible-table>")
+      return
+    end
     record.rawValue = nextValue
     records[#records + 1] = record
     emitted = emitted + 1
   end
 
   table.sort(records, function(a, b) return a.sortKey < b.sortKey end)
-  local usedKeys = ResolveDuplicateObjectKeys(records)
+  local usedKeys = ResolveDuplicateObjectKeys(records, config)
   if truncationReason then AddTruncationRecord(records, usedKeys, truncationReason) end
   table.sort(records, function(a, b) return a.key < b.key end)
 
-  local parts = {}
+  local pretty = config.pretty
+  local childIndent = indent + config.indentStep
+  Emit(state, "{")
+  if #records > 0 and pretty then Emit(state, "\n") end
+
   for index = 1, #records do
+    if index > 1 then Emit(state, pretty and ",\n" or ",") end
+    if pretty then EmitIndent(state, childIndent) end
     local record = records[index]
-    local encodedValue = EncodeValue(record.rawValue, config, state, depth + 1, seen, childIndent)
-    parts[index] = prefix .. EscapeString(record.key, config) .. keySeparator .. encodedValue
+    EmitString(state, record.key, config.maxKeyBytes)
+    Emit(state, pretty and ": " or ":")
+    EncodeValue(record.rawValue, state, depth + 1, seen, childIndent)
   end
 
-  if #parts == 0 then return "{}" end
-  local opening = "{" .. newline
-  local closing = newline .. (pretty and IndentString(indent) or "") .. "}"
-  return JoinParts(opening, parts, separator, closing, config)
+  if #records > 0 and pretty then
+    Emit(state, "\n")
+    EmitIndent(state, indent)
+  end
+  Emit(state, "}")
 end
 
-EncodeValue = function(value, config, state, depth, seen, indent)
+EncodeValue = function(value, state, depth, seen, indent)
+  local config = state.config
   state.nodes = state.nodes + 1
-  if state.nodes > config.maxNodes then return EscapeString("<node-limit>", config) end
+  if state.nodes > config.maxNodes then
+    EmitString(state, "<node-limit>")
+    return
+  end
 
   local ordinary = Scrub(value)
-  if ordinary == nil then return "null" end
+  if ordinary == nil then
+    Emit(state, "null")
+    return
+  end
 
   local valueType = type(ordinary)
-  if valueType == "boolean" then return ordinary and "true" or "false" end
-  if valueType == "number" then
-    if not IsFiniteNumber(ordinary) then return "null" end
-    return tostring(ordinary)
+  if valueType == "boolean" then
+    Emit(state, ordinary and "true" or "false")
+    return
   end
-  if valueType == "string" then return EscapeString(ordinary, config) end
-  if valueType ~= "table" then return EscapeString(RenderUnsupported(ordinary), config) end
+  if valueType == "number" then
+    Emit(state, IsFiniteNumber(ordinary) and tostring(ordinary) or "null")
+    return
+  end
+  if valueType == "string" then
+    EmitString(state, ordinary)
+    return
+  end
+  if valueType ~= "table" then
+    EmitString(state, RenderUnsupported(ordinary))
+    return
+  end
 
-  if not CanAccessTable(ordinary) then return EscapeString("<inaccessible-table>", config) end
-  if depth >= config.maxDepth then return EscapeString("<depth>", config) end
-  if seen[ordinary] then return EscapeString("<cycle>", config) end
+  if not CanAccessTable(ordinary) then
+    EmitString(state, "<inaccessible-table>")
+    return
+  end
+  if depth >= config.maxDepth then
+    EmitString(state, "<depth>")
+    return
+  end
+  if seen[ordinary] then
+    EmitString(state, "<cycle>")
+    return
+  end
   seen[ordinary] = true
 
   local isArray, arrayLength, arrayError = InspectArray(ordinary, config)
-  local encoded
   if arrayError == "inaccessible-key" then
-    encoded = EscapeString("<inaccessible-table>", config)
+    EmitString(state, "<inaccessible-table>")
   elseif arrayError == "scan-limit" then
-    encoded = EscapeString("<table-scan-limit>", config)
+    EmitString(state, "<table-scan-limit>")
   elseif arrayError == "iteration-error" then
-    encoded = EscapeString("<table-iteration-error>", config)
+    EmitString(state, "<table-iteration-error>")
   elseif isArray then
-    encoded = EncodeArray(ordinary, arrayLength, config, state, depth, seen, indent)
+    EncodeArray(ordinary, arrayLength, state, depth, seen, indent)
   else
-    encoded = EncodeObject(ordinary, config, state, depth, seen, indent)
+    EncodeObject(ordinary, state, depth, seen, indent)
   end
 
   seen[ordinary] = nil
-  CheckOutputSize(#encoded, config)
-  return encoded
 end
 
 function JSON:Encode(value, options)
   local config = NormalizeOptions(options)
-  local state = { nodes = 0 }
-  local ok, output = pcall(EncodeValue, value, config, state, 0, {}, 0)
+  local state = {
+    config = config,
+    chunks = {},
+    outputBytes = 0,
+    nodes = 0,
+  }
+  local ok, failure = pcall(EncodeValue, value, state, 0, {}, 0)
   if not ok then
-    if CanAccessValue(output) and not IsSecretValue(output) and output == OUTPUT_LIMIT then
+    if CanAccessValue(failure) and not IsSecretValue(failure) and failure == OUTPUT_LIMIT then
       return '{"error":"json_output_limit"}'
     end
     return '{"error":"json_encode_failed"}'
   end
-  if type(output) ~= "string" then return '{"error":"json_encode_failed"}' end
-  return output
+  return table.concat(state.chunks)
 end
