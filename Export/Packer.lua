@@ -1,7 +1,7 @@
 -- !RothDevLib/Export/Packer.lua
--- LLM-oriented compact packing with a strict final byte contract. The packer
--- degrades deterministically until JSON encoding succeeds inside maxBytes; it
--- never returns an encoder error object as if it were a valid report.
+-- LLM-oriented compact packing with a strict final byte contract. The source
+-- DB is scanned/sorted once; bounded serialization is retried through a small
+-- deterministic degradation ladder without rebuilding source indexes.
 
 local RDL = _G.RothDevLib
 local Export = RDL.Export
@@ -13,8 +13,8 @@ Export.Packer = Packer
 local MAX_PACK_BYTES = 1024 * 1024
 local MAX_GROUPS = 500
 local MAX_TIMELINE = 100
-local MAX_DEGRADATION_RECORDS = 12
-local MAX_ATTEMPTS = 128
+local MAX_ATTEMPTS = 24
+local MAX_DEGRADATION_RECORDS = 6
 
 local function CanAccess(value)
   local guard = RDL.SecretGuard
@@ -51,6 +51,13 @@ local function RawOption(options, key)
   local ok, value = pcall(rawget, options, key)
   if not ok or not CanAccess(value) then return nil end
   return value
+end
+
+local function RawField(value, key)
+  if not CanAccessTable(value) then return nil end
+  local ok, field = pcall(rawget, value, key)
+  if not ok or not CanAccess(field) then return nil end
+  return field
 end
 
 local function FiniteNumber(value)
@@ -91,11 +98,13 @@ local function SafeText(value, fallback, maximum)
   return text
 end
 
-local function RawField(value, key)
-  if not CanAccessTable(value) then return nil end
-  local ok, field = pcall(rawget, value, key)
-  if not ok or not CanAccess(field) then return nil end
-  return field
+local function SafeSerialize(value)
+  local util = RDL.Util
+  if CanAccessTable(value) and util and type(util.SafeSerializeTable) == "function" then
+    local ok, rendered = pcall(util.SafeSerializeTable, util, value)
+    if ok and type(rendered) == "string" then return rendered end
+  end
+  return SafeText(value, "<unavailable>", 8192)
 end
 
 local function KindWeight(kind)
@@ -111,31 +120,22 @@ local function KindWeight(kind)
 end
 
 local function ScoreGroup(group)
-  local weight = KindWeight(SafeText(RawField(group, "kind"), "", 64))
   local count = RawField(group, "count")
   count = FiniteNumber(count) and math.max(0, count) or 1
   local recent = RawField(group, "lastSeen")
   recent = FiniteNumber(recent) and recent or 0
-  return recent * 0.001 + weight + math.log(count + 1) * 3
-end
-
-local function SafeSerialize(value)
-  local util = RDL.Util
-  if CanAccessTable(value) and util and type(util.SafeSerializeTable) == "function" then
-    local ok, rendered = pcall(util.SafeSerializeTable, util, value)
-    if ok and type(rendered) == "string" then return rendered end
-  end
-  return SafeText(value, "<unavailable>", 8192)
+  return recent * 0.001
+    + KindWeight(SafeText(RawField(group, "kind"), "", 64))
+    + math.log(count + 1) * 3
 end
 
 local function CompactStack(value, maximumLines)
-  local stack = SafeText(value, "", 128 * 1024)
-  if not stack or stack == "" then return nil end
+  local stack = SafeText(value, nil, 128 * 1024)
   maximumLines = ClampInteger(maximumLines, 18, 0, 200)
-  if maximumLines <= 0 then return nil end
+  if not stack or stack == "" or maximumLines <= 0 then return nil end
 
-  stack = stack:gsub("\r", ""):gsub("\n+$", "")
   local lines = {}
+  stack = stack:gsub("\r", ""):gsub("\n+$", "")
   for line in stack:gmatch("[^\n]+") do
     lines[#lines + 1] = line
     if #lines >= maximumLines then break end
@@ -225,9 +225,9 @@ local function CollectGroupsAll()
   return groups
 end
 
-local function BuildAddonStats(groups)
+local function BuildAddonStats(groups, maximum)
   local output = {}
-  for index = 1, #groups do
+  for index = 1, math.min(#groups, maximum) do
     local group = groups[index]
     local addon = SafeText(RawField(group, "addon"), "<?>" , 128)
     local kind = SafeText(RawField(group, "kind"), "<?>" , 64)
@@ -273,24 +273,25 @@ local function InsertRecent(best, entry, maximum)
   if #best > maximum then best[#best] = nil end
 end
 
-local function FlattenRecentEntries(groups, maximumEntries, maximumMessageBytes)
-  if maximumEntries <= 0 then return {} end
+local function CollectRecentRefs(groups)
   local best = {}
-
   for groupIndex = 1, #groups do
     local occurrences = RawField(groups[groupIndex], "occurrences")
     if CanAccessTable(occurrences) then
       for occurrenceIndex = 1, 4 do
         local entry = RawField(occurrences, occurrenceIndex)
         if not CanAccessTable(entry) then break end
-        InsertRecent(best, entry, maximumEntries)
+        InsertRecent(best, entry, MAX_TIMELINE)
       end
     end
   end
+  return best
+end
 
+local function SerializeTimeline(entries, maximumEntries, maximumMessageBytes)
   local output = {}
-  for index = 1, #best do
-    local entry = best[index]
+  for index = 1, math.min(#entries, maximumEntries) do
+    local entry = entries[index]
     local stack = SafeText(RawField(entry, "stack"), nil, 16 * 1024)
     output[index] = {
       ts = RawField(entry, "ts"),
@@ -303,25 +304,6 @@ local function FlattenRecentEntries(groups, maximumEntries, maximumMessageBytes)
       stackTop = stack and stack:match("([^\n]*)") or nil,
     }
   end
-  return output
-end
-
-local function BuildPolicyDoc()
-  return {
-    order = {
-      "maxStackLines", "maxLocalsBytes", "maxMsgBytes", "maxDoctorBytes",
-      "maxBreadcrumbs", "maxBreadcrumbMsgBytes", "maxMetricEntries",
-      "maxMetricValueBytes", "timelineMax", "timelineMsgBytes",
-      "maxOccurrences", "maxGroups", "includeLog",
-    },
-    note = "One bounded field shrinks at a time until the strict output budget is met.",
-  }
-end
-
-local function DegradationTail(records)
-  local output = {}
-  local first = math.max(1, #records - MAX_DEGRADATION_RECORDS + 1)
-  for index = first, #records do output[#output + 1] = records[index] end
   return output
 end
 
@@ -384,112 +366,6 @@ local function SerializeGroup(group, limits)
   return object
 end
 
-local function TryPackWithLimits(limits, meta)
-  local base = Export:BuildFullObject({
-    exportKind = "packed",
-    maxGroups = 0,
-    includeOccurrences = false,
-    includeLog = limits.includeLog,
-    maxLogBytes = limits.maxLogBytes,
-  })
-
-  local allGroups = CollectGroupsAll()
-  local chosen = {}
-  for index = 1, math.min(#allGroups, limits.maxGroups) do chosen[index] = allGroups[index] end
-
-  local serialized = {}
-  for index = 1, #chosen do serialized[index] = SerializeGroup(chosen[index], limits) end
-  base.groups = serialized
-  base.addonStats = BuildAddonStats(chosen)
-  base.timeline = FlattenRecentEntries(allGroups, limits.timelineMax, limits.timelineMsgBytes)
-  base.packing = {
-    limits = {
-      maxGroups = limits.maxGroups,
-      maxOccurrences = limits.maxOccurrences,
-      maxStackLines = limits.maxStackLines,
-      maxLocalsBytes = limits.maxLocalsBytes,
-      maxMsgBytes = limits.maxMsgBytes,
-      maxDoctorBytes = limits.maxDoctorBytes,
-      maxBreadcrumbs = limits.maxBreadcrumbs,
-      maxBreadcrumbMsgBytes = limits.maxBreadcrumbMsgBytes,
-      maxMetricEntries = limits.maxMetricEntries,
-      maxMetricValueBytes = limits.maxMetricValueBytes,
-      timelineMax = limits.timelineMax,
-      timelineMsgBytes = limits.timelineMsgBytes,
-      includeLog = limits.includeLog == true,
-      maxLogBytes = limits.maxLogBytes,
-    },
-    byteBudget = {
-      target = meta.maxBytes,
-      attempt = meta.attempt,
-      degradationCount = #meta.degradation,
-    },
-    byteBudgetPolicy = BuildPolicyDoc(),
-    degradation = DegradationTail(meta.degradation),
-    limitations = {
-      "Packed export is size-constrained and fields are truncated deterministically.",
-      "WoW sandbox output is copy-only; no external attachment is created.",
-    },
-  }
-
-  local json = Export:ToJSON(base, {
-    pretty = true,
-    maxDepth = 7,
-    maxTableEntries = 600,
-    maxArrayLen = 600,
-    maxScanEntries = 5000,
-    maxNodes = 20000,
-    maxStringBytes = math.min(64 * 1024, meta.maxBytes),
-    maxKeyBytes = 1024,
-    maxOutputBytes = meta.maxBytes,
-  })
-  if json == '{"error":"json_output_limit"}' or json == '{"error":"json_encode_failed"}' then
-    return nil
-  end
-  if #json > meta.maxBytes then return nil end
-  return json
-end
-
-local function ShrinkMultiply(limits, key, minimum, multiplier)
-  local old = tonumber(limits[key]) or 0
-  if old <= minimum then return nil end
-  local newValue = math.max(minimum, math.floor(old * multiplier))
-  if newValue == old then newValue = old - 1 end
-  if newValue < minimum then newValue = minimum end
-  if newValue == old then return nil end
-  limits[key] = newValue
-  return key, old, newValue
-end
-
-local function ShrinkStep(limits, key, minimum, step)
-  local old = tonumber(limits[key]) or 0
-  if old <= minimum then return nil end
-  local newValue = math.max(minimum, old - step)
-  if newValue == old then return nil end
-  limits[key] = newValue
-  return key, old, newValue
-end
-
-local function ApplyNextDegradation(limits)
-  return ShrinkMultiply(limits, "maxStackLines", 1, 0.70)
-      or ShrinkMultiply(limits, "maxLocalsBytes", 0, 0.65)
-      or ShrinkMultiply(limits, "maxMsgBytes", 64, 0.75)
-      or ShrinkMultiply(limits, "maxDoctorBytes", 0, 0.65)
-      or ShrinkStep(limits, "maxBreadcrumbs", 0, 1)
-      or ShrinkMultiply(limits, "maxBreadcrumbMsgBytes", 32, 0.75)
-      or ShrinkStep(limits, "maxMetricEntries", 0, 1)
-      or ShrinkMultiply(limits, "maxMetricValueBytes", 32, 0.75)
-      or ShrinkStep(limits, "timelineMax", 0, 4)
-      or ShrinkMultiply(limits, "timelineMsgBytes", 32, 0.75)
-      or ShrinkStep(limits, "maxOccurrences", 0, 1)
-      or ShrinkStep(limits, "maxGroups", 0, 1)
-      or (limits.includeLog and (function()
-            limits.includeLog = false
-            limits.maxLogBytes = 0
-            return "includeLog", true, false
-          end)() or nil)
-end
-
 local function NormalizeOptions(options)
   return {
     maxBytes = ClampInteger(RawOption(options, "maxBytes"), 32000, 4096, MAX_PACK_BYTES),
@@ -510,6 +386,179 @@ local function NormalizeOptions(options)
   }
 end
 
+local function SnapshotLog(maximum)
+  if maximum <= 0 or not RDL.Logger or type(RDL.Logger.GetText) ~= "function" then return nil end
+  local ok, value = pcall(RDL.Logger.GetText, RDL.Logger)
+  return ok and SafeText(value, nil, maximum) or nil
+end
+
+local function DegradationTail(records)
+  local output = {}
+  local first = math.max(1, #records - MAX_DEGRADATION_RECORDS + 1)
+  for index = first, #records do output[#output + 1] = records[index] end
+  return output
+end
+
+local function SetAtMost(limits, key, maximum, changes)
+  local old = limits[key]
+  if type(old) ~= "number" or old <= maximum then return end
+  limits[key] = maximum
+  changes[#changes + 1] = key
+end
+
+local function Disable(limits, key, changes)
+  if limits[key] == false or limits[key] == 0 then return end
+  limits[key] = type(limits[key]) == "boolean" and false or 0
+  changes[#changes + 1] = key
+end
+
+local function ApplyStage(limits, stage)
+  local changes = {}
+  if stage == 1 then
+    SetAtMost(limits, "maxStackLines", 8, changes)
+    SetAtMost(limits, "maxLocalsBytes", 512, changes)
+    SetAtMost(limits, "maxMsgBytes", 768, changes)
+    SetAtMost(limits, "maxDoctorBytes", 256, changes)
+    SetAtMost(limits, "maxBreadcrumbs", 4, changes)
+    SetAtMost(limits, "maxBreadcrumbMsgBytes", 96, changes)
+    SetAtMost(limits, "maxMetricEntries", 4, changes)
+    SetAtMost(limits, "maxMetricValueBytes", 96, changes)
+    SetAtMost(limits, "timelineMax", 16, changes)
+    SetAtMost(limits, "timelineMsgBytes", 128, changes)
+    SetAtMost(limits, "maxOccurrences", 1, changes)
+    SetAtMost(limits, "maxLogBytes", 2048, changes)
+  elseif stage == 2 then
+    SetAtMost(limits, "maxStackLines", 4, changes)
+    SetAtMost(limits, "maxLocalsBytes", 256, changes)
+    SetAtMost(limits, "maxMsgBytes", 512, changes)
+    SetAtMost(limits, "maxDoctorBytes", 128, changes)
+    SetAtMost(limits, "maxBreadcrumbs", 2, changes)
+    SetAtMost(limits, "maxBreadcrumbMsgBytes", 64, changes)
+    SetAtMost(limits, "maxMetricEntries", 2, changes)
+    SetAtMost(limits, "maxMetricValueBytes", 64, changes)
+    SetAtMost(limits, "timelineMax", 8, changes)
+    SetAtMost(limits, "timelineMsgBytes", 96, changes)
+    SetAtMost(limits, "maxGroups", 32, changes)
+    SetAtMost(limits, "maxLogBytes", 1024, changes)
+  elseif stage == 3 then
+    SetAtMost(limits, "maxStackLines", 2, changes)
+    Disable(limits, "maxLocalsBytes", changes)
+    SetAtMost(limits, "maxMsgBytes", 256, changes)
+    Disable(limits, "maxDoctorBytes", changes)
+    SetAtMost(limits, "maxBreadcrumbs", 1, changes)
+    SetAtMost(limits, "maxMetricEntries", 1, changes)
+    SetAtMost(limits, "timelineMax", 4, changes)
+    SetAtMost(limits, "maxOccurrences", 0, changes)
+    if limits.includeLog then
+      limits.includeLog = false
+      limits.maxLogBytes = 0
+      changes[#changes + 1] = "includeLog"
+    end
+  elseif stage == 4 then
+    SetAtMost(limits, "maxStackLines", 1, changes)
+    SetAtMost(limits, "maxMsgBytes", 160, changes)
+    Disable(limits, "maxBreadcrumbs", changes)
+    Disable(limits, "maxMetricEntries", changes)
+    SetAtMost(limits, "timelineMax", 2, changes)
+  elseif stage == 5 then
+    Disable(limits, "maxStackLines", changes)
+    SetAtMost(limits, "maxMsgBytes", 96, changes)
+    Disable(limits, "timelineMax", changes)
+  elseif limits.maxGroups > 0 then
+    local old = limits.maxGroups
+    limits.maxGroups = old == 1 and 0 or math.floor((old + 1) / 2)
+    changes[#changes + 1] = "maxGroups"
+  end
+
+  if #changes == 0 then return nil end
+  return {
+    stage = stage,
+    fields = table.concat(changes, ","),
+  }
+end
+
+local function BuildPolicyDoc()
+  return {
+    strategy = "single-snapshot-coarse-degradation",
+    stages = 5,
+    note = "DB/index snapshots are built once; payload detail and then group count are reduced deterministically.",
+  }
+end
+
+local function BuildObject(context, limits, attempt, degradation)
+  local base = context.base
+  local object = {
+    type = base.type,
+    schema = base.schema,
+    exportKind = "packed",
+    generatedAt = base.generatedAt,
+    env = base.env,
+    addon = base.addon,
+    session = base.session,
+    summary = base.summary,
+  }
+
+  local groupCount = math.min(#context.groups, limits.maxGroups)
+  local groups = {}
+  for index = 1, groupCount do groups[index] = SerializeGroup(context.groups[index], limits) end
+  object.groups = groups
+  object.addonStats = BuildAddonStats(context.groups, groupCount)
+  object.timeline = SerializeTimeline(context.recent, limits.timelineMax, limits.timelineMsgBytes)
+  if limits.includeLog and context.log then
+    object.log = SafeText(context.log, nil, limits.maxLogBytes)
+  end
+
+  object.packing = {
+    limits = {
+      maxGroups = limits.maxGroups,
+      maxOccurrences = limits.maxOccurrences,
+      maxStackLines = limits.maxStackLines,
+      maxLocalsBytes = limits.maxLocalsBytes,
+      maxMsgBytes = limits.maxMsgBytes,
+      maxDoctorBytes = limits.maxDoctorBytes,
+      maxBreadcrumbs = limits.maxBreadcrumbs,
+      maxBreadcrumbMsgBytes = limits.maxBreadcrumbMsgBytes,
+      maxMetricEntries = limits.maxMetricEntries,
+      maxMetricValueBytes = limits.maxMetricValueBytes,
+      timelineMax = limits.timelineMax,
+      timelineMsgBytes = limits.timelineMsgBytes,
+      includeLog = limits.includeLog == true,
+      maxLogBytes = limits.maxLogBytes,
+    },
+    byteBudget = {
+      target = limits.maxBytes,
+      attempt = attempt,
+      degradationCount = #degradation,
+    },
+    byteBudgetPolicy = BuildPolicyDoc(),
+    degradation = DegradationTail(degradation),
+    limitations = {
+      "Packed export is size-constrained and fields are truncated deterministically.",
+      "WoW sandbox output is copy-only; no external attachment is created.",
+    },
+  }
+  return object
+end
+
+local function TryEncode(context, limits, attempt, degradation)
+  local object = BuildObject(context, limits, attempt, degradation)
+  local json = Export:ToJSON(object, {
+    pretty = true,
+    maxDepth = 7,
+    maxTableEntries = 600,
+    maxArrayLen = 600,
+    maxScanEntries = 5000,
+    maxNodes = 20000,
+    maxStringBytes = math.min(64 * 1024, limits.maxBytes),
+    maxKeyBytes = 1024,
+    maxOutputBytes = limits.maxBytes,
+  })
+  if json == '{"error":"json_output_limit"}' or json == '{"error":"json_encode_failed"}' then
+    return nil
+  end
+  return #json <= limits.maxBytes and json or nil
+end
+
 local function FallbackJSON(maxBytes, attempts, degradationCount)
   local output = string.format(
     '{"type":"RothDevLibExport","schema":1,"error":"pack_budget_exhausted","maxBytes":%d,"attempts":%d,"degradationCount":%d}',
@@ -520,27 +569,57 @@ end
 
 function Packer:BuildPackedJSON(options)
   local limits = NormalizeOptions(options)
-  local maxBytes = limits.maxBytes
-  local attempts, degradation = 0, {}
+  local context = {
+    groups = CollectGroupsAll(),
+  }
+  context.recent = CollectRecentRefs(context.groups)
+  context.base = Export:BuildFullObject({
+    exportKind = "packed",
+    maxGroups = 0,
+    includeOccurrences = false,
+    includeLog = false,
+  })
+  context.log = limits.includeLog and SnapshotLog(limits.maxLogBytes) or nil
 
-  while attempts < MAX_ATTEMPTS do
-    attempts = attempts + 1
-    local json = TryPackWithLimits(limits, {
-      maxBytes = maxBytes,
-      attempt = attempts,
-      degradation = degradation,
-    })
-    if json then return json end
+  local degradation = {}
+  local stage = 0
+  for attempt = 1, MAX_ATTEMPTS do
+    local json = TryEncode(context, limits, attempt, degradation)
+    if json then
+      self._lastStats = {
+        attempts = attempt,
+        sourceGroups = #context.groups,
+        sourceTimeline = #context.recent,
+        degradationCount = #degradation,
+        outputBytes = #json,
+        maxBytes = limits.maxBytes,
+      }
+      return json
+    end
 
-    local key, from, to = ApplyNextDegradation(limits)
-    if not key then break end
-    degradation[#degradation + 1] = {
-      step = key,
-      from = from,
-      to = to,
-      attempt = attempts,
-    }
+    stage = stage + 1
+    local record = ApplyStage(limits, stage)
+    if not record then break end
+    degradation[#degradation + 1] = record
   end
 
-  return FallbackJSON(maxBytes, attempts, #degradation)
+  local output = FallbackJSON(limits.maxBytes, MAX_ATTEMPTS, #degradation)
+  self._lastStats = {
+    attempts = MAX_ATTEMPTS,
+    sourceGroups = #context.groups,
+    sourceTimeline = #context.recent,
+    degradationCount = #degradation,
+    outputBytes = #output,
+    maxBytes = limits.maxBytes,
+    exhausted = true,
+  }
+  return output
+end
+
+function Packer:GetLastStats()
+  local source = self._lastStats
+  if type(source) ~= "table" then return nil end
+  local output = {}
+  for key, value in pairs(source) do output[key] = value end
+  return output
 end

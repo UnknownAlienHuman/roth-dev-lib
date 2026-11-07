@@ -112,7 +112,7 @@ assert(E:ToShareString('{}') == 'RDL1:E<C<{}>>')
 _G.LibStub = nil
 assert(E:ToShareString('{}') == 'RDL1:{}')
 
--- Use a smaller but deliberately heavy corpus for repeated pack degradation.
+-- Use a smaller but deliberately heavy corpus for pack degradation.
 DB.groups = {}
 for index = 1, 24 do
   local signature = 'pack-' .. index
@@ -157,5 +157,17 @@ assert(#packed <= 4096)
 assert(packed ~= '{"error":"json_output_limit"}')
 assert(packed ~= '{"error":"json_encode_failed"}')
 assert(packed:sub(1, 1) == '{' and packed:sub(-1) == '}')
+
+-- Source indexes are built once, and the coarse ladder must converge without
+-- the former dozens/hundreds of full DB rebuilds.
+local packStats = assert(E.Packer:GetLastStats())
+assert(packStats.sourceGroups == 24)
+assert(packStats.sourceTimeline == 24)
+assert(packStats.attempts <= 16)
+assert(packStats.degradationCount < packStats.attempts)
+assert(packStats.outputBytes == #packed and packStats.maxBytes == 4096)
+assert(packStats.exhausted ~= true)
+packStats.attempts = 999
+assert(E.Packer:GetLastStats().attempts ~= 999)
 
 print('export and packer bound tests: ok')
