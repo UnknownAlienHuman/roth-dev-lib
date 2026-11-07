@@ -21,6 +21,13 @@ RDL.DB = { GetSettings = function() return settings end }
 assert(loadfile('Util/Util.lua'))()
 assert(loadfile('Util/BoundedCopy.lua'))()
 
+local copyCalls = 0
+local originalCopy = RDL.Util.CopyDiagnosticValue
+RDL.Util.CopyDiagnosticValue = function(...)
+  copyCalls = copyCalls + 1
+  return originalCopy(...)
+end
+
 local built, stored = {}, 0
 RDL.Capture.BuildEntry = function(kind, message, stack, locals, addon, func, extra)
   local entry = { kind = kind, message = message, stack = stack, locals = locals, extra = extra }
@@ -49,9 +56,11 @@ assert(bug:IsPresent())
 assert(bug:Enable() == true and bug._enabled == true and bug._ticker ~= nil)
 bug:Disable()
 
--- Default attach establishes one baseline instead of replaying history.
+-- Default attach establishes one light baseline instead of replaying/copying
+-- historical locals or session payloads.
 assert(bug:ImportNew() == 0)
 assert(stored == 0 and bug._baselineComplete == true)
+assert(copyCalls == 0)
 assert(bug:GetStateStats().maximumKeyBytes <= 4096)
 
 -- Once attached, the first occurrence of a new logical error must import now,
@@ -106,6 +115,8 @@ assert(otherKey and bug._counterByKey[otherKey] == 1)
 
 -- An incomplete raw-key scan must never prune counters it did not observe.
 bug._counterByKey.__sentinel = 7
+bug._touchByKey.__sentinel = 0
+bug._counterCount = bug._counterCount + 1
 for index = 1, 20 do errors['metadata' .. index] = true end
 settings.bugGrabberScanMax = 5
 assert(bug:ImportNew() == 0)
@@ -125,7 +136,8 @@ assert(bug._counterByKey[otherKey] ~= nil)
 settings.bugGrabberImportMaxPerPoll = 10
 
 -- Repeated incomplete scans with disjoint records keep only the bounded current
--- window. Full external stacks are never retained as map keys.
+-- window. Long stacks must not be normalized for a grouping key that ignores
+-- stack by contract.
 local originalErrors = _G.BugGrabberDB.errors
 settings.bugGrabberScanMax = 5
 for round = 1, 3 do

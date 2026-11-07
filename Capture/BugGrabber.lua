@@ -11,6 +11,7 @@ local Bug = {
   _ticker = nil,
   _counterByKey = {},
   _touchByKey = {},
+  _counterCount = 0,
   _generation = 0,
   _droppedCounterKeys = 0,
   _baselineComplete = false,
@@ -152,6 +153,9 @@ local function ListBounds(list, maximum)
   end
 end
 
+-- Normalize only identity/counter fields during every poll. Heavy locals and
+-- session payloads remain transient foreign references and cross the bounded
+-- copy boundary only when a delta is actually imported.
 local function NormalizeRecord(raw)
   local ordinary = Scrub(raw)
   local valueType = type(ordinary)
@@ -165,37 +169,36 @@ local function NormalizeRecord(raw)
   local message = SafeText(First(ordinary, "message", "msg", "error", 1), "", 64 * 1024)
   if message == "" or message == "nil" then return nil end
 
-  local stack = SafeText(First(ordinary, "stack", "traceback", "trace", 2), "", 128 * 1024)
+  local stack = SafeText(First(ordinary, "stack", "traceback", "trace", 2), "", 64 * 1024)
   if stack == "nil" then stack = "" end
 
   return {
     message = message,
     stack = stack,
-    locals = SafeCopy(First(ordinary, "locals", "localVariables")),
+    localsSource = First(ordinary, "locals", "localVariables"),
     ts = SafeNumber(First(ordinary, "time", "ts", "when"), nil, 0, 2 ^ 53),
     counter = math.floor(SafeNumber(SafeGet(ordinary, "counter"), 1, 1, 1000000)),
-    session = SafeCopy(SafeGet(ordinary, "session")),
+    sessionSource = SafeGet(ordinary, "session"),
   }
 end
 
--- Use the same bounded logical signature family as RothDevLib grouping. Never
--- retain the complete external message+stack as a long-lived table key.
+-- RothDevLib's LUA_ERROR grouping signature is kind + normalized message; stack
+-- is intentionally absent. Do not run full stack normalization on every
+-- BugGrabber baseline poll only to discard it in the final signature.
 local function RecordKey(record)
+  local message = SafeText(record.message, "", 260)
   local util = RDL.Util
-  if util and type(util.MakeSignature) == "function" then
-    local ok, signature = pcall(util.MakeSignature, util,
-      "LUA_ERROR", record.message, record.stack)
-    if ok and type(signature) == "string" and signature ~= "" then
-      return SafeText(signature, "", 4096)
-    end
+  if util and type(util.NormalizeMessage) == "function" then
+    local ok, normalized = pcall(util.NormalizeMessage, util, message)
+    if ok and type(normalized) == "string" then message = normalized end
   end
-  return SafeText(record.message, "", 2048)
-    .. "\031" .. SafeText(record.stack, "", 4096)
+  return "LUA_ERROR|" .. SafeText(message, "", 2048)
 end
 
 local function ResetAttachment(self)
   self._counterByKey = {}
   self._touchByKey = {}
+  self._counterCount = 0
   self._generation = 0
   self._droppedCounterKeys = 0
   self._baselineComplete = false
@@ -203,17 +206,26 @@ local function ResetAttachment(self)
 end
 
 local function TouchCounter(self, key, counter, generation)
+  if self._counterByKey[key] == nil then
+    self._counterCount = (tonumber(self._counterCount) or 0) + 1
+  end
   self._counterByKey[key] = counter
   self._touchByKey[key] = generation
 end
 
 local function RemoveCounter(self, key)
+  if self._counterByKey[key] ~= nil then
+    self._counterCount = math.max(0, (tonumber(self._counterCount) or 1) - 1)
+  end
   self._counterByKey[key] = nil
   self._touchByKey[key] = nil
 end
 
 local function TrimCounterState(self, maximum, protected)
   maximum = math.floor(SafeNumber(maximum, 5000, 1, 20000))
+  local count = tonumber(self._counterCount) or 0
+  if count <= maximum then return 0 end
+
   local candidates = {}
   for key in pairs(self._counterByKey) do
     candidates[#candidates + 1] = {
@@ -223,7 +235,10 @@ local function TrimCounterState(self, maximum, protected)
     }
   end
   local excess = #candidates - maximum
-  if excess <= 0 then return 0 end
+  if excess <= 0 then
+    self._counterCount = #candidates
+    return 0
+  end
 
   table.sort(candidates, function(a, b)
     if a.protected ~= b.protected then return a.protected == false end
@@ -301,6 +316,7 @@ function Bug:ImportNew()
     self._historyMode = importHistory
     self._counterByKey = {}
     self._touchByKey = {}
+    self._counterCount = 0
     self._generation = 0
     self._droppedCounterKeys = 0
     self._baselineComplete = importHistory
@@ -330,8 +346,6 @@ function Bug:ImportNew()
 
       local previousRaw = self._counterByKey[key]
       if initialBaseline then
-        -- Only the initial bounded scan is history. After this scan, an unseen
-        -- key is a new error and counter=1 must be imported immediately.
         TouchCounter(self, key, record.counter, generation)
         previousRaw = record.counter
       elseif previousRaw == nil and not importHistory then
@@ -346,14 +360,16 @@ function Bug:ImportNew()
       local delta = record.counter - previous
       if delta > 0 then
         local attempts = math.min(delta, budget)
+        local copiedLocals = SafeCopy(record.localsSource)
+        local copiedSession = SafeCopy(record.sessionSource)
         for step = 1, attempts do
           local okBuild, entry = pcall(Capture.BuildEntry, "LUA_ERROR", record.message, record.stack,
-            record.locals, nil, nil, {
+            copiedLocals, nil, nil, {
               source = "BugGrabber",
               imported = true,
               bugIndex = index,
               bugTs = record.ts,
-              bugSession = record.session,
+              bugSession = copiedSession,
               bugCounter = record.counter,
               bugCounterImportedFrom = previous,
               bugCounterImportedStep = step,
@@ -403,6 +419,7 @@ function Bug:GetStateStats()
     count = count + 1
     if type(key) == "string" and #key > maximumKeyBytes then maximumKeyBytes = #key end
   end
+  self._counterCount = count
   return {
     keys = count,
     dropped = tonumber(self._droppedCounterKeys) or 0,
