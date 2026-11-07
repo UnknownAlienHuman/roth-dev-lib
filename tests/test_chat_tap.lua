@@ -85,10 +85,16 @@ local dedupCount = 0
 for _ in pairs(tap._dedup) do dedupCount = dedupCount + 1 end
 assert(dedupCount <= settings.chatTapDedupMax)
 
-tap:Init()
+assert(tap:Init() == true)
 assert(hooks[frame])
 assert(frame.__RDL_ChatTapHooked == nil)
 assert(pcall(hooks[frame], frame, secret))
+
+-- Init is retry-safe: already-installed weak-registry hooks remain authoritative
+-- even though HookFrame deliberately refuses duplicate installation.
+local originalCallback = hooks[frame]
+assert(tap:Init() == true)
+assert(tap._hooked == true and hooks[frame] == originalCallback)
 
 -- A pending timer must discard capture when the setting is disabled.
 captured = nil
@@ -99,5 +105,27 @@ settings.captureChatErrors = false
 now = now + 2
 timers[#timers]()
 assert(captured == nil and tap._active == nil)
+
+-- Timer API failure is contained. The active capture remains available for the
+-- next line to finalize instead of escaping through AddMessage.
+settings.captureChatErrors = true
+local originalAfter = C_Timer.After
+C_Timer.After = function() error('timer failed') end
+captured = nil
+assert(pcall(tap.OnChatMessage, tap,
+  'Demo: error: Interface/AddOns/Demo/Core.lua:10: timer-fallback'))
+assert(tap._active ~= nil)
+assert(pcall(tap.OnChatMessage, tap, 'done'))
+assert(captured and captured.message:find('timer%-fallback'))
+C_Timer.After = originalAfter
+
+-- A backward clock jump must not turn an old dedup timestamp into a hit.
+local util = assert(RDL.Util)
+local signature = util:MakeSignature('SUPPRESSED', 'clock-test', '')
+tap._dedup[signature] = 100
+now = 1
+tap:OnChatMessage('Demo: error: clock-test')
+tap:OnChatMessage('done')
+assert(captured)
 
 print('chat tap tests: ok')

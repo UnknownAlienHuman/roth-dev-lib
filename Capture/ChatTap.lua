@@ -51,18 +51,28 @@ local function SafeCopy(value)
       maxEntries = 40,
       maxNodes = 200,
       maxStringBytes = 4096,
+      maxTotalBytes = 64 * 1024,
     })
     if ok then return copy end
   end
   return nil
 end
 
+local function Finite(value)
+  return type(value) == "number" and value == value
+    and value ~= math.huge and value ~= -math.huge
+end
+
 local function Now()
   if type(_G.GetTime) == "function" then
     local ok, value = pcall(_G.GetTime)
-    if ok and type(value) == "number" then return value end
+    if ok and Finite(value) then return value end
   end
-  return type(_G.time) == "function" and _G.time() or 0
+  if type(_G.time) == "function" then
+    local ok, value = pcall(_G.time)
+    if ok and Finite(value) then return value end
+  end
+  return 0
 end
 
 local function StripTimestamp(message)
@@ -128,13 +138,14 @@ local function RecentlyCaptured(message, stack)
   end
 
   local kinds = { "LUA_ERROR", "LUA_WARNING", "TAINT_BLOCKED", "TAINT_FORBIDDEN" }
+  local now = Now()
   for index = 1, #kinds do
     local okSig, signature = pcall(util.MakeSignature, util, kinds[index], message, stack)
     if okSig then
       local okGroup, group = pcall(db.GetGroup, db, signature)
-      if okGroup and type(group) == "table" and type(group.lastSeen) == "number"
-          and (type(_G.time) == "function" and _G.time() or 0) - group.lastSeen <= 2 then
-        return true
+      if okGroup and type(group) == "table" and Finite(group.lastSeen) then
+        local age = now - group.lastSeen
+        if age >= 0 and age <= 2 then return true end
       end
     end
   end
@@ -149,8 +160,7 @@ local function TrimDedup(self, now, window, maximum, keepKey)
 
   local entries = {}
   for key, timestamp in pairs(self._dedup) do
-    if type(timestamp) ~= "number" or timestamp ~= timestamp
-        or now - timestamp > window * 10 then
+    if not Finite(timestamp) or now - timestamp > window * 10 then
       self._dedup[key] = nil
     else
       entries[#entries + 1] = { key = key, timestamp = timestamp }
@@ -183,7 +193,8 @@ local function DedupHit(self, signature)
   local now = Now()
   local previous = self._dedup[signature]
   self._dedup[signature] = now
-  local hit = type(previous) == "number" and now - previous < window
+  local age = type(previous) == "number" and now - previous or math.huge
+  local hit = age >= 0 and age < window
 
   -- Stale pruning alone is not a hard bound during a burst of unique errors.
   -- Evict the oldest entries as a second step and preserve the current key.
@@ -258,13 +269,13 @@ end
 
 local function ArmFinalizeTimer(self)
   local timer = _G.C_Timer
-  if type(timer) ~= "table" or type(timer.After) ~= "function" then return end
+  if type(timer) ~= "table" or type(timer.After) ~= "function" then return false end
   local window = tonumber(Settings().chatTapWindowSec) or 0.8
   if window < 0.05 then window = 0.05 elseif window > 10 then window = 10 end
 
   self._timerToken = self._timerToken + 1
   local token = self._timerToken
-  timer.After(window, function()
+  local ok = pcall(timer.After, window, function()
     if token ~= ChatTap._timerToken then return end
     if Settings().captureChatErrors ~= true then
       ChatTap._active = nil
@@ -273,6 +284,8 @@ local function ArmFinalizeTimer(self)
     local active = ChatTap._active
     if active and Now() - (active.lastTs or 0) >= window then Finalize(ChatTap) end
   end)
+  if not ok then self._timerToken = self._timerToken + 1 end
+  return ok
 end
 
 function ChatTap:OnChatMessage(rawMessage)
@@ -332,7 +345,9 @@ local function HookFrame(frame)
 end
 
 function ChatTap:Init()
-  local hooked = false
+  -- Idempotent retries must preserve already-installed hooks. HookFrame returns
+  -- false for a frame that is already in the weak registry by design.
+  local hooked = self._hooked == true
   hooked = HookFrame(_G.DEFAULT_CHAT_FRAME) or hooked
   hooked = HookFrame(_G.ChatFrame1) or hooked
 
