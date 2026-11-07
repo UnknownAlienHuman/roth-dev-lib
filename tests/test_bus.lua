@@ -23,6 +23,13 @@ for i = 1, 12 do B:Breadcrumb('Test', 'event', 'm' .. i, { n = i }) end
 assert(a.size == 10)
 local snap = B:GetBreadcrumbSnapshot('Test', 20)
 assert(#snap == 10 and snap[1].msg == 'm12' and snap[10].msg == 'm3')
+
+-- Snapshots are detached from the retained ring.
+snap[1].msg = 'tampered'
+snap[1].data = 'tampered'
+local fresh = B:GetBreadcrumbSnapshot('Test', 1)
+assert(fresh[1].msg == 'm12' and fresh[1].data ~= 'tampered')
+
 a = B:RegisterAddon('Test', { maxBreadcrumbs = 5 })
 assert(a.max == 10) -- minimum clamp
 for i = 13, 15 do B:Breadcrumb('Test', 'event', 'm' .. i) end
@@ -35,6 +42,15 @@ assert(B:Metric('Throttle', 'fps', 60, 'hz', { minInterval = 100 }) == true)
 local head = throttled.head
 assert(B:Metric('Throttle', 'fps', 61, 'hz', { minInterval = 100 }) == false)
 assert(throttled.head == head)
+
+-- Options are external input; hostile __index/__pairs metamethods must not run.
+local hostileOptions = setmetatable({ maxBreadcrumbs = 20, minInterval = 0 }, {
+  __index = function() error('option __index must not run') end,
+  __pairs = function() error('option __pairs must not run') end,
+})
+local okHostile, hostileAddon = pcall(B.RegisterAddon, B, 'Hostile', hostileOptions)
+assert(okHostile and hostileAddon and hostileAddon.max == 20)
+assert(B:Metric('Hostile', 'metric', 1, 'n', hostileOptions) == true)
 
 -- Dynamic metric names are public diagnostic input and must not create an
 -- unbounded throttle registry.

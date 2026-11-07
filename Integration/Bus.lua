@@ -75,6 +75,14 @@ local function OrdinaryNumber(value)
   return value
 end
 
+local function RawOption(options, key)
+  options = OrdinaryTable(options)
+  if not options then return nil end
+  local ok, value = pcall(rawget, options, key)
+  if not ok then return nil end
+  return value
+end
+
 local function Truncate(value, maximum)
   if type(value) ~= "string" then return value end
   if #value <= maximum then return value end
@@ -86,14 +94,14 @@ local function NormalizeOptions(opts)
   if not opts then return nil end
 
   local normalized = {}
-  local maxBreadcrumbs = OrdinaryNumber(opts.maxBreadcrumbs)
+  local maxBreadcrumbs = OrdinaryNumber(RawOption(opts, "maxBreadcrumbs"))
   if maxBreadcrumbs then
     normalized.maxBreadcrumbs = Clamp(math.floor(maxBreadcrumbs), 10, 400)
   end
 
-  local metricMinInterval = OrdinaryNumber(opts.metricMinInterval)
+  local metricMinInterval = OrdinaryNumber(RawOption(opts, "metricMinInterval"))
   if metricMinInterval == nil then
-    metricMinInterval = OrdinaryNumber(opts.minInterval)
+    metricMinInterval = OrdinaryNumber(RawOption(opts, "minInterval"))
   end
   if metricMinInterval then
     normalized.metricMinInterval = Clamp(metricMinInterval, 0, 3600)
@@ -143,7 +151,7 @@ end
 
 local function DefaultMaximum()
   local settings = RDL.DB and RDL.DB.GetSettings and RDL.DB:GetSettings() or nil
-  local configured = settings and OrdinaryNumber(settings.maxBreadcrumbsPerAddon) or nil
+  local configured = settings and OrdinaryNumber(RawOption(settings, "maxBreadcrumbsPerAddon")) or nil
   return Clamp(math.floor(configured or 80), 10, 400)
 end
 
@@ -260,7 +268,7 @@ function Bus:Metric(addonName, name, value, unit, opts)
 
   local minInterval = normalizedOpts and normalizedOpts.metricMinInterval
     or addon.opts and addon.opts.metricMinInterval
-    or settings and OrdinaryNumber(settings.metricMinInterval)
+    or settings and OrdinaryNumber(RawOption(settings, "metricMinInterval"))
     or 1
   minInterval = Clamp(minInterval, 0, 3600)
 
@@ -298,7 +306,17 @@ function Bus:GetBreadcrumbSnapshot(addonName, count)
   local index = addon.head
   for position = 1, count do
     local item = addon.ring[index]
-    if item ~= nil then out[#out + 1] = item end
+    if type(item) == "table" then
+      -- Never expose the retained ring record itself. Callers may freely mutate
+      -- the snapshot without altering later error context or monitor output.
+      out[#out + 1] = {
+        ts = item.ts,
+        clock = item.clock,
+        cat = item.cat,
+        msg = item.msg,
+        data = item.data,
+      }
+    end
     index = index - 1
     if index < 1 then index = addon.max end
   end
@@ -307,8 +325,8 @@ end
 
 function Bus:GetErrorContext(addonName)
   local settings = RDL.DB and RDL.DB.GetSettings and RDL.DB:GetSettings() or nil
-  if not settings or settings.includeBreadcrumbsInErrors == false then return nil end
-  local count = OrdinaryNumber(settings.breadcrumbsPerError) or 12
+  if not settings or RawOption(settings, "includeBreadcrumbsInErrors") == false then return nil end
+  local count = OrdinaryNumber(RawOption(settings, "breadcrumbsPerError")) or 12
   return self:GetBreadcrumbSnapshot(addonName, count)
 end
 
