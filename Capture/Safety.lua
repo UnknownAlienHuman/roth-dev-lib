@@ -37,7 +37,11 @@ local function SafeText(value, fallback, maxBytes)
   local ordinary = value
   if util and type(util.Scrub) == "function" then
     local ok, scrubbed = pcall(util.Scrub, util, value)
-    ordinary = ok and scrubbed or "<unavailable>"
+    if ok then
+      ordinary = scrubbed
+    else
+      ordinary = "<unavailable>"
+    end
   end
 
   local text = type(fallback) == "string" and fallback or ""
