@@ -21,18 +21,50 @@ local function Pack(...)
   return { n = select("#", ...), ... }
 end
 
+local function CanAccess(value)
+  local guard = RDL.SecretGuard
+  if guard and type(guard.CanAccess) == "function" then
+    local ok, allowed = pcall(guard.CanAccess, guard, value)
+    if not ok or allowed ~= true then return false end
+  elseif type(_G.canaccessvalue) == "function" then
+    local ok, allowed = pcall(_G.canaccessvalue, value)
+    if not ok or allowed ~= true then return false end
+  end
+  if guard and type(guard.IsSecret) == "function" then
+    local ok, secret = pcall(guard.IsSecret, guard, value)
+    if not ok or secret == true then return false end
+  elseif type(_G.issecretvalue) == "function" then
+    local ok, secret = pcall(_G.issecretvalue, value)
+    if not ok or secret == true then return false end
+  end
+  return true
+end
+
+local function IsCallable(value)
+  return CanAccess(value) and type(value) == "function"
+end
+
+local function Finite(value)
+  return CanAccess(value) and type(value) == "number" and value == value
+    and value ~= math.huge and value ~= -math.huge
+end
+
+local function SafeNumber(value, fallback)
+  return Finite(value) and value or fallback
+end
+
 local function NowMs()
   if type(_G.debugprofilestop) == "function" then
     local ok, value = pcall(_G.debugprofilestop)
-    if ok and type(value) == "number" then return value end
+    if ok and Finite(value) then return value end
   end
   if type(_G.GetTime) == "function" then
     local ok, value = pcall(_G.GetTime)
-    if ok and type(value) == "number" then return value * 1000 end
+    if ok and Finite(value) then return value * 1000 end
   end
   if type(_G.time) == "function" then
     local ok, value = pcall(_G.time)
-    if ok and type(value) == "number" then return value * 1000 end
+    if ok and Finite(value) then return value * 1000 end
   end
   return 0
 end
@@ -46,10 +78,18 @@ local function GetSettings()
 end
 
 local function Option(opts, key)
-  if type(opts) ~= "table" then return nil end
+  if not CanAccess(opts) or type(opts) ~= "table" then return nil end
+  local guard = RDL.SecretGuard
+  if guard and type(guard.CanAccessTable) == "function" then
+    local ok, allowed = pcall(guard.CanAccessTable, guard, opts)
+    if not ok or allowed ~= true then return nil end
+  elseif type(_G.canaccesstable) == "function" then
+    local ok, allowed = pcall(_G.canaccesstable, opts)
+    if not ok or allowed ~= true then return nil end
+  end
   local ok, value = pcall(rawget, opts, key)
-  if ok then return value end
-  return nil
+  if not ok or not CanAccess(value) then return nil end
+  return value
 end
 
 local function Clamp(value, minimum, maximum)
@@ -64,7 +104,7 @@ local function SafeLabel(value, fallback, maximum)
   if util and type(util.SafeToString) == "function" then
     local ok, rendered = pcall(util.SafeToString, util, value)
     if ok and type(rendered) == "string" then text = rendered end
-  else
+  elseif CanAccess(value) then
     local valueType = type(value)
     if valueType == "string" then
       text = value
@@ -90,18 +130,20 @@ local function ShouldSample(opts, settings)
     configured = rawget(settings, "cpuSampleRate")
   end
 
-  local sampleRate = tonumber(configured)
-  if sampleRate == nil then sampleRate = 1 end
+  local sampleRate = SafeNumber(configured, 1)
   if sampleRate <= 0 then return false end
   if sampleRate >= 1 then return true end
   return math.random() < sampleRate
 end
 
 local function AlertThrottleOK(key, nowMs, minimumIntervalMs)
-  minimumIntervalMs = tonumber(minimumIntervalMs) or 0
+  minimumIntervalMs = SafeNumber(minimumIntervalMs, 0)
   if minimumIntervalMs <= 0 then return true end
   local last = CPU._lastAlert[key]
-  if last and (nowMs - last) < minimumIntervalMs then return false end
+  if Finite(last) then
+    local elapsed = nowMs - last
+    if elapsed >= 0 and elapsed < minimumIntervalMs then return false end
+  end
   CPU._lastAlert[key] = nowMs
   return true
 end
@@ -142,17 +184,17 @@ local function Record(addonName, funcName, elapsedMs, opts, settings)
       or (type(settings) == "table" and rawget(settings, "metricMinInterval"))
       or 1
     pcall(RDL.Bus.Metric, RDL.Bus, addon, "cpu_ms:" .. func,
-      elapsedMs, "ms", { minInterval = minimum })
+      elapsedMs, "ms", { minInterval = SafeNumber(minimum, 1) })
   end
 
-  local spikeMs = tonumber(Option(opts, "spikeMs"))
-    or (type(settings) == "table" and tonumber(rawget(settings, "cpuSpikeMs")))
+  local spikeMs = SafeNumber(Option(opts, "spikeMs"), nil)
+    or (type(settings) == "table" and SafeNumber(rawget(settings, "cpuSpikeMs"), nil))
     or 16
   spikeMs = Clamp(spikeMs, 1, 5000)
 
   if elapsedMs >= spikeMs and type(RDL.Alert) == "function" then
-    local alertMinimum = tonumber(Option(opts, "alertMinIntervalMs"))
-      or (type(settings) == "table" and tonumber(rawget(settings, "cpuAlertMinIntervalMs")))
+    local alertMinimum = SafeNumber(Option(opts, "alertMinIntervalMs"), nil)
+      or (type(settings) == "table" and SafeNumber(rawget(settings, "cpuAlertMinIntervalMs"), nil))
       or 2000
     local now = NowMs()
     if AlertThrottleOK(key, now, alertMinimum) then
@@ -169,7 +211,7 @@ local function Record(addonName, funcName, elapsedMs, opts, settings)
 end
 
 function CPU:Measure(addonName, funcName, fn, opts, ...)
-  if type(fn) ~= "function" then return nil end
+  if not IsCallable(fn) then return nil end
 
   local settings = GetSettings()
   if settings and rawget(settings, "enablePerfProfiling") == false then
@@ -184,7 +226,7 @@ function CPU:Measure(addonName, funcName, fn, opts, ...)
   -- hard-error behavior of the wrapped function.
   local result = Pack(fn(...))
   local elapsedMs = NowMs() - startedAt
-  if elapsedMs < 0 then elapsedMs = 0 end
+  if not Finite(elapsedMs) or elapsedMs < 0 then elapsedMs = 0 end
 
   -- Telemetry is best-effort and cannot affect function semantics.
   pcall(Record, addonName, funcName, elapsedMs, opts, settings)
@@ -192,7 +234,7 @@ function CPU:Measure(addonName, funcName, fn, opts, ...)
 end
 
 function CPU:Wrap(addonName, funcName, fn, opts)
-  if type(fn) ~= "function" then return fn end
+  if not IsCallable(fn) then return nil end
   return function(...)
     return CPU:Measure(addonName, funcName, fn, opts, ...)
   end
@@ -210,7 +252,19 @@ function CPU:ResetStats()
 end
 
 function CPU:GetStats()
-  return self._stats
+  local output = {}
+  for key, stats in pairs(self._stats or {}) do
+    if type(key) == "string" and type(stats) == "table" then
+      output[key] = {
+        n = SafeNumber(stats.n, 0),
+        total = SafeNumber(stats.total, 0),
+        max = SafeNumber(stats.max, 0),
+        ema = SafeNumber(stats.ema, 0),
+        last = SafeNumber(stats.last, 0),
+      }
+    end
+  end
+  return output
 end
 
 function CPU:GetRegistryStats()

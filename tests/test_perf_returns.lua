@@ -1,6 +1,15 @@
 _G.RothDevLib = {}
 local RDL = RothDevLib
 
+local secret = setmetatable({}, {
+  __tostring = function() error('secret tostring') end,
+  __index = function() error('secret index') end,
+})
+function _G.canaccessvalue(value) return value ~= secret end
+function _G.issecretvalue(value) return value == secret end
+function _G.canaccesstable(value) return value ~= secret end
+function _G.issecrettable(value) return value == secret end
+
 local settings = {
   enablePerfProfiling = true,
   cpuSampleRate = 1,
@@ -23,6 +32,8 @@ _G.collectgarbage = function(command)
   return memory
 end
 
+assert(loadfile('Util/SecretGuard.lua'))()
+assert(loadfile('Util/Util.lua'))()
 assert(loadfile('Perf/CPU.lua'))()
 assert(loadfile('Perf/Mem.lua'))()
 
@@ -42,14 +53,22 @@ local memWrapped = table.pack(RDL.Mem:Wrap('Addon', 'many', ManyReturns, {})())
 assert(memWrapped.n == 8 and memWrapped[8] == 8)
 assert(pcall(RDL.Mem.Measure, RDL.Mem, 'Addon', 'boom', function() error('boom') end, {}) == false)
 
--- Direct profiler calls must not execute hostile __tostring metamethods when
--- producing diagnostic identities.
-local hostile = setmetatable({}, {
-  __tostring = function() error('hostile tostring') end,
+-- Direct profiler calls must gate inaccessible values before type/rawget or
+-- identity formatting. A secret callable/options value is rejected, not invoked.
+assert(pcall(RDL.CPU.Measure, RDL.CPU, secret, secret, function() return true end, secret) == true)
+assert(pcall(RDL.Mem.Measure, RDL.Mem, secret, secret, function() return true end, secret) == true)
+assert(pcall(RDL.Mem.Sample, RDL.Mem, secret, secret, secret) == true)
+assert(RDL.CPU:Measure('Addon', 'secret-fn', secret, {}) == nil)
+assert(RDL.CPU:Wrap('Addon', 'secret-fn', secret, {}) == nil)
+assert(RDL.Mem:Measure('Addon', 'secret-fn', secret, {}) == nil)
+assert(RDL.Mem:Wrap('Addon', 'secret-fn', secret, {}) == nil)
+
+local hostileOptions = setmetatable({ sampleRate = 1, spikeMs = 999999, spikeKB = 999999 }, {
+  __index = function() error('option __index must not run') end,
+  __pairs = function() error('option __pairs must not run') end,
 })
-assert(pcall(RDL.CPU.Measure, RDL.CPU, hostile, hostile, function() return true end, {}) == true)
-assert(pcall(RDL.Mem.Measure, RDL.Mem, hostile, hostile, function() return true end, {}) == true)
-assert(pcall(RDL.Mem.Sample, RDL.Mem, hostile, hostile, {}) == true)
+assert(RDL.CPU:Measure('Addon', 'hostile-options', function() return true end, hostileOptions) == true)
+assert(RDL.Mem:Measure('Addon', 'hostile-options', function() return true end, hostileOptions) == true)
 
 -- Dynamic labels cannot grow long-lived telemetry maps without a hard bound.
 for index = 1, 1100 do
@@ -61,18 +80,30 @@ end
 local cpuRegistry = RDL.CPU:GetRegistryStats()
 assert(cpuRegistry.keys == cpuRegistry.maximum and cpuRegistry.maximum == 1024)
 assert(cpuRegistry.dropped > 0)
-local cpuCount = 0
-for _ in pairs(RDL.CPU:GetStats()) do cpuCount = cpuCount + 1 end
-assert(cpuCount == cpuRegistry.maximum)
+local cpuStats = RDL.CPU:GetStats()
+local cpuCount, cpuKey = 0, nil
+for key in pairs(cpuStats) do cpuCount = cpuCount + 1; cpuKey = cpuKey or key end
+assert(cpuCount == cpuRegistry.maximum and cpuKey)
+local originalCpuN = cpuStats[cpuKey].n
+cpuStats[cpuKey].n = 999999
+cpuStats.injected = { n = 1 }
+local freshCpu = RDL.CPU:GetStats()
+assert(freshCpu[cpuKey].n == originalCpuN and freshCpu.injected == nil)
 
 local memRegistry = RDL.Mem:GetRegistryStats()
 assert(memRegistry.stats == memRegistry.maxStats and memRegistry.maxStats == 1024)
 assert(memRegistry.samples == memRegistry.maxSamples and memRegistry.maxSamples == 1024)
 assert(memRegistry.droppedStats > 0 and memRegistry.droppedSamples > 0)
-local memCount, sampleCount = 0, 0
-for _ in pairs(RDL.Mem:GetStats()) do memCount = memCount + 1 end
+local memStats = RDL.Mem:GetStats()
+local memCount, memKey, sampleCount = 0, nil, 0
+for key in pairs(memStats) do memCount = memCount + 1; memKey = memKey or key end
 for _ in pairs(RDL.Mem._lastSample) do sampleCount = sampleCount + 1 end
-assert(memCount == memRegistry.maxStats and sampleCount == memRegistry.maxSamples)
+assert(memCount == memRegistry.maxStats and sampleCount == memRegistry.maxSamples and memKey)
+local originalMemN = memStats[memKey].n
+memStats[memKey].n = 999999
+memStats.injected = { n = 1 }
+local freshMem = RDL.Mem:GetStats()
+assert(freshMem[memKey].n == originalMemN and freshMem.injected == nil)
 
 RDL.CPU:ResetStats()
 RDL.Mem:ResetStats()

@@ -26,18 +26,50 @@ local function Pack(...)
   return { n = select("#", ...), ... }
 end
 
+local function CanAccess(value)
+  local guard = RDL.SecretGuard
+  if guard and type(guard.CanAccess) == "function" then
+    local ok, allowed = pcall(guard.CanAccess, guard, value)
+    if not ok or allowed ~= true then return false end
+  elseif type(_G.canaccessvalue) == "function" then
+    local ok, allowed = pcall(_G.canaccessvalue, value)
+    if not ok or allowed ~= true then return false end
+  end
+  if guard and type(guard.IsSecret) == "function" then
+    local ok, secret = pcall(guard.IsSecret, guard, value)
+    if not ok or secret == true then return false end
+  elseif type(_G.issecretvalue) == "function" then
+    local ok, secret = pcall(_G.issecretvalue, value)
+    if not ok or secret == true then return false end
+  end
+  return true
+end
+
+local function IsCallable(value)
+  return CanAccess(value) and type(value) == "function"
+end
+
+local function Finite(value)
+  return CanAccess(value) and type(value) == "number" and value == value
+    and value ~= math.huge and value ~= -math.huge
+end
+
+local function SafeNumber(value, fallback)
+  return Finite(value) and value or fallback
+end
+
 local function NowMs()
   if type(_G.debugprofilestop) == "function" then
     local ok, value = pcall(_G.debugprofilestop)
-    if ok and type(value) == "number" then return value end
+    if ok and Finite(value) then return value end
   end
   if type(_G.GetTime) == "function" then
     local ok, value = pcall(_G.GetTime)
-    if ok and type(value) == "number" then return value * 1000 end
+    if ok and Finite(value) then return value * 1000 end
   end
   if type(_G.time) == "function" then
     local ok, value = pcall(_G.time)
-    if ok and type(value) == "number" then return value * 1000 end
+    if ok and Finite(value) then return value * 1000 end
   end
   return 0
 end
@@ -51,10 +83,18 @@ local function GetSettings()
 end
 
 local function Option(opts, key)
-  if type(opts) ~= "table" then return nil end
+  if not CanAccess(opts) or type(opts) ~= "table" then return nil end
+  local guard = RDL.SecretGuard
+  if guard and type(guard.CanAccessTable) == "function" then
+    local ok, allowed = pcall(guard.CanAccessTable, guard, opts)
+    if not ok or allowed ~= true then return nil end
+  elseif type(_G.canaccesstable) == "function" then
+    local ok, allowed = pcall(_G.canaccesstable, opts)
+    if not ok or allowed ~= true then return nil end
+  end
   local ok, value = pcall(rawget, opts, key)
-  if ok then return value end
-  return nil
+  if not ok or not CanAccess(value) then return nil end
+  return value
 end
 
 local function Clamp(value, minimum, maximum)
@@ -69,7 +109,7 @@ local function SafeLabel(value, fallback, maximum)
   if util and type(util.SafeToString) == "function" then
     local ok, rendered = pcall(util.SafeToString, util, value)
     if ok and type(rendered) == "string" then text = rendered end
-  else
+  elseif CanAccess(value) then
     local valueType = type(value)
     if valueType == "string" then
       text = value
@@ -90,10 +130,13 @@ local function Identity(addonName, label)
 end
 
 local function AlertThrottleOK(key, nowMs, minimumIntervalMs)
-  minimumIntervalMs = tonumber(minimumIntervalMs) or 0
+  minimumIntervalMs = SafeNumber(minimumIntervalMs, 0)
   if minimumIntervalMs <= 0 then return true end
   local last = Mem._lastAlert[key]
-  if last and (nowMs - last) < minimumIntervalMs then return false end
+  if Finite(last) then
+    local elapsed = nowMs - last
+    if elapsed >= 0 and elapsed < minimumIntervalMs then return false end
+  end
   Mem._lastAlert[key] = nowMs
   return true
 end
@@ -101,11 +144,11 @@ end
 function Mem:GetKB()
   if type(_G.collectgarbage) == "function" then
     local ok, value = pcall(_G.collectgarbage, "count")
-    if ok and type(value) == "number" then return value end
+    if ok and Finite(value) then return value end
   end
   if type(_G.gcinfo) == "function" then
     local ok, value = pcall(_G.gcinfo)
-    if ok and type(value) == "number" then return value end
+    if ok and Finite(value) then return value end
   end
   return nil
 end
@@ -146,17 +189,17 @@ local function Record(addonName, funcName, deltaKB, opts, settings)
       or (type(settings) == "table" and rawget(settings, "metricMinInterval"))
       or 1
     pcall(RDL.Bus.Metric, RDL.Bus, addon, "mem_kb:" .. func,
-      deltaKB, "KB", { minInterval = minimum })
+      deltaKB, "KB", { minInterval = SafeNumber(minimum, 1) })
   end
 
-  local spikeKB = tonumber(Option(opts, "spikeKB"))
-    or (type(settings) == "table" and tonumber(rawget(settings, "memSpikeKB")))
+  local spikeKB = SafeNumber(Option(opts, "spikeKB"), nil)
+    or (type(settings) == "table" and SafeNumber(rawget(settings, "memSpikeKB"), nil))
     or 64
   spikeKB = Clamp(spikeKB, 1, 1024 * 1024)
 
   if deltaKB >= spikeKB and type(RDL.Alert) == "function" then
-    local alertMinimum = tonumber(Option(opts, "alertMinIntervalMs"))
-      or (type(settings) == "table" and tonumber(rawget(settings, "memAlertMinIntervalMs")))
+    local alertMinimum = SafeNumber(Option(opts, "alertMinIntervalMs"), nil)
+      or (type(settings) == "table" and SafeNumber(rawget(settings, "memAlertMinIntervalMs"), nil))
       or 2000
     local now = NowMs()
     if AlertThrottleOK(key, now, alertMinimum) then
@@ -173,7 +216,7 @@ local function Record(addonName, funcName, deltaKB, opts, settings)
 end
 
 function Mem:Measure(addonName, funcName, fn, opts, ...)
-  if type(fn) ~= "function" then return nil end
+  if not IsCallable(fn) then return nil end
 
   local settings = GetSettings()
   if settings and rawget(settings, "enablePerfProfiling") == false then
@@ -185,14 +228,14 @@ function Mem:Measure(addonName, funcName, fn, opts, ...)
   local result = Pack(fn(...))
   local after = self:GetKB()
 
-  if type(before) == "number" and type(after) == "number" then
+  if Finite(before) and Finite(after) then
     pcall(Record, addonName, funcName, after - before, opts, settings)
   end
   return Unpack(result, 1, result.n)
 end
 
 function Mem:Wrap(addonName, funcName, fn, opts)
-  if type(fn) ~= "function" then return fn end
+  if not IsCallable(fn) then return nil end
   return function(...)
     return Mem:Measure(addonName, funcName, fn, opts, ...)
   end
@@ -203,7 +246,7 @@ function Mem:Sample(addonName, tag, opts)
   if settings and rawget(settings, "enablePerfProfiling") == false then return false end
 
   local nowKB = self:GetKB()
-  if type(nowKB) ~= "number" then return false end
+  if not Finite(nowKB) then return false end
 
   local addon, safeTag, key = Identity(addonName, tag or "sample")
   local last = self._lastSample[key]
@@ -217,12 +260,12 @@ function Mem:Sample(addonName, tag, opts)
   self._lastSample[key] = nowKB
 
   if RDL.Bus and type(RDL.Bus.Metric) == "function" then
-    if type(last) == "number" then
+    if Finite(last) then
       local minimum = Option(opts, "metricMinInterval")
         or (type(settings) == "table" and rawget(settings, "metricMinInterval"))
         or 1
       pcall(RDL.Bus.Metric, RDL.Bus, addon,
-        "mem_kb_delta:" .. safeTag, nowKB - last, "KB", { minInterval = minimum })
+        "mem_kb_delta:" .. safeTag, nowKB - last, "KB", { minInterval = SafeNumber(minimum, 1) })
     else
       pcall(RDL.Bus.Metric, RDL.Bus, addon,
         "mem_kb:" .. safeTag, nowKB, "KB", { minInterval = 0 })
@@ -233,18 +276,18 @@ end
 
 function Mem:StartWatcher()
   local settings = GetSettings() or {}
-  if rawget(settings, "memWatchEnabled") ~= true then return end
-  if type(_G.C_Timer) ~= "table" or type(_G.C_Timer.NewTicker) ~= "function" then return end
-  if self._ticker then return end
+  if rawget(settings, "memWatchEnabled") ~= true then return false end
+  if type(_G.C_Timer) ~= "table" or type(_G.C_Timer.NewTicker) ~= "function" then return false end
+  if self._ticker then return true end
 
-  local interval = tonumber(rawget(settings, "memWatchIntervalSec")) or 2
+  local interval = SafeNumber(rawget(settings, "memWatchIntervalSec"), 2)
   interval = Clamp(interval, 0.2, 3600)
   local last = self:GetKB()
 
   local ok, ticker = pcall(_G.C_Timer.NewTicker, interval, function()
     local now = Mem:GetKB()
-    if type(now) ~= "number" then return end
-    if type(last) ~= "number" then
+    if not Finite(now) then return end
+    if not Finite(last) then
       last = now
       return
     end
@@ -257,9 +300,9 @@ function Mem:StartWatcher()
         "mem_kb_global_delta", deltaKB, "KB", { minInterval = interval })
     end
 
-    local spikeKB = tonumber(rawget(settings, "memWatchSpikeKB")) or 256
+    local spikeKB = SafeNumber(rawget(settings, "memWatchSpikeKB"), 256)
     if deltaKB >= spikeKB and type(RDL.Alert) == "function" then
-      local alertMinimum = tonumber(rawget(settings, "memAlertMinIntervalMs")) or 2000
+      local alertMinimum = SafeNumber(rawget(settings, "memAlertMinIntervalMs"), 2000)
       local nowMs = NowMs()
       if AlertThrottleOK("@watcher", nowMs, alertMinimum) then
         pcall(RDL.Alert, RDL, "RothDevLib", "MEM_WATCH",
@@ -271,7 +314,11 @@ function Mem:StartWatcher()
     end
   end)
 
-  if ok then self._ticker = ticker end
+  if ok and ticker then
+    self._ticker = ticker
+    return true
+  end
+  return false
 end
 
 function Mem:StopWatcher()
@@ -299,7 +346,19 @@ function Mem:ResetStats()
 end
 
 function Mem:GetStats()
-  return self._stats
+  local output = {}
+  for key, stats in pairs(self._stats or {}) do
+    if type(key) == "string" and type(stats) == "table" then
+      output[key] = {
+        n = SafeNumber(stats.n, 0),
+        total = SafeNumber(stats.total, 0),
+        max = SafeNumber(stats.max, 0),
+        ema = SafeNumber(stats.ema, 0),
+        last = SafeNumber(stats.last, 0),
+      }
+    end
+  end
+  return output
 end
 
 function Mem:GetRegistryStats()
