@@ -59,12 +59,29 @@ end))
 assert(result.n == 8 and result[1] == 1 and result[2] == nil and result[8] == 8)
 assert(leaveTokens[#leaveTokens] == entered[#entered])
 
+-- Arguments, including interior/trailing nils, must survive without depending
+-- on non-standard xpcall vararg forwarding.
+local argsResult = table.pack(RDL:SafeCall('Addon', 'Args', function(...)
+  return select('#', ...), ...
+end, 1, nil, 3, nil, 5, nil))
+assert(argsResult.n == 7 and argsResult[1] == 6)
+assert(argsResult[2] == 1 and argsResult[3] == nil and argsResult[4] == 3)
+assert(argsResult[5] == nil and argsResult[6] == 5 and argsResult[7] == nil)
+
 local ctx = { n = 1, hidden = secret }
 local wrapped = assert(RDL:WrapSafe('Addon', 'Wrapped', function(v) return v * 2 end, ctx))
 ctx.n = 9
 assert(wrapped(4) == 8)
 assert(entered[#entered].ctx.n == 1)
 assert(entered[#entered].ctx.hidden == '<inaccessible>')
+
+local wrappedArgs = assert(RDL:WrapSafe('Addon', 'WrappedArgs', function(...)
+  return select('#', ...), ...
+end))
+local wrappedArgsResult = table.pack(wrappedArgs('a', nil, 'c', nil))
+assert(wrappedArgsResult.n == 5 and wrappedArgsResult[1] == 4)
+assert(wrappedArgsResult[2] == 'a' and wrappedArgsResult[3] == nil)
+assert(wrappedArgsResult[4] == 'c' and wrappedArgsResult[5] == nil)
 
 local failing = assert(RDL:WrapSafeCtx(secret, secret, function()
   error(secret, 0)

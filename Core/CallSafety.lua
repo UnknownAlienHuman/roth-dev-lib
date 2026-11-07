@@ -65,6 +65,7 @@ local function SafeContext(value)
       maxEntries = 80,
       maxNodes = 500,
       maxStringBytes = 4096,
+      maxTotalBytes = 64 * 1024,
     })
     if ok then return copy end
   end
@@ -149,6 +150,7 @@ local function RunProtected(addonName, funcName, context, fn, ...)
   if not IsCallable(fn) then return nil end
   addonName, funcName = NormalizeIdentity(addonName, funcName)
   local doctorToken = EnterDoctor(addonName, funcName, context)
+  local args = Pack(...)
 
   local function ErrorHandler(err)
     local stack = SafeDebugStack(3)
@@ -158,15 +160,21 @@ local function RunProtected(addonName, funcName, context, fn, ...)
     return safeError
   end
 
-  local result = Pack(pcall(function(...)
+  -- Do not depend on non-standard xpcall vararg forwarding. The explicit
+  -- packed closure preserves nil arguments on every Lua runtime WoW may embed.
+  local function InvokeTarget()
+    return fn(Unpack(args, 1, args.n))
+  end
+
+  local result = Pack(pcall(function()
     local cpu = RDL.CPU
     if cpu and type(cpu.Measure) == "function" then
-      return cpu:Measure(addonName, funcName, function(...)
-        return xpcall(fn, ErrorHandler, ...)
-      end, nil, ...)
+      return cpu:Measure(addonName, funcName, function()
+        return xpcall(InvokeTarget, ErrorHandler)
+      end, nil)
     end
-    return xpcall(fn, ErrorHandler, ...)
-  end, ...))
+    return xpcall(InvokeTarget, ErrorHandler)
+  end))
 
   LeaveDoctor(doctorToken)
   if not result[1] then

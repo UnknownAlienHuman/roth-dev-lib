@@ -79,6 +79,7 @@ function Internal:Call(addonHint, funcName, fn, ...)
 
   self._depth = (self._depth or 0) + 1
   local doctorToken = EnterDoctor(addonHint, funcName)
+  local args = Pack(...)
 
   local function ErrorHandler(err)
     local stack = SafeDebugStack(3)
@@ -112,17 +113,23 @@ function Internal:Call(addonHint, funcName, fn, ...)
     return safeError
   end
 
+  -- Keep xpcall portable: explicit packed arguments preserve nils without
+  -- relying on runtime-specific xpcall vararg forwarding.
+  local function InvokeTarget()
+    return fn(Unpack(args, 1, args.n))
+  end
+
   -- The outer pcall contains failures in the profiling layer itself. Target
   -- failures are represented by the inner xpcall boolean.
-  local result = Pack(pcall(function(...)
+  local result = Pack(pcall(function()
     local cpu = RDL.CPU
     if cpu and type(cpu.Measure) == "function" then
-      return cpu:Measure(addonHint or RDL.addonName, funcName, function(...)
-        return xpcall(fn, ErrorHandler, ...)
-      end, { sampleRate = 1.0 }, ...)
+      return cpu:Measure(addonHint or RDL.addonName, funcName, function()
+        return xpcall(InvokeTarget, ErrorHandler)
+      end, { sampleRate = 1.0 })
     end
-    return xpcall(fn, ErrorHandler, ...)
-  end, ...))
+    return xpcall(InvokeTarget, ErrorHandler)
+  end))
 
   LeaveDoctor(doctorToken)
   self._depth = math.max(0, (self._depth or 1) - 1)
