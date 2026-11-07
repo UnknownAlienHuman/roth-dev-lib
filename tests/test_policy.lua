@@ -6,14 +6,21 @@ local settings = {
   fallbackHookScriptErrors = true,
 }
 
+local ensureCalls = 0
+_G.RothDevLibDB = { settings = settings }
 _G.RothDevLib = {
   DB = {
-    EnsureReady = function() return true end,
+    EnsureReady = function()
+      ensureCalls = ensureCalls + 1
+      return true
+    end,
     GetSettings = function() return settings end,
   },
 }
 
 assert(loadfile('Capture/Policy.lua'))()
+assert(ensureCalls == 0) -- file-load policy must not construct DB/session state
+assert(RothDevLibDB.settings == settings)
 assert(settings.errorHandlerMode == 'chain')
 assert(settings.chainCallPrevHandler == true)
 assert(settings.maintainOwnership == false)
