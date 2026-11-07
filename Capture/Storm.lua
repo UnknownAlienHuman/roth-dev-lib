@@ -1,13 +1,25 @@
 -- !RothDevLib/Capture/Storm.lua
 -- Bounded token-bucket flood protection for error/warning/taint/integration
--- capture. Dynamic kinds share one overflow bucket instead of bypassing limits.
+-- capture. Only fixed semantic kinds own buckets; arbitrary public labels share
+-- one overflow bucket and therefore cannot multiply the available burst budget.
 
 local RDL = _G.RothDevLib
 local Storm = {}
 RDL.Storm = Storm
 
-local MAX_BUCKETS = 64
 local OTHER_KIND = "@other"
+local KNOWN_KINDS = {
+  LUA_ERROR = true,
+  SUPPRESSED = true,
+  LUA_WARNING = true,
+  TAINT_BLOCKED = true,
+  TAINT_FORBIDDEN = true,
+  TAINT_STATE = true,
+  ALERT = true,
+  ASSERT = true,
+  INTEGRATION = true,
+}
+local MAX_BUCKETS = 10 -- nine semantic kinds plus the shared overflow bucket.
 
 local function NewBucket()
   return {
@@ -31,27 +43,35 @@ local function SafeKind(value)
   elseif type(value) == "string" then
     text = value
   end
+
   if type(text) ~= "string" or text == "" or text == "<inaccessible>"
       or text == "<secret>" then
-    return "INTEGRATION"
+    return nil
   end
   if #text > 64 then text = text:sub(1, 64) end
   return text
 end
 
+local function CanonicalKind(rawKind)
+  local kind = SafeKind(rawKind)
+  if kind and KNOWN_KINDS[kind] then return kind, false end
+  return OTHER_KIND, true
+end
+
 local function GetBucket(kind)
   local existing = Storm._buckets[kind]
-  if existing then return existing, kind end
+  if existing then return existing end
 
+  -- CanonicalKind() limits this table to the fixed semantic set above. Keep a
+  -- defensive ceiling in case the table is externally corrupted at runtime.
   if (tonumber(Storm._bucketCount) or 0) >= MAX_BUCKETS then
-    Storm._droppedKinds = (tonumber(Storm._droppedKinds) or 0) + 1
-    return Storm._buckets[OTHER_KIND], OTHER_KIND
+    return Storm._buckets[OTHER_KIND]
   end
 
   local bucket = NewBucket()
   Storm._buckets[kind] = bucket
   Storm._bucketCount = (tonumber(Storm._bucketCount) or 0) + 1
-  return bucket, kind
+  return bucket
 end
 
 local function Settings()
@@ -69,10 +89,11 @@ local function GetRate(kind)
     rate = settings and settings.stormErrorsPerSec or 15
   elseif kind == "LUA_WARNING" then
     rate = settings and settings.stormWarningsPerSec or 30
-  elseif kind == "TAINT_BLOCKED" or kind == "TAINT_FORBIDDEN" then
+  elseif kind == "TAINT_BLOCKED" or kind == "TAINT_FORBIDDEN" or kind == "TAINT_STATE" then
     rate = settings and settings.stormErrorsPerSec or 15
   else
-    -- Integration events share a generous default rate.
+    -- Alerts, assertions, explicit integration kinds and arbitrary labels use
+    -- the same integration budget.
     rate = 30
   end
 
@@ -95,9 +116,13 @@ end
 
 -- Check whether an event of the given kind may pass.
 function Storm:Allow(rawKind)
-  local kind = SafeKind(rawKind)
-  local bucket, bucketKind = GetBucket(kind)
-  local rate = GetRate(bucketKind == OTHER_KIND and "INTEGRATION" or kind)
+  local kind, collapsed = CanonicalKind(rawKind)
+  if collapsed then
+    self._droppedKinds = (tonumber(self._droppedKinds) or 0) + 1
+  end
+
+  local bucket = GetBucket(kind)
+  local rate = GetRate(kind)
   local now = Now()
 
   if type(bucket.tokens) ~= "number" then bucket.tokens = rate * 2 end

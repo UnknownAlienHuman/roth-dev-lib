@@ -33,34 +33,41 @@ assert(S:Allow('LUA_ERROR') == true)
 now = 1
 assert(pcall(S.Allow, S, 'LUA_ERROR') == true)
 
--- Direct hostile kinds degrade to one ordinary bounded identity.
+-- Direct hostile kinds degrade to the shared ordinary overflow identity.
 assert(pcall(S.Allow, S, secret) == true)
 
--- Dynamic kinds cannot allocate one bucket each or bypass throttling forever.
+-- Every arbitrary public label shares one bucket immediately. Rotating names
+-- therefore cannot multiply the integration burst budget before saturation.
 now = 20
+local allowed, denied = 0, 0
 for index = 1, 200 do
-  S:Allow('CUSTOM_KIND_' .. index .. string.rep('x', 100))
+  if S:Allow('CUSTOM_KIND_' .. index .. string.rep('x', 100)) then
+    allowed = allowed + 1
+  else
+    denied = denied + 1
+  end
 end
+assert(allowed <= 60 and denied > 0)
+
 local stats = S:GetStats()
-assert(stats.bucketCount == stats.maxBuckets and stats.maxBuckets == 64)
-assert(stats.droppedKinds > 0)
+assert(stats.bucketCount == 2) -- LUA_ERROR plus @other
+assert(stats.maxBuckets == 10 and stats.droppedKinds >= 200)
 local actualBuckets = 0
 for kind in pairs(S._buckets) do
   actualBuckets = actualBuckets + 1
   assert(type(kind) == 'string' and #kind <= 64)
 end
 assert(actualBuckets == stats.bucketCount)
+assert(S._buckets['@other'])
 
--- Overflow kinds share one token bucket, so rotating names still throttles.
+-- A fixed semantic kind may own one independent bucket, but aliases do not.
 now = 100
-local allowed, denied = 0, 0
-for index = 1, 100 do
-  if S:Allow('OVERFLOW_' .. index) then allowed = allowed + 1 else denied = denied + 1 end
-end
-assert(allowed <= 60 and denied > 0)
+for _ = 1, 6 do assert(S:Allow('LUA_WARNING') == true) end
+assert(S:Allow('LUA_WARNING') == false)
+stats = S:GetStats()
+assert(stats.bucketCount == 3)
 
 -- Stats are detached snapshots; callers cannot mutate live buckets.
-stats = S:GetStats()
 stats.buckets['@other'].tokens = 999999
 assert(S._buckets['@other'].tokens ~= 999999)
 
