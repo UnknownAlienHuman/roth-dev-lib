@@ -12,7 +12,9 @@ Target: **Retail 12.1.5 / Interface 120105**
 - [x] Recheck ChatTap continuation parsing and disabled-setting timer cleanup.
 - [x] Separate early SavedVariables availability from PLAYER_LOGIN session construction and add lifecycle/load-order regression coverage.
 - [x] Enforce a hard total group cap including pinned entries and remove the duplicate suppression ADDON_LOADED owner.
-- [ ] Run the complete repository offline suite after the final static pass; focused lifecycle and capture matrices are green.
+- [x] Compact persisted occurrence history and handle `SAVED_VARIABLES_TOO_LARGE` without retry loops.
+- [x] Add total byte budgets to diagnostic deep-copy boundaries.
+- [x] Run the complete repository suite and first-party Lua syntax gate in CI.
 
 ### Named-client validation
 
@@ -34,10 +36,13 @@ Target: **Retail 12.1.5 / Interface 120105**
 - Forced one-time chain ownership and disabled automatic reclaim/watchdog fights; manual reclaim remains explicit.
 - Rejected secure-only `AddLuaErrorHandler` as an ordinary-addon fallback; retained bounded BugGrabber import only.
 - Baseline BugGrabber history by default, use stable content keys and avoid foreign `__len` execution.
+- Import the first occurrence of every new BugGrabber error after the one-time baseline and retain counters when a bounded scan is incomplete.
 - Rebuilt ChatTap and BugGrabber import around bounded ordinary-value snapshots.
+- Enforced a hard ChatTap dedup-cache limit during bursts of unique errors.
 - Added bounded ordinary-value boundaries for public API, reports, taint/restriction data, JSON, callbacks and breadcrumbs.
-- Added raw JSON/table traversal plus depth, entry, scan, node, string and output budgets.
+- Added raw JSON/table traversal plus depth, entry, scan, node, string, total-byte and output budgets.
 - Guarded bootstrap hard-error intake and made successful-store status explicit across hard, suppressed, report, warning, taint and chat paths.
+- Preserved a successful `nil` scrub result so missing stack fallbacks reach `debugstack` instead of becoming `<unavailable>`.
 - Preserved inaccessible restriction states, rejected inaccessible external signature identities and fixed ChatTap stack-line/header ordering.
 - Defined callback dispatch mutation semantics and isolated each callback payload from DB state and other consumers.
 - Preserved arbitrary return tuples through Core, Internal, Doctor, CPU and memory wrappers.
@@ -45,4 +50,8 @@ Target: **Retail 12.1.5 / Interface 120105**
 - Fixed minimap drag angle/scale handling and LDB button recovery.
 - Fixed breadcrumb ring resize semantics and option alias compatibility.
 - Updated load-on-demand menu loading to `C_AddOns.LoadAddOn`.
-- Added a PLAYER_LOGIN DB/session gate, one-time persisted-state normalization and bounded boot-entry session binding.
+- Added a PLAYER_LOGIN DB/session gate, failed-root retry semantics, one-time persisted-state normalization and bounded boot-entry session binding.
+- Added one idempotent `ADDONS_UNLOADING` / `PLAYER_LOGOUT` teardown path.
+- Migrated persistence to schema 5 with compact occurrence summaries and bounded root messages, stacks and locals.
+- Added one-shot `SAVED_VARIABLES_TOO_LARGE` recovery with emergency compaction, current-session write suspension and explicit clear/reload recovery.
+- Added GitHub Actions coverage for the complete regression suite and first-party `texluac -p` syntax gate.
