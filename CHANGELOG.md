@@ -5,72 +5,62 @@
 ### Compatibility
 
 - Target Retail 12.1.5, Interface 120105.
-- Declare `LoadSavedVariablesFirst` because capture policy and handler installation intentionally read persisted settings during file loading.
-- Register `rothdevlib` links through the current `LinkUtil` dispatcher, with a bounded legacy fallback.
+- Declare `LoadSavedVariablesFirst` because file-load capture policy intentionally reads persisted settings.
+- Register `rothdevlib` links through current `LinkUtil`, with a bounded legacy fallback.
 - Load Blizzard menu support through `C_AddOns.LoadAddOn`.
+- Preserve protected-call argument and return tuples through explicit packed closures instead of depending on runtime-specific `xpcall` vararg forwarding.
 
 ### Correctness and safety
 
-- Normalize external values before comparison, formatting, iteration, persistence or callback delivery.
-- Deep-copy and bound diagnostic payloads; inaccessible values are represented explicitly.
+- Normalize external values before comparison, formatting, iteration, persistence, logging, callback delivery or UI use.
 - Traverse foreign diagnostic tables with raw `next`/`rawget`; never invoke `__pairs`, `__index` or `__len`.
-- Bound JSON traversal by depth, table entries, scan entries, total nodes, strings, arrays and total output.
-- Add total-node and total-byte table-copy budgets, preventing broad diagnostic graphs from bypassing per-string limits.
-- Keep `Core/Core.lua` limited to namespace/integrity ownership; the final public wrappers have one owner in `Core/CallSafety.lua`.
-- Preserve newest breadcrumbs when a ring is resized.
-- Bound Bus addon/metric registries and CPU/memory profiling key spaces; dynamic labels are dropped after explicit ceilings instead of growing session memory indefinitely.
-- Bound callback namespaces, callbacks per event and total retained callbacks while preserving replacement, unregister-during-dispatch and failure-disable semantics.
-- Bound Doctor scope depth, detach retained contexts and preserve the newest correlation frames when callers leak scopes.
-- Bound the locals-calibration cache, read foreign options through raw access and match addon paths literally rather than as Lua patterns.
-- Retire the invasive global error-handler lock and force compatibility-first chain mode.
-- Install the error handler once; stop automatic reclaim/watchdog fights after another addon becomes owner. Explicit `/rdev reclaim` remains available.
-- Do not call secure-only `AddLuaErrorHandler` or hook private ScriptErrorsFrame internals. Fallback is bounded BugGrabber import or an explicit unavailable state.
-- Baseline existing BugGrabber counters by default and use content-stable keys, preventing historical replay and list-reorder duplicates.
-- Import the first occurrence of a new BugGrabber error immediately after the one-time attach baseline instead of silently waiting for its counter to reach two.
-- Import at most one current occurrence when a newly observed BugGrabber record already has a counter greater than one.
-- Keep BugGrabber counter state when a bounded raw-key scan is incomplete; stale-key pruning now requires proof of a complete scan.
-- Bound BugGrabber counter state to the configured scan window and retain bounded logical signatures instead of full external message+stack strings as map keys.
-- Scan BugGrabber records without the foreign length operator, so hostile `__len` code cannot run.
-- Rebuild ChatTap and BugGrabber import as bounded, secret-safe external intake paths.
-- Enforce the configured ChatTap dedup limit during bursts of recent unique errors, not only after entries become stale.
-- Stop replacing Blizzard frame methods, mutating `StaticPopupDialogs`, or unregistering Blizzard-owned events.
-- Give callbacks deterministic mutation semantics and an independent detached payload per consumer.
-- Preserve arbitrary function return tuples through safe wrappers, profiling wrappers, Doctor scopes and internal calls.
-- Add token-aware Doctor cleanup, including a one-frame cleanup fallback for hard errors handled by another owner.
+- Bound diagnostic copies by depth, entries, nodes, strings and total bytes; bound JSON by arrays, scans and total output too.
+- Keep `Core/Core.lua` limited to namespace/integrity ownership; final public wrappers have one owner in `Core/CallSafety.lua`.
+- Retire the global error-handler lock and force compatibility-first one-time chain ownership.
+- Observe later handler replacement without automatic reclaim/watchdog fights; explicit `/rdev reclaim` remains available.
+- Do not call secure-only `AddLuaErrorHandler` or hook private ScriptErrorsFrame internals.
 - Guard the pre-`Safety.lua` handler window so capture faults clear recursion state and retain prior-handler delivery.
-- Preserve a successful `nil` scrub result instead of converting it to `<unavailable>`; stack capture now reaches `debugstack` when no fallback was supplied.
-- Treat only `stored`, `queued` and `ignored` as successful intake statuses; throttled/failed writes are not reported as captured.
-- Tear down the BugGrabber fallback immediately when ownership or settings make it ineligible.
-- Preserve inaccessible restriction-state values instead of coercing them to `false`.
-- Reject inaccessible external signature overrides rather than using them as grouping keys.
-- Preserve warning tuple arity and recognize ChatTap stack continuations before generic headers.
-- Separate early SavedVariables access from player-session readiness; construct sessions only at `PLAYER_LOGIN`.
-- Treat DB/session startup as the root initialization gate: failed DB initialization no longer starts consumers or leaves a false `_initialized` state.
-- Use one idempotent final teardown for `ADDONS_UNLOADING` and `PLAYER_LOGOUT`, including pending ChatTap invalidation.
+- Preserve successful `nil` scrub results so absent stack fallbacks reach `debugstack` instead of becoming `<unavailable>`.
+- Treat only `stored`, `queued` and `ignored` as successful intake statuses.
+- Preserve warning tuple arity, inaccessible restriction-state values and explicit report signatures.
+- Recognize ChatTap stack continuations before generic headers and hard-cap its dedup map during unique bursts.
+- Baseline existing BugGrabber counters once, use bounded logical signatures, import the first newly observed occurrence immediately and never replay a newly seen foreign counter as full history.
+- Retain BugGrabber counters across incomplete scans, cap retained counter state to the configured scan window and stop the fallback immediately when ineligible.
+- Bound Storm token buckets; dynamic integration kinds share one overflow bucket and cannot bypass throttling by rotating names.
+- Bound locals calibration state; read foreign options through raw access and match addon paths literally instead of as Lua patterns.
+- Bound Doctor scope depth, detach retained contexts and preserve newest scopes if callers leak tokens.
+- Give callbacks deterministic mutation semantics, independent detached payloads and hard per-event/total registry ceilings.
+- Bound Bus addon/metric identities and CPU/memory profiling/sample identities.
+- Bound in-memory logging by per-field/per-line limits and a 2 MiB total retained-byte budget.
+- Preserve newest breadcrumbs when a ring is resized.
+- Remove invasive Blizzard frame-method replacement, popup mutation and foreign event unregistration.
+
+### Persistence and lifecycle
+
+- Separate early SavedVariables availability from player-session readiness; construct sessions only at `PLAYER_LOGIN`.
+- Treat DB/session startup as the root initialization gate; failed DB init never starts consumers or leaves a false initialized state.
 - Queue file-load errors without a session and bind them to the first real session when committed.
-- Normalize persisted settings/groups/session indexes once per DB root and trim stale/excess persisted data before normal use.
-- Persist compact occurrence summaries instead of duplicating full locals/context payloads for every occurrence.
-- Bound persisted group messages, stacks and locals and migrate existing occurrence history to schema 5.
-- Handle `SAVED_VARIABLES_TOO_LARGE` as one emergency-compaction path: keep the newest/pinned groups, strip heavy context, pause writes for the current session and require explicit clear/reload recovery.
-- Enforce the global group cap even when groups are pinned; pinning changes eviction priority, not the memory/persistence bound.
-- Pre-normalize persisted sessions/groups before the legacy DB owner scans them, bounding login work as well as steady-state storage.
-- Remove the duplicate suppression `ADDON_LOADED` watcher; `Core/Events.lua` is the single late-Blizzard-readiness owner.
+- Normalize persisted settings/groups/session indexes once per DB root and pre-trim malformed/excess data before the legacy DB owner scans it.
+- Migrate to schema 5 with compact occurrence summaries instead of duplicating full locals/context payloads per occurrence.
+- Bound persisted group messages, stacks, locals, total groups and sessions; pinning affects eviction priority, not the cap.
+- Bound persisted signature/addon ignore maps with a bounded startup scan and timestamp-based oldest-rule eviction.
+- Handle `SAVED_VARIABLES_TOO_LARGE` through one emergency-compaction path: keep a small newest/pinned set, strip heavy context, shrink ignore maps and suspend writes for the session without retry loops.
+- Use one idempotent `ADDONS_UNLOADING` / `PLAYER_LOGOUT` teardown, including pending ChatTap invalidation and watcher/ticker shutdown.
+- Keep `Core/Events.lua` as the single late-Blizzard-readiness owner.
 
 ### UI
 
 - Fix manual minimap dragging with `math.atan2` and effective-scale coordinates.
 - Recover a missing LibDBIcon button correctly.
-- Use owner-aware tooltip cleanup for the addon-compartment entry.
+- Use owner-aware addon-compartment tooltip cleanup.
+- Load menus through current APIs while retaining explicit fallback behavior.
 
 ### Validation
 
-- Add manifest/load-order coverage for `LoadSavedVariablesFirst` and capture ordering.
-- Add regression coverage for raw JSON traversal, hostile metamethods, JSON node/byte budgets and raw BugGrabber list scanning.
-- Add focused regression coverage for bootstrap handler recovery, fallback teardown, store statuses, warning arity, restriction-state markers, report signatures and ChatTap continuation/timer behavior.
-- Add regressions for first-occurrence BugGrabber import, incomplete-scan retention, bounded fallback state, ChatTap dedup hard bounds, failed-root initialization and idempotent unload/logout teardown.
-- Add persistence regressions for compact occurrence migration, bounded root payloads, oversized-SavedVariables recovery, write suspension and explicit resume.
-- Add saturation regressions for Bus, CPU, memory, callbacks, Doctor and locals-cache ceilings, including hostile identity/options inputs.
-- Run the complete repository regression suite and first-party `texluac -p` syntax gate on every branch/PR through GitHub Actions.
-- Complete repository regression suite: pass.
+- Add GitHub Actions CI for the complete `tests/test_*.lua` suite and first-party `texluac -p` syntax gate.
+- Add regression matrices for manifest/load order, lifecycle failure/retry/teardown, bootstrap handler recovery and store-status semantics.
+- Add hostile-input and saturation tests for bounded copy/JSON, persistence, ignore maps, Logger, Bus, CPU/memory, callbacks, Doctor, Locals, ChatTap, BugGrabber and Storm.
+- Add argument/return-tuple tests with interior and trailing nils for safe/internal/profiling paths.
+- Complete offline regression suite: pass.
 - All first-party production Lua files pass `texluac -p`.
-- In-game matrix: not run in this environment.
+- In-game matrix: not run in this environment; remaining client gates are explicit in `todo.md`.
