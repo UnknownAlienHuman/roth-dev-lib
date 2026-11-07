@@ -23,6 +23,7 @@ Core\Core.lua
 Core\Version.lua
 Core\DB.lua
 Core\DBLifecycle.lua
+Core\IgnoreBounds.lua
 Core\Internal.lua
 
 # Ordinary-value boundary and utilities
