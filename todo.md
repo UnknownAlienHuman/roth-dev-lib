@@ -14,6 +14,8 @@ Target: **Retail 12.1.5 / Interface 120105**
 - [x] Enforce a hard total group cap including pinned entries and remove the duplicate suppression ADDON_LOADED owner.
 - [x] Compact persisted occurrence history and handle `SAVED_VARIABLES_TOO_LARGE` without retry loops.
 - [x] Add total byte budgets to diagnostic deep-copy boundaries.
+- [x] Bound dynamic Bus/profiling/callback registries and correlation/calibration caches.
+- [x] Bound BugGrabber fallback identities and retained counter state across incomplete scans.
 - [x] Run the complete repository suite and first-party Lua syntax gate in CI.
 
 ### Named-client validation
@@ -35,12 +37,16 @@ Target: **Retail 12.1.5 / Interface 120105**
 - Replaced the loaded legacy error-handler monolith with the compact `Capture/Engine.lua` owner and retired the global setter lock.
 - Forced one-time chain ownership and disabled automatic reclaim/watchdog fights; manual reclaim remains explicit.
 - Rejected secure-only `AddLuaErrorHandler` as an ordinary-addon fallback; retained bounded BugGrabber import only.
-- Baseline BugGrabber history by default, use stable content keys and avoid foreign `__len` execution.
-- Import the first occurrence of every new BugGrabber error after the one-time baseline and retain counters when a bounded scan is incomplete.
+- Baseline BugGrabber history by default, use stable bounded signatures and avoid foreign `__len` execution.
+- Import the first occurrence of every new BugGrabber error after the one-time baseline, import at most one occurrence for newly seen counters greater than one and retain counters when a bounded scan is incomplete.
+- Bound BugGrabber retained state to the configured scan window instead of accumulating historical full message/stack keys.
 - Rebuilt ChatTap and BugGrabber import around bounded ordinary-value snapshots.
 - Enforced a hard ChatTap dedup-cache limit during bursts of unique errors.
 - Added bounded ordinary-value boundaries for public API, reports, taint/restriction data, JSON, callbacks and breadcrumbs.
 - Added raw JSON/table traversal plus depth, entry, scan, node, string, total-byte and output budgets.
+- Bounded Bus addon/metric registries, CPU/memory profiling identities and callback registrations.
+- Bounded Doctor scope depth, detached retained correlation contexts and preserved newest scopes under leaks.
+- Bounded the locals-calibration cache and removed foreign-option/metapattern execution paths.
 - Guarded bootstrap hard-error intake and made successful-store status explicit across hard, suppressed, report, warning, taint and chat paths.
 - Preserved a successful `nil` scrub result so missing stack fallbacks reach `debugstack` instead of becoming `<unavailable>`.
 - Preserved inaccessible restriction states, rejected inaccessible external signature identities and fixed ChatTap stack-line/header ordering.

@@ -18,12 +18,18 @@
 - Add total-node and total-byte table-copy budgets, preventing broad diagnostic graphs from bypassing per-string limits.
 - Keep `Core/Core.lua` limited to namespace/integrity ownership; the final public wrappers have one owner in `Core/CallSafety.lua`.
 - Preserve newest breadcrumbs when a ring is resized.
+- Bound Bus addon/metric registries and CPU/memory profiling key spaces; dynamic labels are dropped after explicit ceilings instead of growing session memory indefinitely.
+- Bound callback namespaces, callbacks per event and total retained callbacks while preserving replacement, unregister-during-dispatch and failure-disable semantics.
+- Bound Doctor scope depth, detach retained contexts and preserve the newest correlation frames when callers leak scopes.
+- Bound the locals-calibration cache, read foreign options through raw access and match addon paths literally rather than as Lua patterns.
 - Retire the invasive global error-handler lock and force compatibility-first chain mode.
 - Install the error handler once; stop automatic reclaim/watchdog fights after another addon becomes owner. Explicit `/rdev reclaim` remains available.
 - Do not call secure-only `AddLuaErrorHandler` or hook private ScriptErrorsFrame internals. Fallback is bounded BugGrabber import or an explicit unavailable state.
 - Baseline existing BugGrabber counters by default and use content-stable keys, preventing historical replay and list-reorder duplicates.
 - Import the first occurrence of a new BugGrabber error immediately after the one-time attach baseline instead of silently waiting for its counter to reach two.
+- Import at most one current occurrence when a newly observed BugGrabber record already has a counter greater than one.
 - Keep BugGrabber counter state when a bounded raw-key scan is incomplete; stale-key pruning now requires proof of a complete scan.
+- Bound BugGrabber counter state to the configured scan window and retain bounded logical signatures instead of full external message+stack strings as map keys.
 - Scan BugGrabber records without the foreign length operator, so hostile `__len` code cannot run.
 - Rebuild ChatTap and BugGrabber import as bounded, secret-safe external intake paths.
 - Enforce the configured ChatTap dedup limit during bursts of recent unique errors, not only after entries become stale.
@@ -61,8 +67,9 @@
 - Add manifest/load-order coverage for `LoadSavedVariablesFirst` and capture ordering.
 - Add regression coverage for raw JSON traversal, hostile metamethods, JSON node/byte budgets and raw BugGrabber list scanning.
 - Add focused regression coverage for bootstrap handler recovery, fallback teardown, store statuses, warning arity, restriction-state markers, report signatures and ChatTap continuation/timer behavior.
-- Add regressions for first-occurrence BugGrabber import, incomplete-scan retention, ChatTap dedup hard bounds, failed-root initialization and idempotent unload/logout teardown.
+- Add regressions for first-occurrence BugGrabber import, incomplete-scan retention, bounded fallback state, ChatTap dedup hard bounds, failed-root initialization and idempotent unload/logout teardown.
 - Add persistence regressions for compact occurrence migration, bounded root payloads, oversized-SavedVariables recovery, write suspension and explicit resume.
+- Add saturation regressions for Bus, CPU, memory, callbacks, Doctor and locals-cache ceilings, including hostile identity/options inputs.
 - Run the complete repository regression suite and first-party `texluac -p` syntax gate on every branch/PR through GitHub Actions.
 - Complete repository regression suite: pass.
 - All first-party production Lua files pass `texluac -p`.
