@@ -1,45 +1,99 @@
 -- !RothDevLib/Capture/Locals.lua
--- Locals capture and stack-level calibration.
---
--- Problem:
---   `debuglocals(level)` is very sensitive to call-path differences:
---   * hard errors via global errorhandler
---   * suppressed errors via xpcall wrappers
---   * explicit reports via RDL:Report()
---   Depending on wrappers, the correct `level` may shift.
---
--- Goal:
---   Best-effort capture of locals from the most relevant stack frame,
---   with bounded overhead and Secret Value filtering.
+-- Bounded locals capture and stack-level calibration.
 
 local RDL = _G.RothDevLib
 local Locals = {}
 RDL.Locals = Locals
 
+local MAX_CACHE_KEYS = 512
+
 Locals._cache = {}
+Locals._cacheCount = 0
+Locals._droppedCacheKeys = 0
 Locals._bucket = { t = 0, tokens = 0 }
 
 local function Now()
-  if type(GetTime) == "function" then return GetTime() end
-  return time()
+  local fn = type(_G.GetTime) == "function" and _G.GetTime or _G.time
+  if type(fn) ~= "function" then return 0 end
+  local ok, value = pcall(fn)
+  return ok and type(value) == "number" and value or 0
 end
 
 local function Settings()
-  return (RDL.DB and RDL.DB.GetSettings and RDL.DB:GetSettings()) or {}
+  if RDL.DB and type(RDL.DB.GetSettings) == "function" then
+    local ok, settings = pcall(RDL.DB.GetSettings, RDL.DB)
+    if ok and type(settings) == "table" then return settings end
+  end
+  return {}
+end
+
+local function Option(opts, key)
+  if type(opts) ~= "table" then return nil end
+  local guard = RDL.SecretGuard
+  if guard and type(guard.CanAccessTable) == "function" then
+    local ok, accessible = pcall(guard.CanAccessTable, guard, opts)
+    if not ok or accessible ~= true then return nil end
+  end
+  local ok, value = pcall(rawget, opts, key)
+  if not ok then return nil end
+  if guard and type(guard.CanAccess) == "function" then
+    local okAccess, accessible = pcall(guard.CanAccess, guard, value)
+    if not okAccess or accessible ~= true then return nil end
+  end
+  if guard and type(guard.IsSecret) == "function" then
+    local okSecret, secret = pcall(guard.IsSecret, guard, value)
+    if not okSecret or secret == true then return nil end
+  end
+  return value
+end
+
+local function SafeText(value, fallback, maximum)
+  if value == nil then return fallback end
+  local text
+  local util = RDL.Util
+  if util and type(util.SafeToString) == "function" then
+    local ok, rendered = pcall(util.SafeToString, util, value)
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(value) == "string" then
+    text = value
+  end
+  if type(text) ~= "string" or text == "<inaccessible>" or text == "<secret>" then
+    return fallback
+  end
+  if maximum and #text > maximum then text = text:sub(1, maximum) end
+  return text
+end
+
+local function SafeNumber(value, fallback, minimum, maximum)
+  local ordinary = value
+  local util = RDL.Util
+  if util and type(util.Scrub) == "function" then
+    local ok, scrubbed = pcall(util.Scrub, util, value)
+    if not ok then return fallback end
+    ordinary = scrubbed
+  end
+  if type(ordinary) ~= "number" or ordinary ~= ordinary
+      or ordinary == math.huge or ordinary == -math.huge then
+    return fallback
+  end
+  if ordinary < minimum then return minimum end
+  if ordinary > maximum then return maximum end
+  return ordinary
 end
 
 local function FilterAndTrim(localsStr)
   if type(localsStr) ~= "string" or localsStr == "" then return nil end
 
-  local s = Settings()
-  local maxSize = tonumber(s.maxLocalsSize) or 8192
+  local settings = Settings()
+  local maxSize = math.floor(SafeNumber(Option(settings, "maxLocalsSize"), 8192, 256, 64 * 1024))
 
-  -- Secret escape filtering (12.x |K...|k)
-  if RDL.SecretGuard and RDL.SecretGuard.FilterLocals then
-    localsStr = RDL.SecretGuard:FilterLocals(localsStr)
+  if RDL.SecretGuard and type(RDL.SecretGuard.FilterLocals) == "function" then
+    local ok, filtered = pcall(RDL.SecretGuard.FilterLocals, RDL.SecretGuard, localsStr)
+    if ok and type(filtered) == "string" then localsStr = filtered end
   end
-  if RDL.Util and RDL.Util.FilterLocals then
-    localsStr = RDL.Util:FilterLocals(localsStr, maxSize)
+  if RDL.Util and type(RDL.Util.FilterLocals) == "function" then
+    local ok, filtered = pcall(RDL.Util.FilterLocals, RDL.Util, localsStr, maxSize)
+    if ok and type(filtered) == "string" then localsStr = filtered end
   elseif #localsStr > maxSize then
     localsStr = localsStr:sub(1, maxSize) .. "\n...[truncated]"
   end
@@ -60,7 +114,7 @@ local function MakeAddonToken(addonName)
   if type(addonName) ~= "string" or addonName == "" or addonName == "<?>" then
     return nil
   end
-  return "AddOns[\\/]" .. addonName .. "[\\/]"
+  return "AddOns/" .. addonName .. "/"
 end
 
 local function IsInternalFrame(line)
@@ -77,43 +131,65 @@ local function IsGoodLocals(localsStr)
   return true
 end
 
+local function CacheSet(self, key, level)
+  if type(key) ~= "string" or key == "" then return false end
+  if self._cache[key] ~= nil then
+    self._cache[key] = level
+    return true
+  end
+  if (tonumber(self._cacheCount) or 0) >= MAX_CACHE_KEYS then
+    self._droppedCacheKeys = (tonumber(self._droppedCacheKeys) or 0) + 1
+    return false
+  end
+  self._cache[key] = level
+  self._cacheCount = (tonumber(self._cacheCount) or 0) + 1
+  return true
+end
+
 function Locals:_TakeProbeTokens(n)
-  n = n or 1
-  local s = Settings()
-  local rate = tonumber(s.localsProbesPerSec) or 30
+  n = math.floor(SafeNumber(n, 1, 1, 100))
+  local settings = Settings()
+  local rate = math.floor(SafeNumber(Option(settings, "localsProbesPerSec"), 30, 1, 1000))
   local cap = rate * 2
 
-  local b = self._bucket
+  local bucket = self._bucket
   local now = Now()
-  if not b.t or b.t == 0 then
-    b.t = now
-    b.tokens = rate
+  if not bucket.t or bucket.t == 0 then
+    bucket.t = now
+    bucket.tokens = rate
   end
 
-  local dt = now - b.t
-  if dt >= 1 then
+  local dt = now - bucket.t
+  if dt < 0 then
+    bucket.t = now
+    bucket.tokens = rate
+  elseif dt >= 1 then
     local refill = math.floor(dt) * rate
-    b.tokens = math.min(cap, (b.tokens or 0) + refill)
-    b.t = now
+    bucket.tokens = math.min(cap, (bucket.tokens or 0) + refill)
+    bucket.t = now
   end
 
-  if (b.tokens or 0) < n then return false end
-  b.tokens = (b.tokens or 0) - n
+  if (bucket.tokens or 0) < n then return false end
+  bucket.tokens = (bucket.tokens or 0) - n
   return true
 end
 
 function Locals:_TryLevel(level)
-  level = tonumber(level)
-  if not level or level < 1 then return nil, "" end
+  level = math.floor(SafeNumber(level, 0, 0, 100))
+  if level < 1 then return nil, "" end
 
-  local okL, raw = pcall(debuglocals, level)
-  local localsStr = okL and raw or nil
-  localsStr = FilterAndTrim(localsStr)
+  local raw
+  if type(_G.debuglocals) == "function" then
+    local ok, value = pcall(_G.debuglocals, level)
+    if ok then raw = value end
+  end
+  local localsStr = FilterAndTrim(raw)
 
-  local okS, st = pcall(function()
-    return debugstack(level, 3, 3)
-  end)
-  local frameLine = okS and FirstFrameLine(st) or ""
+  local frameLine = ""
+  if type(_G.debugstack) == "function" then
+    local ok, stack = pcall(_G.debugstack, level, 3, 3)
+    if ok then frameLine = FirstFrameLine(SafeText(stack, "", 4096)) end
+  end
 
   return localsStr, frameLine
 end
@@ -121,77 +197,67 @@ end
 function Locals:_ScoreCandidate(localsStr, frameLine, addonToken)
   if not IsGoodLocals(localsStr) then return -1 end
 
-  local score = 0
-  score = score + math.min(#localsStr / 64, 40)
-
+  local score = math.min(#localsStr / 64, 40)
   if frameLine and frameLine ~= "" then
-    if frameLine:find("%[C%]", 1, false) then score = score - 25 end
-    if frameLine:find("xpcall", 1, true) then score = score - 15 end
-    if IsInternalFrame(frameLine) then score = score - 100 end
-    if addonToken and frameLine:find(addonToken) then
-      score = score + 80
-    end
+    local normalized = frameLine:gsub("\\", "/")
+    if normalized:find("[C]", 1, true) then score = score - 25 end
+    if normalized:find("xpcall", 1, true) then score = score - 15 end
+    if IsInternalFrame(normalized) then score = score - 100 end
+    if addonToken and normalized:find(addonToken, 1, true) then score = score + 80 end
   end
-
   return score
 end
 
--- Capture locals using a calibrated heuristic.
---
--- opts:
---   addon: string (preferred addon name)
---   stack: string (traceback/stack; used to guess addon/origin)
---   baseLevel: number (starting debuglocals level)
---   maxProbe: number (levels to probe beyond base)
---   cacheKey: string (optional)
---
--- returns localsStr, meta
+-- Capture locals using a calibrated heuristic. External options are read only
+-- through rawget and retained cache identities are bounded.
 function Locals:CaptureBest(opts)
-  opts = opts or {}
-  local s = Settings()
+  if type(opts) ~= "table" then opts = {} end
+  local settings = Settings()
 
-  if s.captureLocals == false then
+  if Option(settings, "captureLocals") == false then
     return nil, { disabled = true }
   end
 
-  local base = tonumber(opts.baseLevel) or 2
-  local maxProbe = tonumber(opts.maxProbe) or tonumber(s.localsProbeMax) or 12
-  if maxProbe < 0 then maxProbe = 0 end
-  if maxProbe > 30 then maxProbe = 30 end
+  local base = math.floor(SafeNumber(Option(opts, "baseLevel"), 2, 1, 100))
+  local configuredProbe = Option(opts, "maxProbe")
+  if configuredProbe == nil then configuredProbe = Option(settings, "localsProbeMax") end
+  local maxProbe = math.floor(SafeNumber(configuredProbe, 12, 0, 30))
 
-  -- Determine addon matching token.
-  local targetAddon = opts.addon
-  if (not targetAddon or targetAddon == "<?>" or targetAddon == "") and RDL.Util and RDL.Util.GuessAddonFromStack then
-    targetAddon = RDL.Util:GuessAddonFromStack(opts.stack)
+  local stackText = SafeText(Option(opts, "stack"), "", 128 * 1024)
+  local targetAddon = SafeText(Option(opts, "addon"), nil, 128)
+  if (not targetAddon or targetAddon == "<?>")
+      and RDL.Util and type(RDL.Util.GuessAddonFromStack) == "function" then
+    local ok, guessed = pcall(RDL.Util.GuessAddonFromStack, RDL.Util, stackText)
+    if ok then targetAddon = SafeText(guessed, nil, 128) end
   end
   local addonToken = MakeAddonToken(targetAddon)
 
-  -- Cache key by addon + first stack origin line (normalized).
-  local cacheKey = opts.cacheKey
-  if cacheKey == nil and s.localsProbeCache ~= false then
-    local top = ""
-    if type(opts.stack) == "string" then
-      top = (opts.stack:match("Interface/AddOns/[^\n]+") or opts.stack:match("AddOns/[^\n]+") or "")
-      if #top > 180 then top = top:sub(1, 180) end
-    end
-    cacheKey = tostring(targetAddon or "<?>") .. "|" .. tostring(top)
+  local cacheEnabled = Option(settings, "localsProbeCache") ~= false
+  local cacheKey
+  local explicitCacheKey = Option(opts, "cacheKey")
+  if type(explicitCacheKey) == "string" then
+    cacheKey = SafeText(explicitCacheKey, nil, 384)
+  elseif cacheEnabled then
+    local top = stackText:match("Interface/AddOns/[^\n]+")
+      or stackText:match("AddOns/[^\n]+") or ""
+    if #top > 180 then top = top:sub(1, 180) end
+    cacheKey = (targetAddon or "<?>") .. "|" .. top
   end
 
   local meta = { baseLevel = base, targetAddon = targetAddon, cacheKey = cacheKey }
 
   if cacheKey and self._cache[cacheKey] then
-    local lvl = self._cache[cacheKey]
-    local localsStr, frameLine = self:_TryLevel(lvl)
+    local level = self._cache[cacheKey]
+    local localsStr, frameLine = self:_TryLevel(level)
     if IsGoodLocals(localsStr) then
       meta.cacheHit = true
-      meta.level = lvl
+      meta.level = level
       meta.frame = frameLine
       meta.score = 999
       return localsStr, meta
     end
   end
 
-  -- Fast path: try base level first.
   local bestLocals, bestFrame = self:_TryLevel(base)
   local bestScore = self:_ScoreCandidate(bestLocals, bestFrame, addonToken)
   local bestLevel = base
@@ -200,25 +266,25 @@ function Locals:CaptureBest(opts)
     meta.level = bestLevel
     meta.frame = bestFrame
     meta.score = bestScore
-    if cacheKey and s.localsProbeCache ~= false then self._cache[cacheKey] = bestLevel end
+    if cacheKey and cacheEnabled then CacheSet(self, cacheKey, bestLevel) end
     return bestLocals, meta
   end
 
   local probed = 0
-  for lvl = base, base + maxProbe do
-    if lvl ~= base then
+  for level = base, base + maxProbe do
+    if level ~= base then
       if not self:_TakeProbeTokens(1) then
         meta.probeBudgetExhausted = true
         break
       end
-      local localsStr, frameLine = self:_TryLevel(lvl)
+      local localsStr, frameLine = self:_TryLevel(level)
       local score = self:_ScoreCandidate(localsStr, frameLine, addonToken)
       probed = probed + 1
       if score > bestScore then
         bestScore = score
         bestLocals = localsStr
         bestFrame = frameLine
-        bestLevel = lvl
+        bestLevel = level
         if bestScore >= 80 then break end
       end
     end
@@ -229,15 +295,27 @@ function Locals:CaptureBest(opts)
   meta.frame = bestFrame
   meta.score = bestScore
 
-  if cacheKey and s.localsProbeCache ~= false and bestScore >= 0 then
-    self._cache[cacheKey] = bestLevel
+  if cacheKey and cacheEnabled and bestScore >= 0 then
+    CacheSet(self, cacheKey, bestLevel)
   end
 
   return bestLocals, meta
 end
 
--- Explicit level capture (backward-compat helper).
 function Locals:CaptureAtLevel(level)
-  local localsStr = select(1, self:_TryLevel(level))
-  return localsStr
+  return select(1, self:_TryLevel(level))
+end
+
+function Locals:ResetCache()
+  for key in pairs(self._cache) do self._cache[key] = nil end
+  self._cacheCount = 0
+  self._droppedCacheKeys = 0
+end
+
+function Locals:GetCacheStats()
+  return {
+    keys = tonumber(self._cacheCount) or 0,
+    maximum = MAX_CACHE_KEYS,
+    dropped = tonumber(self._droppedCacheKeys) or 0,
+  }
 end
