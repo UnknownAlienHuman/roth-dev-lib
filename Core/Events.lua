@@ -8,24 +8,40 @@ if not RDL then return end
 local frame = CreateFrame("Frame", "RothDevLibEventFrame")
 RDL._eventFrame = frame
 
-local function SafeText(value)
+local MAX_EVENT_ERRORS = 24
+local MAX_INIT_WARNINGS = 24
+
+local function SafeText(value, maximum)
   local util = RDL.Util
+  local text
   if util and type(util.SafeToString) == "function" then
-    local ok, text = pcall(util.SafeToString, util, value)
-    if ok and type(text) == "string" then return text end
+    local ok, rendered = pcall(util.SafeToString, util, value)
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(value) == "string" then
+    text = value
   end
-  return type(value) == "string" and value or "<?>"
+  if type(text) ~= "string" then text = "<?>" end
+  maximum = tonumber(maximum) or 2048
+  if maximum < 1 then maximum = 1 end
+  if #text > maximum then text = text:sub(1, maximum) .. "<truncated>" end
+  return text
+end
+
+local function PushBounded(list, value, maximum)
+  list[#list + 1] = value
+  while #list > maximum do table.remove(list, 1) end
 end
 
 local function SafeRegisterEvent(event)
   local ok, err = pcall(frame.RegisterEvent, frame, event)
-  if ok then return end
-  RDL._eventRegErrors = RDL._eventRegErrors or {}
-  RDL._eventRegErrors[#RDL._eventRegErrors + 1] = {
+  if ok then return true end
+  RDL._eventRegErrors = type(RDL._eventRegErrors) == "table" and RDL._eventRegErrors or {}
+  PushBounded(RDL._eventRegErrors, {
     ts = type(_G.time) == "function" and _G.time() or 0,
-    event = SafeText(event),
-    err = SafeText(err),
-  }
+    event = SafeText(event, 128),
+    err = SafeText(err, 2048),
+  }, MAX_EVENT_ERRORS)
+  return false
 end
 
 local function ICall(name, fn, ...)
@@ -34,6 +50,22 @@ local function ICall(name, fn, ...)
     return RDL.Internal:Call(RDL.addonName, name, fn, ...)
   end
   return pcall(fn, ...)
+end
+
+local function RecordInitWarning(stage, detail)
+  RDL._initWarnings = type(RDL._initWarnings) == "table" and RDL._initWarnings or {}
+  PushBounded(RDL._initWarnings, {
+    ts = type(_G.time) == "function" and _G.time() or 0,
+    stage = SafeText(stage, 128),
+    detail = SafeText(detail, 2048),
+  }, MAX_INIT_WARNINGS)
+end
+
+local function OptionalCall(stage, fn, ...)
+  if type(fn) ~= "function" then return false, "unavailable" end
+  local ok, result = ICall(stage, fn, ...)
+  if not ok then RecordInitWarning(stage, result) end
+  return ok, result
 end
 
 SafeRegisterEvent("ADDON_LOADED")
@@ -49,13 +81,36 @@ SafeRegisterEvent("MACRO_ACTION_FORBIDDEN")
 SafeRegisterEvent("ADDON_RESTRICTION_STATE_CHANGED")
 SafeRegisterEvent("PLAYER_REGEN_ENABLED")
 
+local shutdownDone = false
+
+local function InvalidateChatTap()
+  local capture = RDL.Capture
+  local tap = capture and capture.ChatTap
+  if not tap then return end
+  tap._active = nil
+  tap._timerToken = (tonumber(tap._timerToken) or 0) + 1
+end
+
+local function StopRuntimeConsumers()
+  InvalidateChatTap()
+  local capture = RDL.Capture
+  if capture and capture.BugGrabber and type(capture.BugGrabber.Disable) == "function" then
+    ICall("BugGrabber:Disable", capture.BugGrabber.Disable, capture.BugGrabber)
+  end
+  if RDL.Mem and type(RDL.Mem.StopWatcher) == "function" then
+    ICall("Mem:StopWatcher", RDL.Mem.StopWatcher, RDL.Mem)
+  end
+end
+
 local function FailInitialization(stage, detail)
+  StopRuntimeConsumers()
   RDL._initializing = false
   RDL._initialized = false
+  RDL._initGeneration = (tonumber(RDL._initGeneration) or 0) + 1
   RDL._initFailure = {
     ts = type(_G.time) == "function" and _G.time() or 0,
-    stage = SafeText(stage),
-    detail = SafeText(detail),
+    stage = SafeText(stage, 128),
+    detail = SafeText(detail, 2048),
   }
   if type(RDL.Log) == "function" then
     pcall(RDL.Log, RDL, "ERROR", "BOOT", "RothDevLib initialization failed", RDL._initFailure)
@@ -65,11 +120,12 @@ end
 
 local function InitAll()
   if RDL._initialized then return true end
-  if RDL._initializing then return false end
+  if RDL._initializing or shutdownDone then return false end
   RDL._initializing = true
+  RDL._initWarnings = {}
 
-  -- DB/session readiness is the root invariant. Do not mark the addon initialized
-  -- or start consumers if the authoritative persistence owner failed to start.
+  -- DB/session readiness is the root invariant. Do not start consumers if the
+  -- authoritative persistence owner failed to start.
   local db = RDL.DB
   if not (db and type(db.MarkPlayerReady) == "function" and type(db.Init) == "function") then
     return FailInitialization("DB", "owner-unavailable")
@@ -83,68 +139,82 @@ local function InitAll()
     return FailInitialization("DB:Init", initOK and "not-ready" or ready)
   end
 
-  if RDL.Logger and RDL.Logger.Init then ICall("Logger:Init", RDL.Logger.Init, RDL.Logger) end
-  if RDL.Doctor and RDL.Doctor.Init then ICall("Doctor:Init", RDL.Doctor.Init, RDL.Doctor) end
-  if RDL.Validation and RDL.Validation.Init then
-    ICall("Validation:Init", RDL.Validation.Init, RDL.Validation)
-  end
-  if RDL.Bus and RDL.Bus.Init then ICall("Bus:Init", RDL.Bus.Init, RDL.Bus) end
+  -- Diagnostics helpers are useful but not allowed to strand core capture.
+  if RDL.Logger then OptionalCall("Logger:Init", RDL.Logger.Init, RDL.Logger) end
+  if RDL.Doctor then OptionalCall("Doctor:Init", RDL.Doctor.Init, RDL.Doctor) end
+  if RDL.Validation then OptionalCall("Validation:Init", RDL.Validation.Init, RDL.Validation) end
+  if RDL.Bus then OptionalCall("Bus:Init", RDL.Bus.Init, RDL.Bus) end
 
-  if RDL.Mem and RDL.Mem.StartWatcher then
-    ICall("Mem:StartWatcher", RDL.Mem.StartWatcher, RDL.Mem)
+  -- Capture is the essential runtime service. Missing/throwing capture must not
+  -- produce a false initialized state. Its boolean result describes handler
+  -- ownership, not initialization success, so only call success is required.
+  local capture = RDL.Capture
+  if not (capture and type(capture.Init) == "function") then
+    return FailInitialization("Capture:Init", "owner-unavailable")
   end
-  if RDL.Capture and RDL.Capture.Init then
-    ICall("Capture:Init", RDL.Capture.Init, RDL.Capture)
-  end
-  if RDL.Capture and RDL.Capture.FlushBootQueue then
-    ICall("Capture:FlushBootQueue", RDL.Capture.FlushBootQueue, RDL.Capture)
-  end
-  if RDL.Suppress and RDL.Suppress.SuppressAll then
-    ICall("Suppress:SuppressAll", RDL.Suppress.SuppressAll, RDL.Suppress)
-  end
+  local captureOK, captureResult = ICall("Capture:Init", capture.Init, capture)
+  if not captureOK then return FailInitialization("Capture:Init", captureResult) end
 
-  if RDL.UI and RDL.UI.Init then ICall("UI:Init", RDL.UI.Init, RDL.UI) end
-  if RDL.UI and RDL.UI.UpdateTitle then
-    ICall("UI:UpdateTitle", RDL.UI.UpdateTitle, RDL.UI)
+  if type(capture.FlushBootQueue) ~= "function" then
+    return FailInitialization("Capture:FlushBootQueue", "unavailable")
   end
+  local flushOK, flushResult = ICall("Capture:FlushBootQueue", capture.FlushBootQueue, capture)
+  if not flushOK then return FailInitialization("Capture:FlushBootQueue", flushResult) end
 
-  if RDL.UI and RDL.UI.InitMinimapButton then
-    local timers = _G.C_Timer
-    if type(timers) == "table" and type(timers.After) == "function" then
-      pcall(timers.After, 0.25, function()
-        ICall("UI:InitMinimapButton", RDL.UI.InitMinimapButton, RDL.UI)
-      end)
-    else
-      ICall("UI:InitMinimapButton", RDL.UI.InitMinimapButton, RDL.UI)
-    end
+  if RDL.Suppress then
+    OptionalCall("Suppress:SuppressAll", RDL.Suppress.SuppressAll, RDL.Suppress)
+  end
+  if RDL.UI then
+    OptionalCall("UI:Init", RDL.UI.Init, RDL.UI)
+    OptionalCall("UI:UpdateTitle", RDL.UI.UpdateTitle, RDL.UI)
+  end
+  if RDL.Mem then
+    OptionalCall("Mem:StartWatcher", RDL.Mem.StartWatcher, RDL.Mem)
   end
 
   RDL._initFailure = nil
   RDL._initialized = true
   RDL._initializing = false
+  RDL._initGeneration = (tonumber(RDL._initGeneration) or 0) + 1
+  local generation = RDL._initGeneration
+
+  if RDL.UI and type(RDL.UI.InitMinimapButton) == "function" then
+    local function InitMinimap()
+      if shutdownDone or not RDL._initialized or RDL._initGeneration ~= generation then return end
+      OptionalCall("UI:InitMinimapButton", RDL.UI.InitMinimapButton, RDL.UI)
+    end
+    local timers = _G.C_Timer
+    if type(timers) == "table" and type(timers.After) == "function" then
+      local okTimer, timerError = pcall(timers.After, 0.25, InitMinimap)
+      if not okTimer then
+        RecordInitWarning("UI:InitMinimapButton:timer", timerError)
+        InitMinimap()
+      end
+    else
+      InitMinimap()
+    end
+  end
+
   if type(RDL.Log) == "function" then
-    pcall(RDL.Log, RDL, "INFO", "BOOT", "RothDevLib initialized", { version = RDL.version })
+    pcall(RDL.Log, RDL, "INFO", "BOOT", "RothDevLib initialized", {
+      version = RDL.version,
+      captureOwned = captureResult == true,
+      bootEntriesFlushed = tonumber(flushResult) or 0,
+      warnings = #RDL._initWarnings,
+    })
   end
   return true
 end
 
-local shutdownDone = false
 local function Shutdown(reason)
   if shutdownDone then return false end
   shutdownDone = true
+  RDL._initGeneration = (tonumber(RDL._initGeneration) or 0) + 1
+  RDL._initialized = false
+  RDL._initializing = false
 
-  local capture = RDL.Capture
-  if capture and capture.ChatTap then
-    capture.ChatTap._active = nil
-    capture.ChatTap._timerToken = (tonumber(capture.ChatTap._timerToken) or 0) + 1
-  end
-  if capture and capture.BugGrabber and capture.BugGrabber.Disable then
-    ICall("BugGrabber:Disable", capture.BugGrabber.Disable, capture.BugGrabber)
-  end
-  if RDL.Mem and RDL.Mem.StopWatcher then
-    ICall("Mem:StopWatcher", RDL.Mem.StopWatcher, RDL.Mem)
-  end
-  if RDL.DB and RDL.DB.OnShutdown then
+  StopRuntimeConsumers()
+  if RDL.DB and type(RDL.DB.OnShutdown) == "function" then
     ICall("DB:OnShutdown", RDL.DB.OnShutdown, RDL.DB, reason)
   end
   return true
@@ -169,28 +239,47 @@ local function HandlePersistenceFailure(addonName)
   return false
 end
 
+local FALLBACK_ADDONS = {
+  ["!BugGrabber"] = true,
+  BugGrabber = true,
+  BugSack = true,
+}
+
+local function RefreshLateFallback(addonName)
+  if not RDL._initialized or not FALLBACK_ADDONS[addonName] then return false end
+  local capture = RDL.Capture
+  if not capture or capture.ownsHandler == true
+      or type(capture.InstallFallbackHooks) ~= "function" then
+    return false
+  end
+  local ok, result = ICall("Capture:InstallFallbackHooks",
+    capture.InstallFallbackHooks, capture)
+  if not ok then RecordInitWarning("Capture:InstallFallbackHooks", result) end
+  return ok
+end
+
 frame:SetScript("OnEvent", function(_, event, ...)
   if event == "ADDON_LOADED" then
     local name = ...
     if name == RDL.addonName then
       -- File loading is complete, but player/session state is still deferred.
-      if RDL.Logger and RDL.Logger.Init then
-        ICall("Logger:Init", RDL.Logger.Init, RDL.Logger)
-      end
-      if RDL.Validation and RDL.Validation.Init then
-        ICall("Validation:Init", RDL.Validation.Init, RDL.Validation)
-      end
-      if RDL.Capture and RDL.Capture.EarlyInit then
-        ICall("Capture:EarlyInit", RDL.Capture.EarlyInit, RDL.Capture)
+      if RDL.Logger then OptionalCall("Logger:Init", RDL.Logger.Init, RDL.Logger) end
+      if RDL.Validation then OptionalCall("Validation:Init", RDL.Validation.Init, RDL.Validation) end
+      if RDL.Capture and type(RDL.Capture.EarlyInit) == "function" then
+        local ok, result = ICall("Capture:EarlyInit", RDL.Capture.EarlyInit, RDL.Capture)
+        if not ok then RecordInitWarning("Capture:EarlyInit", result) end
       end
       if RDL.SelfCheckEarly then
-        ICall("RDL:SelfCheckEarly", RDL.SelfCheckEarly, RDL, "ADDON_LOADED")
+        OptionalCall("RDL:SelfCheckEarly", RDL.SelfCheckEarly, RDL, "ADDON_LOADED")
       end
-    elseif name == "Blizzard_DebugTools" or name == "Blizzard_ScriptErrors"
-        or name == "Blizzard_ScriptErrorsFrame" then
-      if RDL.Suppress and RDL.Suppress.SuppressAll then
-        ICall("Suppress:SuppressAll", RDL.Suppress.SuppressAll, RDL.Suppress)
+    else
+      if name == "Blizzard_DebugTools" or name == "Blizzard_ScriptErrors"
+          or name == "Blizzard_ScriptErrorsFrame" then
+        if RDL.Suppress then
+          OptionalCall("Suppress:SuppressAll", RDL.Suppress.SuppressAll, RDL.Suppress)
+        end
       end
+      RefreshLateFallback(name)
     end
     return
   end
@@ -198,10 +287,10 @@ frame:SetScript("OnEvent", function(_, event, ...)
   if event == "PLAYER_LOGIN" then
     if not InitAll() then return end
     if RDL.SelfCheckEarly then
-      ICall("RDL:SelfCheckEarly", RDL.SelfCheckEarly, RDL, "PLAYER_LOGIN")
+      OptionalCall("RDL:SelfCheckEarly", RDL.SelfCheckEarly, RDL, "PLAYER_LOGIN")
     end
-    if RDL.Validation and RDL.Validation.MaybeContinueReloadLoop then
-      ICall("Validation:MaybeContinueReloadLoop",
+    if RDL.Validation then
+      OptionalCall("Validation:MaybeContinueReloadLoop",
         RDL.Validation.MaybeContinueReloadLoop, RDL.Validation)
     end
     return
