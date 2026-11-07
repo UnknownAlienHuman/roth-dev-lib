@@ -1,5 +1,6 @@
 _G.RothDevLib = {}
 local RDL = RothDevLib
+local Unpack = table.unpack or unpack
 
 local secret = setmetatable({}, {
   __tostring = function() error('secret tostring') end,
@@ -89,6 +90,35 @@ assert(RDL._callbacks.EVENT == nil)
 assert(RDL:UnregisterCallback('EVENT', 'missing') == false)
 local stats = RDL:GetCallbackRegistryStats()
 assert(stats.events == 0 and stats.callbacks == 0)
+
+-- The packed callback tuple preserves interior and trailing nil positions.
+local tupleN, tuple1, tuple2, tuple3, tuple4
+assert(RDL:RegisterCallback('TUPLE', 'observer', function(...)
+  tupleN = select('#', ...)
+  tuple1, tuple2, tuple3, tuple4 = ...
+end))
+assert(RDL:Fire('TUPLE', 1, nil, 3, nil) == 1)
+assert(tupleN == 4 and tuple1 == 1 and tuple2 == nil and tuple3 == 3 and tuple4 == nil)
+assert(RDL:UnregisterCallback('TUPLE', 'observer'))
+
+-- The byte ceiling applies to the complete argument tuple, not independently
+-- to every argument.
+local observedCount, observedBytes = 0, 0
+assert(RDL:RegisterCallback('PAYLOAD', 'observer', function(...)
+  observedCount = select('#', ...)
+  for index = 1, observedCount do
+    local value = select(index, ...)
+    if type(value) == 'string' then observedBytes = observedBytes + #value end
+  end
+end))
+local largeArgs = {}
+for index = 1, 32 do largeArgs[index] = string.rep(string.char(64 + (index % 26)), 12000) end
+assert(RDL:Fire('PAYLOAD', Unpack(largeArgs, 1, 32)) == 1)
+stats = RDL:GetCallbackRegistryStats()
+assert(observedCount == 32)
+assert(observedBytes <= stats.maxPayloadBytes + 8192)
+assert(stats.maxPayloadBytes == 64 * 1024)
+assert(RDL:UnregisterCallback('PAYLOAD', 'observer'))
 
 local noop = function() end
 

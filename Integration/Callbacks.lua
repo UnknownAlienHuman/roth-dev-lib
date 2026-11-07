@@ -11,6 +11,7 @@ local MAX_CALLBACK_ARGS = 32
 local MAX_CALLBACK_EVENTS = 128
 local MAX_CALLBACKS_PER_EVENT = 128
 local MAX_CALLBACKS_TOTAL = 512
+local MAX_CALLBACK_PAYLOAD_BYTES = 64 * 1024
 
 local function OrdinaryString(value, maxBytes)
   local guard = RDL.SecretGuard
@@ -64,22 +65,21 @@ local function Drop(registry)
   return false
 end
 
-local function SnapshotValue(value)
+local function SnapshotFallback(value)
   local util = RDL.Util
-  if util and type(util.CopyDiagnosticValue) == "function" then
-    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, {
-      maxDepth = 5,
-      maxEntries = 160,
-      maxNodes = 1000,
-      maxStringBytes = 8192,
-      maxTotalBytes = 256 * 1024,
-    })
-    if ok then return copy end
-  end
-
   if util and type(util.Scrub) == "function" then
     local ok, ordinary = pcall(util.Scrub, util, value)
-    if ok then return ordinary end
+    if ok then
+      local valueType = type(ordinary)
+      if valueType == "string" then
+        if #ordinary > 8192 then return ordinary:sub(1, 8192) .. "<truncated>" end
+        return ordinary
+      end
+      if ordinary == nil or valueType == "number" or valueType == "boolean" then
+        return ordinary
+      end
+      return "<" .. valueType .. ">"
+    end
   end
   return "<unavailable>"
 end
@@ -88,10 +88,29 @@ local function SnapshotArgs(...)
   local count = select("#", ...)
   if count > MAX_CALLBACK_ARGS then count = MAX_CALLBACK_ARGS end
 
-  local args = { n = count }
-  for index = 1, count do
-    args[index] = SnapshotValue(select(index, ...))
+  -- Copy the complete argument tuple through one budget. A per-argument budget
+  -- lets 32 independently large values multiply retained allocation before a
+  -- callback even begins.
+  local source = { n = count }
+  for index = 1, count do source[index] = select(index, ...) end
+
+  local util = RDL.Util
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, source, {
+      maxDepth = 6,
+      maxEntries = 256,
+      maxNodes = 1500,
+      maxStringBytes = 8192,
+      maxTotalBytes = MAX_CALLBACK_PAYLOAD_BYTES,
+    })
+    if ok and type(copy) == "table" then
+      copy.n = count
+      return copy
+    end
   end
+
+  local args = { n = count }
+  for index = 1, count do args[index] = SnapshotFallback(select(index, ...)) end
   return args
 end
 
@@ -227,6 +246,7 @@ function RDL:GetCallbackRegistryStats()
     callbacks = registry.total,
     maxCallbacks = MAX_CALLBACKS_TOTAL,
     maxPerEvent = MAX_CALLBACKS_PER_EVENT,
+    maxPayloadBytes = MAX_CALLBACK_PAYLOAD_BYTES,
     dropped = registry.dropped,
   }
 end
