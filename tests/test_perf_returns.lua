@@ -42,4 +42,42 @@ local memWrapped = table.pack(RDL.Mem:Wrap('Addon', 'many', ManyReturns, {})())
 assert(memWrapped.n == 8 and memWrapped[8] == 8)
 assert(pcall(RDL.Mem.Measure, RDL.Mem, 'Addon', 'boom', function() error('boom') end, {}) == false)
 
+-- Direct profiler calls must not execute hostile __tostring metamethods when
+-- producing diagnostic identities.
+local hostile = setmetatable({}, {
+  __tostring = function() error('hostile tostring') end,
+})
+assert(pcall(RDL.CPU.Measure, RDL.CPU, hostile, hostile, function() return true end, {}) == true)
+assert(pcall(RDL.Mem.Measure, RDL.Mem, hostile, hostile, function() return true end, {}) == true)
+assert(pcall(RDL.Mem.Sample, RDL.Mem, hostile, hostile, {}) == true)
+
+-- Dynamic labels cannot grow long-lived telemetry maps without a hard bound.
+for index = 1, 1100 do
+  RDL.CPU:Measure('Addon', 'cpu-' .. index, function() return index end, {})
+  RDL.Mem:Measure('Addon', 'mem-' .. index, function() return index end, {})
+  RDL.Mem:Sample('Addon', 'sample-' .. index, {})
+end
+
+local cpuRegistry = RDL.CPU:GetRegistryStats()
+assert(cpuRegistry.keys == cpuRegistry.maximum and cpuRegistry.maximum == 1024)
+assert(cpuRegistry.dropped > 0)
+local cpuCount = 0
+for _ in pairs(RDL.CPU:GetStats()) do cpuCount = cpuCount + 1 end
+assert(cpuCount == cpuRegistry.maximum)
+
+local memRegistry = RDL.Mem:GetRegistryStats()
+assert(memRegistry.stats == memRegistry.maxStats and memRegistry.maxStats == 1024)
+assert(memRegistry.samples == memRegistry.maxSamples and memRegistry.maxSamples == 1024)
+assert(memRegistry.droppedStats > 0 and memRegistry.droppedSamples > 0)
+local memCount, sampleCount = 0, 0
+for _ in pairs(RDL.Mem:GetStats()) do memCount = memCount + 1 end
+for _ in pairs(RDL.Mem._lastSample) do sampleCount = sampleCount + 1 end
+assert(memCount == memRegistry.maxStats and sampleCount == memRegistry.maxSamples)
+
+RDL.CPU:ResetStats()
+RDL.Mem:ResetStats()
+assert(RDL.CPU:GetRegistryStats().keys == 0)
+local resetMem = RDL.Mem:GetRegistryStats()
+assert(resetMem.stats == 0 and resetMem.samples == 0)
+
 print('performance return-tuple tests: ok')

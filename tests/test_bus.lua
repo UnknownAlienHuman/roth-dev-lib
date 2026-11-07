@@ -28,11 +28,38 @@ assert(a.max == 10) -- minimum clamp
 for i = 13, 15 do B:Breadcrumb('Test', 'event', 'm' .. i) end
 snap = B:GetBreadcrumbSnapshot('Test', 3)
 assert(#snap == 3 and snap[1].msg == 'm15')
-B:Metric('Test', 'fps', 60, 'hz', { metricMinInterval = 0 })
+assert(B:Metric('Test', 'fps', 60, 'hz', { metricMinInterval = 0 }) == true)
 assert(B:GetAddonStats('Test').size == 10)
 local throttled = B:RegisterAddon('Throttle', { maxBreadcrumbs = 20 })
-B:Metric('Throttle', 'fps', 60, 'hz', { minInterval = 100 })
+assert(B:Metric('Throttle', 'fps', 60, 'hz', { minInterval = 100 }) == true)
 local head = throttled.head
-B:Metric('Throttle', 'fps', 61, 'hz', { minInterval = 100 })
+assert(B:Metric('Throttle', 'fps', 61, 'hz', { minInterval = 100 }) == false)
 assert(throttled.head == head)
+
+-- Dynamic metric names are public diagnostic input and must not create an
+-- unbounded throttle registry.
+for index = 1, 2100 do
+  B:Metric('Test', 'dynamic-' .. index, index, 'n', { minInterval = 0 })
+end
+local registry = B:GetRegistryStats()
+assert(registry.metrics == registry.maxMetrics and registry.maxMetrics == 2048)
+assert(registry.droppedMetrics > 0)
+local metricCount = 0
+for _ in pairs(B._metrics) do metricCount = metricCount + 1 end
+assert(metricCount == registry.maxMetrics)
+
+-- Spoofed addon identities are bounded too; real installed-addon counts are far
+-- below this ceiling, while an integration bug cannot grow the registry forever.
+for index = 1, 600 do B:RegisterAddon('DynamicAddon' .. index) end
+registry = B:GetRegistryStats()
+assert(registry.addons == registry.maxAddons and registry.maxAddons == 512)
+assert(registry.droppedAddons > 0)
+assert(B:RegisterAddon('OverflowAddon') == nil)
+assert(B:Metric('OverflowAddon', 'x', 1, 'n', { minInterval = 0 }) == false)
+
+B:ResetAll()
+registry = B:GetRegistryStats()
+assert(registry.metrics == 0 and registry.droppedMetrics == 0)
+assert(registry.addons == 512)
+
 print('bus tests: ok')

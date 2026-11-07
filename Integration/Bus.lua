@@ -5,8 +5,15 @@ local RDL = _G.RothDevLib
 local Bus = {}
 RDL.Bus = Bus
 
+local MAX_ADDONS = 512
+local MAX_METRIC_KEYS = 2048
+
 Bus._addons = Bus._addons or {}
 Bus._metrics = Bus._metrics or {}
+Bus._addonCount = 0
+Bus._metricCount = 0
+Bus._droppedAddons = 0
+Bus._droppedMetrics = 0
 
 local function NowSec()
   return time()
@@ -21,6 +28,13 @@ local function Clamp(value, minimum, maximum)
   if value < minimum then return minimum end
   if value > maximum then return maximum end
   return value
+end
+
+local function CountKeys(value)
+  if type(value) ~= "table" then return 0 end
+  local count = 0
+  for _ in next, value do count = count + 1 end
+  return count
 end
 
 local function IsOrdinary(value)
@@ -149,6 +163,11 @@ local function EnsureAddon(self, addonName, opts)
   end
 
   if not addon then
+    if (tonumber(self._addonCount) or 0) >= MAX_ADDONS then
+      self._droppedAddons = (tonumber(self._droppedAddons) or 0) + 1
+      return nil
+    end
+
     addon = {
       name = addonName,
       opts = normalizedOpts or {},
@@ -158,6 +177,7 @@ local function EnsureAddon(self, addonName, opts)
       ring = {},
     }
     self._addons[addonName] = addon
+    self._addonCount = (tonumber(self._addonCount) or 0) + 1
   else
     addon.name = addonName
     addon.opts = normalizedOpts or addon.opts or {}
@@ -170,8 +190,12 @@ local function EnsureAddon(self, addonName, opts)
 end
 
 function Bus:Init()
-  self._addons = self._addons or {}
-  self._metrics = self._metrics or {}
+  self._addons = type(self._addons) == "table" and self._addons or {}
+  self._metrics = type(self._metrics) == "table" and self._metrics or {}
+  self._addonCount = CountKeys(self._addons)
+  self._metricCount = CountKeys(self._metrics)
+  self._droppedAddons = tonumber(self._droppedAddons) or 0
+  self._droppedMetrics = tonumber(self._droppedMetrics) or 0
 end
 
 function Bus:RegisterAddon(addonName, opts)
@@ -180,7 +204,7 @@ end
 
 function Bus:Breadcrumb(addonName, category, message, data)
   local addon = EnsureAddon(self, addonName)
-  if not addon then return end
+  if not addon then return false end
 
   local U = RDL.Util
   local categoryText = U and U.SafeToString and U:SafeToString(category) or "<category>"
@@ -218,16 +242,17 @@ function Bus:Breadcrumb(addonName, category, message, data)
     msg = messageText,
     data = payload,
   })
+  return true
 end
 
 function Bus:Metric(addonName, name, value, unit, opts)
   local addon = EnsureAddon(self, addonName)
-  if not addon then return end
+  if not addon then return false end
 
-  if not IsOrdinary(name) then return end
+  if not IsOrdinary(name) then return false end
   local U = RDL.Util
   local metricName = U and U.SafeToString and U:SafeToString(name) or nil
-  if not metricName or metricName == "" then return end
+  if not metricName or metricName == "" then return false end
   metricName = metricName:sub(1, 160)
 
   local settings = RDL.DB and RDL.DB.GetSettings and RDL.DB:GetSettings() or nil
@@ -242,10 +267,19 @@ function Bus:Metric(addonName, name, value, unit, opts)
   local key = addon.name .. "\031" .. metricName
   local now = NowClock()
   local last = self._metrics[key]
-  if last and (now - last) < minInterval then return end
+  if last and (now - last) < minInterval then return false end
+
+  if last == nil then
+    if (tonumber(self._metricCount) or 0) >= MAX_METRIC_KEYS then
+      self._droppedMetrics = (tonumber(self._droppedMetrics) or 0) + 1
+      return false
+    end
+    self._metricCount = (tonumber(self._metricCount) or 0) + 1
+  end
   self._metrics[key] = now
 
   self:Breadcrumb(addon.name, "metric", metricName, { value = value, unit = unit })
+  return true
 end
 
 function Bus:GetBreadcrumbSnapshot(addonName, count)
@@ -282,7 +316,7 @@ function Bus:Alert(addonName, code, message, data, level)
   local U = RDL.Util
   local codeText = U and U.SafeToString and U:SafeToString(code) or "alert"
   if codeText == "nil" or codeText == "" then codeText = "alert" end
-  self:Breadcrumb(addonName, "alert", codeText, {
+  return self:Breadcrumb(addonName, "alert", codeText, {
     message = message,
     level = level,
     data = data,
@@ -314,6 +348,17 @@ function Bus:GetAddonStats(addonName)
   }
 end
 
+function Bus:GetRegistryStats()
+  return {
+    addons = tonumber(self._addonCount) or 0,
+    maxAddons = MAX_ADDONS,
+    metrics = tonumber(self._metricCount) or 0,
+    maxMetrics = MAX_METRIC_KEYS,
+    droppedAddons = tonumber(self._droppedAddons) or 0,
+    droppedMetrics = tonumber(self._droppedMetrics) or 0,
+  }
+end
+
 function Bus:ResetAll()
   if self._addons then
     for _, addon in pairs(self._addons) do
@@ -323,4 +368,6 @@ function Bus:ResetAll()
     end
   end
   if self._metrics then wipe(self._metrics) end
+  self._metricCount = 0
+  self._droppedMetrics = 0
 end
