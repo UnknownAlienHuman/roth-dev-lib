@@ -1,0 +1,23 @@
+name: Export audit source
+
+on:
+  push:
+    branches:
+      - gpt/roth-dev-lib-audit-export-20261107
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roth-dev-lib-source
+          path: |
+            .
+            !.git
+          include-hidden-files: true
+          retention-days: 1
