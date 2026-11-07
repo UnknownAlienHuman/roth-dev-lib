@@ -1,6 +1,6 @@
 -- !RothDevLib/Core/DBLifecycle.lua
 -- Separates early SavedVariables availability from player-session readiness,
--- bounds persisted diagnostics, and owns persistence-failure recovery.
+-- bounds every persisted diagnostic root, and owns persistence-failure recovery.
 
 local RDL = _G.RothDevLib
 local DB = RDL and RDL.DB
@@ -15,6 +15,7 @@ DB._playerReady = false
 DB._writesSuspended = false
 
 local SCHEMA = 5
+local GROUP_SIGNATURE_BYTES = 4096
 local GROUP_MESSAGE_BYTES = 16 * 1024
 local GROUP_STACK_BYTES = 64 * 1024
 local OCCURRENCE_MESSAGE_BYTES = 4096
@@ -23,9 +24,110 @@ local FAILURE_MAX_GROUPS = 20
 local FAILURE_MAX_SESSIONS = 10
 local FAILURE_MESSAGE_BYTES = 4096
 local FAILURE_STACK_BYTES = 16 * 1024
+local MAX_SESSIONS = 50
+
+local ROOT_FIELDS = {
+  _schema = true,
+  settings = true,
+  sessions = true,
+  sessionIndex = true,
+  ignore = true,
+  groups = true,
+  persistence = true,
+}
+
+local SETTING_FIELDS = {
+  maxGroups = true,
+  maxOccurrencesPerGroup = true,
+  forwardToDefaultErrorHandler = true,
+  errorHandlerMode = true,
+  chainCallPrevHandler = true,
+  maintainOwnership = true,
+  maintainOwnershipIntervalSec = true,
+  lockErrorHandler = true,
+  hideTaintPopups = true,
+  hideBlizzardScriptErrors = true,
+  minimap = true,
+  minimapHide = true,
+  minimapAngle = true,
+  chatNotifyOnError = true,
+  chatNotifyThrottleSec = true,
+  captureChatErrors = true,
+  chatTapWindowSec = true,
+  chatTapMaxStackLines = true,
+  chatTapHookAllFrames = true,
+  chatTapStripColors = true,
+  chatTapDedupSec = true,
+  chatTapDedupMax = true,
+  fallbackHookScriptErrors = true,
+  scriptErrorsFrameSyncPollSec = true,
+  scriptErrorsFrameImportMaxPerPoll = true,
+  importBugGrabber = true,
+  importBugGrabberHistory = true,
+  bugGrabberPollSec = true,
+  bugGrabberImportMaxPerPoll = true,
+  bugGrabberScanMax = true,
+  openOnErrorOutOfCombat = true,
+  includeBreadcrumbsInErrors = true,
+  breadcrumbsPerError = true,
+  maxBreadcrumbsPerAddon = true,
+  uiRefreshThrottleSec = true,
+  metricMinInterval = true,
+  minimapForceShowOnNextLogin = true,
+  stormErrorsPerSec = true,
+  stormWarningsPerSec = true,
+  maxLocalsSize = true,
+  captureLocals = true,
+  localsProbeMax = true,
+  localsProbeCache = true,
+  localsProbesPerSec = true,
+  enablePerfProfiling = true,
+  cpuSampleRate = true,
+  cpuSpikeMs = true,
+  cpuAlertMinIntervalMs = true,
+  memSpikeKB = true,
+  memAlertMinIntervalMs = true,
+  memWatchEnabled = true,
+  memWatchIntervalSec = true,
+  memWatchSpikeKB = true,
+  monitorRefreshSec = true,
+  monitorTopN = true,
+  monitorMinSamples = true,
+  uiFrames = true,
+  uiPanes = true,
+  uiUseScrollBoxList = true,
+  uiGroupGridCols = true,
+  uiUseButtonFrameShell = true,
+  _validationPassLog = true,
+  _reloadLoop = true,
+}
+
+local SESSION_FIELDS = {
+  id = true,
+  started = true,
+  ended = true,
+  build = true,
+  character = true,
+  class = true,
+  spec = true,
+  errors = true,
+  warnings = true,
+  taints = true,
+  suppressed = true,
+  alerts = true,
+  asserts = true,
+  throttledCount = true,
+}
+
+local SESSION_COUNTERS = {
+  "errors", "warnings", "taints", "suppressed",
+  "alerts", "asserts", "throttledCount",
+}
 
 local function Now()
-  return type(_G.time) == "function" and _G.time() or 0
+  if type(_G.time) ~= "function" then return 0 end
+  local ok, value = pcall(_G.time)
+  return ok and type(value) == "number" and value or 0
 end
 
 local function FiniteNumber(value)
@@ -37,6 +139,28 @@ local function TruncateString(value, maximum, fallback)
   if type(value) ~= "string" then return fallback end
   if #value <= maximum then return value end
   return value:sub(1, maximum) .. "<truncated>"
+end
+
+local function CompactDiagnostic(value, options)
+  if value == nil then return nil end
+  local util = RDL.Util
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, options)
+    if ok then return copy end
+  end
+
+  local valueType = type(value)
+  if valueType == "string" then
+    return TruncateString(value, options.maxStringBytes or 4096, "")
+  end
+  if valueType == "number" then return FiniteNumber(value) and value or nil end
+  if valueType == "boolean" then return value end
+  return "<diagnostic omitted>"
+end
+
+local function CompactTable(value, options)
+  local copy = CompactDiagnostic(value, options)
+  return type(copy) == "table" and copy or {}
 end
 
 local function ClampNumber(settings, key, default, minimum, maximum, integer)
@@ -52,8 +176,16 @@ local function NormalizeBoolean(settings, key, default)
   if type(settings[key]) ~= "boolean" then settings[key] = default end
 end
 
+local function DropUnknownFields(value, allowed)
+  if type(value) ~= "table" then return end
+  for key in pairs(value) do
+    if not allowed[key] then value[key] = nil end
+  end
+end
+
 local function NormalizeSettings(settings)
   if type(settings) ~= "table" then return end
+  DropUnknownFields(settings, SETTING_FIELDS)
 
   ClampNumber(settings, "maxGroups", 200, 10, 5000, true)
   ClampNumber(settings, "maxOccurrencesPerGroup", 10, 1, 100, true)
@@ -83,6 +215,10 @@ local function NormalizeSettings(settings)
   ClampNumber(settings, "memWatchSpikeKB", 256, 1, 1024 * 1024, false)
   ClampNumber(settings, "monitorRefreshSec", 1, 0.1, 60, false)
   ClampNumber(settings, "monitorTopN", 20, 1, 200, true)
+  ClampNumber(settings, "monitorMinSamples", 1, 1, 1000000, true)
+  ClampNumber(settings, "maintainOwnershipIntervalSec", 4, 0.25, 60, false)
+  ClampNumber(settings, "scriptErrorsFrameSyncPollSec", 1, 0.25, 60, false)
+  ClampNumber(settings, "scriptErrorsFrameImportMaxPerPoll", 60, 1, 1000, true)
 
   NormalizeBoolean(settings, "chainCallPrevHandler", true)
   NormalizeBoolean(settings, "importBugGrabber", true)
@@ -96,8 +232,13 @@ local function NormalizeSettings(settings)
   NormalizeBoolean(settings, "chatNotifyOnError", true)
   NormalizeBoolean(settings, "includeBreadcrumbsInErrors", true)
   NormalizeBoolean(settings, "captureLocals", true)
+  NormalizeBoolean(settings, "localsProbeCache", true)
   NormalizeBoolean(settings, "enablePerfProfiling", true)
   NormalizeBoolean(settings, "memWatchEnabled", false)
+  NormalizeBoolean(settings, "openOnErrorOutOfCombat", false)
+  NormalizeBoolean(settings, "minimapForceShowOnNextLogin", true)
+  NormalizeBoolean(settings, "uiUseScrollBoxList", true)
+  NormalizeBoolean(settings, "uiUseButtonFrameShell", true)
 
   -- Compatibility-first capture policy. Old persisted values must not revive
   -- handler wars or global setter replacement.
@@ -107,14 +248,34 @@ local function NormalizeSettings(settings)
   settings.lockErrorHandler = false
   settings.fallbackHookScriptErrors = false
 
-  if type(settings.minimap) ~= "table" then settings.minimap = {} end
-  NormalizeBoolean(settings.minimap, "hide", false)
-  ClampNumber(settings.minimap, "minimapPos", 225, 0, 360, false)
+  local minimap = type(settings.minimap) == "table" and settings.minimap or {}
+  NormalizeBoolean(minimap, "hide", false)
+  ClampNumber(minimap, "minimapPos", 225, 0, 360, false)
+  settings.minimap = { hide = minimap.hide, minimapPos = minimap.minimapPos }
   settings.minimapHide = settings.minimap.hide
   settings.minimapAngle = settings.minimap.minimapPos
 
-  if type(settings.uiFrames) ~= "table" then settings.uiFrames = {} end
-  if type(settings.uiPanes) ~= "table" then settings.uiPanes = {} end
+  settings.uiFrames = CompactTable(settings.uiFrames, {
+    maxDepth = 3, maxEntries = 64, maxNodes = 300,
+    maxStringBytes = 256, maxTotalBytes = 32 * 1024,
+  })
+  settings.uiPanes = CompactTable(settings.uiPanes, {
+    maxDepth = 3, maxEntries = 128, maxNodes = 500,
+    maxStringBytes = 256, maxTotalBytes = 32 * 1024,
+  })
+  settings.uiGroupGridCols = CompactTable(settings.uiGroupGridCols, {
+    maxDepth = 2, maxEntries = 16, maxNodes = 32,
+    maxStringBytes = 64, maxTotalBytes = 4096,
+  })
+  settings._validationPassLog = CompactTable(settings._validationPassLog, {
+    maxDepth = 4, maxEntries = 80, maxNodes = 300,
+    maxStringBytes = 512, maxTotalBytes = 16 * 1024,
+  })
+  local reloadLoop = CompactDiagnostic(settings._reloadLoop, {
+    maxDepth = 2, maxEntries = 8, maxNodes = 16,
+    maxStringBytes = 64, maxTotalBytes = 2048,
+  })
+  settings._reloadLoop = type(reloadLoop) == "table" and reloadLoop or nil
 end
 
 local function CompactOrigin(value)
@@ -134,7 +295,7 @@ local function CompactOccurrence(entry)
     kind = TruncateString(entry.kind, 64, "INTEGRATION"),
     addon = TruncateString(entry.addon, 128, "<?>"),
     func = TruncateString(entry.func, 512, "<?>"),
-    sig = TruncateString(entry.sig, 4096, nil),
+    sig = TruncateString(entry.sig, GROUP_SIGNATURE_BYTES, nil),
     message = TruncateString(entry.message, OCCURRENCE_MESSAGE_BYTES,
       "<invalid persisted message>"),
     stack = TruncateString(entry.stack, OCCURRENCE_STACK_BYTES, ""),
@@ -149,19 +310,35 @@ local function NormalizeGroupFields(group, settings)
   group.count = math.floor(group.count)
   if not FiniteNumber(group.firstSeen) then group.firstSeen = 0 end
   if not FiniteNumber(group.lastSeen) then group.lastSeen = group.firstSeen end
+  group.firstSessionId = FiniteNumber(group.firstSessionId) and math.floor(group.firstSessionId) or nil
+  group.lastSessionId = FiniteNumber(group.lastSessionId) and math.floor(group.lastSessionId) or nil
   group.kind = TruncateString(group.kind, 64, "INTEGRATION")
   group.addon = TruncateString(group.addon, 128, "<?>")
   group.func = TruncateString(group.func, 512, "<?>")
   group.message = TruncateString(group.message, GROUP_MESSAGE_BYTES,
     "<invalid persisted message>")
   group.stack = TruncateString(group.stack, GROUP_STACK_BYTES, "")
+
   local localsMaximum = type(settings) == "table" and settings.maxLocalsSize or 8192
   if type(group.locals) == "string" then
     group.locals = TruncateString(group.locals, localsMaximum, nil)
   elseif group.locals ~= nil then
     group.locals = "<structured locals omitted from persistence>"
   end
+
   group.origin = CompactOrigin(group.origin)
+  group.sys = CompactDiagnostic(group.sys, {
+    maxDepth = 4, maxEntries = 80, maxNodes = 500,
+    maxStringBytes = 4096, maxTotalBytes = 64 * 1024,
+  })
+  group.ctx = CompactDiagnostic(group.ctx, {
+    maxDepth = 5, maxEntries = 120, maxNodes = 800,
+    maxStringBytes = 4096, maxTotalBytes = 96 * 1024,
+  })
+  group.bus = CompactDiagnostic(group.bus, {
+    maxDepth = 5, maxEntries = 160, maxNodes = 1000,
+    maxStringBytes = 8192, maxTotalBytes = 128 * 1024,
+  })
   group.pinned = group.pinned == true
   group.ignored = group.ignored == true
 end
@@ -175,10 +352,11 @@ local function NormalizeGroups(db)
 
   local maximumOccurrences = db.settings.maxOccurrencesPerGroup
   for signature, group in pairs(groups) do
-    if type(signature) ~= "string" or signature == "" or type(group) ~= "table" then
+    if type(signature) ~= "string" or signature == "" or #signature > GROUP_SIGNATURE_BYTES
+        or type(group) ~= "table" then
       groups[signature] = nil
     else
-      group.sig = TruncateString(signature, 4096, signature)
+      group.sig = signature
       NormalizeGroupFields(group, db.settings)
 
       local source = type(group.occurrences) == "table" and group.occurrences or {}
@@ -202,8 +380,6 @@ local function NormalizeGroups(db)
     }
   end
   table.sort(candidates, function(a, b)
-    -- Preserve pinned groups before ordinary groups, but never let pinning turn
-    -- the persistence limit into an unbounded store.
     if a.pinned ~= b.pinned then return a.pinned == false end
     if a.lastSeen == b.lastSeen then return a.signature < b.signature end
     return a.lastSeen < b.lastSeen
@@ -214,23 +390,40 @@ local function NormalizeGroups(db)
   end
 end
 
+local function NormalizeSession(session)
+  if type(session) ~= "table" or not FiniteNumber(session.id) then return nil end
+  session.id = math.floor(session.id)
+  if session.id < 0 then return nil end
+
+  DropUnknownFields(session, SESSION_FIELDS)
+  session.started = FiniteNumber(session.started) and session.started or 0
+  session.ended = FiniteNumber(session.ended) and session.ended or nil
+  if type(session.build) == "string" then
+    session.build = TruncateString(session.build, 64, nil)
+  elseif not FiniteNumber(session.build) then
+    session.build = nil
+  end
+  session.character = TruncateString(session.character, 256, "?")
+  session.class = TruncateString(session.class, 64, nil)
+  session.spec = TruncateString(session.spec, 128, nil)
+
+  for index = 1, #SESSION_COUNTERS do
+    local key = SESSION_COUNTERS[index]
+    local value = session[key]
+    if not FiniteNumber(value) or value < 0 then value = 0 end
+    session[key] = math.floor(value)
+  end
+  return session
+end
+
 local function NormalizeSessions(db)
   if type(db.sessions) ~= "table" then db.sessions = {} end
   local sessions, validIds = {}, {}
-  for index = 1, math.min(#db.sessions, 50) do
-    local session = db.sessions[index]
-    if type(session) == "table" and FiniteNumber(session.id) then
-      session.id = math.floor(session.id)
-      if session.id >= 0 and not validIds[session.id] then
-        local counters = { "errors", "warnings", "taints", "suppressed", "alerts", "asserts", "throttledCount" }
-        for counterIndex = 1, #counters do
-          local key = counters[counterIndex]
-          if not FiniteNumber(session[key]) or session[key] < 0 then session[key] = 0 end
-          session[key] = math.floor(session[key])
-        end
-        sessions[#sessions + 1] = session
-        validIds[session.id] = true
-      end
+  for index = 1, math.min(#db.sessions, MAX_SESSIONS) do
+    local session = NormalizeSession(db.sessions[index])
+    if session and not validIds[session.id] then
+      sessions[#sessions + 1] = session
+      validIds[session.id] = true
     end
   end
   db.sessions = sessions
@@ -244,6 +437,7 @@ local function NormalizeSessions(db)
       local records = {}
       for signature, record in pairs(source) do
         if signature ~= "__meta" and type(signature) == "string"
+            and #signature <= GROUP_SIGNATURE_BYTES
             and type(record) == "table" and type(db.groups[signature]) == "table" then
           local count = FiniteNumber(record.count) and math.max(0, math.floor(record.count)) or 0
           records[#records + 1] = {
@@ -252,8 +446,8 @@ local function NormalizeSessions(db)
               count = count,
               firstSeen = FiniteNumber(record.firstSeen) and record.firstSeen or 0,
               lastSeen = FiniteNumber(record.lastSeen) and record.lastSeen or 0,
-              kind = type(record.kind) == "string" and record.kind or db.groups[signature].kind,
-              addon = type(record.addon) == "string" and record.addon or db.groups[signature].addon,
+              kind = TruncateString(record.kind, 64, db.groups[signature].kind),
+              addon = TruncateString(record.addon, 128, db.groups[signature].addon),
             },
           }
         end
@@ -273,9 +467,25 @@ local function NormalizeSessions(db)
   db.sessionIndex = normalizedIndex
 end
 
+local function NormalizePersistence(value)
+  if type(value) ~= "table" then return nil end
+  return {
+    event = TruncateString(value.event, 64, nil),
+    lastFailureAt = FiniteNumber(value.lastFailureAt) and value.lastFailureAt or nil,
+    recovery = TruncateString(value.recovery, 64, nil),
+    writesSuspendedForSession = value.writesSuspendedForSession == true,
+  }
+end
+
+local function NormalizeRoot(db)
+  DropUnknownFields(db, ROOT_FIELDS)
+  db.persistence = NormalizePersistence(db.persistence)
+end
+
 local function PrepareRawDatabase()
   if type(_G.RothDevLibDB) ~= "table" then _G.RothDevLibDB = {} end
   local db = _G.RothDevLibDB
+  NormalizeRoot(db)
   if type(db.settings) ~= "table" then db.settings = {} end
   if type(db.groups) ~= "table" then db.groups = {} end
   if type(db.sessions) ~= "table" then db.sessions = {} end
@@ -284,8 +494,6 @@ local function PrepareRawDatabase()
   if type(db.ignore.sig) ~= "table" then db.ignore.sig = {} end
   if type(db.ignore.addon) ~= "table" then db.ignore.addon = {} end
 
-  -- Bound persisted work before the legacy owner scans sessions or merges
-  -- defaults. This remains player-independent and does not create a session.
   NormalizeSettings(db.settings)
   NormalizeGroups(db)
   NormalizeSessions(db)
@@ -296,6 +504,7 @@ local function NormalizeDatabase(self)
   local db = self.raw
   if type(db) ~= "table" then return false end
   if self._normalizedRoot == db then return true end
+  NormalizeRoot(db)
   if type(db.settings) ~= "table" then db.settings = {} end
   NormalizeSettings(db.settings)
   NormalizeGroups(db)
@@ -314,12 +523,15 @@ local function HardTrimRuntimeGroups(self)
 
   local candidates = {}
   for signature, group in pairs(db.groups) do
-    if type(signature) == "string" and type(group) == "table" then
+    if type(signature) == "string" and #signature <= GROUP_SIGNATURE_BYTES
+        and type(group) == "table" then
       candidates[#candidates + 1] = {
         signature = signature,
         pinned = group.pinned == true,
         lastSeen = FiniteNumber(group.lastSeen) and group.lastSeen or 0,
       }
+    else
+      db.groups[signature] = nil
     end
   end
   if #candidates <= maximum then return end
@@ -346,6 +558,7 @@ end
 
 local function EmergencyCompact(db)
   if type(db) ~= "table" then return false end
+  NormalizeRoot(db)
   if type(db.settings) ~= "table" then db.settings = {} end
   if type(db.groups) ~= "table" then db.groups = {} end
   if type(db.sessions) ~= "table" then db.sessions = {} end
@@ -359,7 +572,8 @@ local function EmergencyCompact(db)
 
   local candidates = {}
   for signature, group in pairs(db.groups) do
-    if type(signature) == "string" and type(group) == "table" then
+    if type(signature) == "string" and #signature <= GROUP_SIGNATURE_BYTES
+        and type(group) == "table" then
       candidates[#candidates + 1] = {
         signature = signature,
         pinned = group.pinned == true,
@@ -455,19 +669,22 @@ end
 -- to the first real player session only when they are finally committed.
 function DB:UpsertGroup(entry)
   if self._writesSuspended then return nil end
-  if type(entry) == "table" and entry.sessionId == nil and self.sessionId ~= nil then
-    entry.sessionId = self.sessionId
+  if type(entry) ~= "table" or type(entry.sig) ~= "string"
+      or entry.sig == "" or #entry.sig > GROUP_SIGNATURE_BYTES then
+    return nil
   end
+  if entry.sessionId == nil and self.sessionId ~= nil then entry.sessionId = self.sessionId end
+
   local group = OriginalUpsertGroup(self, entry)
   if type(group) == "table" then
+    group.sig = entry.sig
     NormalizeGroupFields(group, self.raw and self.raw.settings)
     if type(group.occurrences) == "table" then
       group.occurrences[1] = CompactOccurrence(entry)
     end
   end
   HardTrimRuntimeGroups(self)
-  if type(entry) == "table" and type(entry.sig) == "string"
-      and type(self.raw) == "table" and type(self.raw.groups) == "table" then
+  if type(self.raw) == "table" and type(self.raw.groups) == "table" then
     return self.raw.groups[entry.sig]
   end
   return group
@@ -480,6 +697,7 @@ if type(OriginalClear) == "function" then
     self._persistenceFailureNotified = nil
     local db = type(self.raw) == "table" and self.raw or _G.RothDevLibDB
     if type(db) == "table" then db.persistence = nil end
+    self._normalizedRoot = nil
     return OriginalClear(self)
   end
 end
