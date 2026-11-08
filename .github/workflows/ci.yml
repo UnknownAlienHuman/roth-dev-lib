@@ -35,3 +35,13 @@ jobs:
             texluac -p "$file"
           done < <(find Capture Core Doctor Export Integration Perf UI Util \
             -type f -name '*.lua' -print0)
+
+      - name: Pack audited source
+        run: git archive --format=zip -o roth-dev-lib-source.zip HEAD
+
+      - name: Upload audited source
+        uses: actions/upload-artifact@v4
+        with:
+          name: roth-dev-lib-source-${{ github.sha }}
+          path: roth-dev-lib-source.zip
+          retention-days: 1
