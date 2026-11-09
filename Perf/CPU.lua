@@ -124,6 +124,19 @@ local function Identity(addonName, funcName)
   return addon, func, addon .. ":" .. func
 end
 
+local function SnapshotOptions(opts)
+  local output = {}
+  local function CopyNumber(key, minimum, maximum)
+    local value = SafeNumber(Option(opts, key), nil)
+    if value ~= nil then output[key] = Clamp(value, minimum, maximum) end
+  end
+  CopyNumber("sampleRate", 0, 1)
+  CopyNumber("metricMinInterval", 0, 3600)
+  CopyNumber("spikeMs", 1, 5000)
+  CopyNumber("alertMinIntervalMs", 0, 600000)
+  return next(output) and output or nil
+end
+
 local function ShouldSample(opts, settings)
   local configured = Option(opts, "sampleRate")
   if configured == nil and type(settings) == "table" then
@@ -235,8 +248,10 @@ end
 
 function CPU:Wrap(addonName, funcName, fn, opts)
   if not IsCallable(fn) then return nil end
+  local addon, func = Identity(addonName, funcName)
+  local options = SnapshotOptions(opts)
   return function(...)
-    return CPU:Measure(addonName, funcName, fn, opts, ...)
+    return CPU:Measure(addon, func, fn, options, ...)
   end
 end
 

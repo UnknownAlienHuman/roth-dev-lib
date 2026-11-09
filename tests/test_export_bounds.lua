@@ -170,4 +170,16 @@ assert(packStats.exhausted ~= true)
 packStats.attempts = 999
 assert(E.Packer:GetLastStats().attempts ~= 999)
 
+
+-- Exhaustion telemetry must report the number of attempts actually executed,
+-- not the compile-time ceiling after the degradation ladder has already ended.
+local originalToJSON = E.ToJSON
+E.ToJSON = function() return '{"error":"json_output_limit"}' end
+local exhausted = E.Packer:BuildPackedJSON({ maxBytes = 4096, maxGroups = 1 })
+local exhaustedStats = assert(E.Packer:GetLastStats())
+E.ToJSON = originalToJSON
+assert(exhaustedStats.exhausted == true)
+assert(exhaustedStats.attempts > 0 and exhaustedStats.attempts < 24)
+assert(exhausted:find('"attempts":' .. exhaustedStats.attempts, 1, true))
+
 print('export and packer bound tests: ok')

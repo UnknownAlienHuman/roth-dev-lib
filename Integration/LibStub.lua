@@ -162,8 +162,8 @@ function lib:Embed(target, addonName, opts)
     RDL_Enter = function(_, funcName, ctx)
       return current:Enter(addonName, funcName, ctx)
     end,
-    RDL_Leave = function()
-      return current:Leave()
+    RDL_Leave = function(_, token)
+      return current:Leave(token)
     end,
     RDL_Report = function(_, kind, message, reportOpts)
       return current:Report(addonName, kind, message, reportOpts)

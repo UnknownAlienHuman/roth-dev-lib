@@ -369,7 +369,9 @@ end
 function Capture:OnLuaError(errorValue, stack, noForward)
   if self._disabled then return false end
   if self._inHandler then
-    if type(self.prevErrorHandler) == "function" then pcall(self.prevErrorHandler, errorValue) end
+    if not noForward and type(self.prevErrorHandler) == "function" then
+      pcall(self.prevErrorHandler, errorValue)
+    end
     return false
   end
 

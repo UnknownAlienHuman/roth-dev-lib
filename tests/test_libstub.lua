@@ -51,6 +51,10 @@ assert(target:RDL_Breadcrumb('flow', 'start', { n = 1 }) == 'Breadcrumb')
 assert(calls.Breadcrumb[1] == 'Test')
 assert(calls.Breadcrumb[2] == 'flow')
 
+local token = {}
+assert(target:RDL_Leave(token) == 'Leave')
+assert(calls.Leave[1] == token)
+
 local locked = setmetatable({}, { __newindex = function() error('locked') end })
 assert(lib:Embed(locked, 'Locked') == nil)
 print('LibStub integration tests: ok')

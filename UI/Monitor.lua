@@ -656,11 +656,13 @@ end
 -- BuildMonitorContent(parent) — Public API for MainFrame embed
 ---------------------------------------------------------------------------
 function UI:BuildMonitorContent(parent)
-  if not parent then return end
-  if self._monitor.embedded then return end -- already built
+  if not parent then return false end
+  if self._monitor.embedded then return true end -- already built
 
   local inst = self:_BuildMonitorPanels(parent, "monitorEmbed")
+  if not inst then return false end
   self._monitor.embedded = inst
+  return true
 end
 
 ---------------------------------------------------------------------------

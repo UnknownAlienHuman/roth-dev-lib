@@ -146,7 +146,8 @@ local function NormalizeOptions(options)
   return config
 end
 
-local function TruncateUTF8(value, maximum)
+local function UTF8Prefix(value, maximum)
+  if maximum <= 0 then return "" end
   if #value <= maximum then return value end
 
   local index, lastComplete = 1, 0
@@ -164,7 +165,23 @@ local function TruncateUTF8(value, maximum)
     lastComplete = index + width - 1
     index = index + width
   end
-  return value:sub(1, lastComplete) .. "<truncated>"
+  return value:sub(1, lastComplete)
+end
+
+local function TruncateUTF8(value, maximum)
+  if #value <= maximum then return value end
+  return UTF8Prefix(value, maximum) .. "<truncated>"
+end
+
+-- Object-key identity is resolved after truncation, so key truncation must be
+-- a strict final-byte contract. Appending an unbudgeted marker here would let a
+-- later encoder pass collapse distinct keys again.
+local function TruncateUTF8Exact(value, maximum)
+  if maximum <= 0 then return "" end
+  if #value <= maximum then return value end
+  local marker = "<truncated>"
+  if maximum <= #marker then return UTF8Prefix(marker, maximum) end
+  return UTF8Prefix(value, maximum - #marker) .. marker
 end
 
 local function FilterString(value)
@@ -193,10 +210,11 @@ local function RenderUnsupported(value)
   return "<unsupported>"
 end
 
-local function EscapedString(value, maximum)
+local function EscapedString(value, maximum, exactLimit)
   local text = Scrub(value)
   if type(text) ~= "string" then text = RenderUnsupported(text) end
-  text = FilterString(TruncateUTF8(text, maximum))
+  text = FilterString(exactLimit and TruncateUTF8Exact(text, maximum)
+    or TruncateUTF8(text, maximum))
   text = text:gsub("\\", "\\\\")
     :gsub('"', '\\"')
     :gsub("\b", "\\b")
@@ -217,8 +235,8 @@ local function Emit(state, text)
   state.chunks[#state.chunks + 1] = text
 end
 
-local function EmitString(state, value, maximum)
-  Emit(state, EscapedString(value, maximum or state.config.maxStringBytes))
+local function EmitString(state, value, maximum, exactLimit)
+  Emit(state, EscapedString(value, maximum or state.config.maxStringBytes, exactLimit))
 end
 
 local function EmitIndent(state, count)
@@ -252,30 +270,67 @@ local function InspectArray(value, config)
   return true, maximum, nil
 end
 
+local HASH_MODULUS = 4294967296
+
+-- Most long-key comparisons use a bounded stable fingerprint. Full string
+-- comparison is retained only as a collision fallback, so output is stable
+-- across table insertion/hash order without doing unbounded work normally.
+local function KeyFingerprint(value)
+  local length = #value
+  local sample
+  if length <= 2048 then
+    sample = value
+  else
+    local quarter = math.floor(length / 4)
+    local middle = math.floor(length / 2)
+    local threeQuarter = math.floor(length * 3 / 4)
+    sample = value:sub(1, 512)
+      .. value:sub(math.max(1, quarter - 127), math.min(length, quarter + 128))
+      .. value:sub(math.max(1, middle - 255), math.min(length, middle + 256))
+      .. value:sub(math.max(1, threeQuarter - 127), math.min(length, threeQuarter + 128))
+      .. value:sub(math.max(1, length - 511), length)
+  end
+
+  local hashA, hashB = 5381, 2166136261
+  for index = 1, #sample do
+    local byte = string.byte(sample, index)
+    hashA = (hashA * 33 + byte) % HASH_MODULUS
+    hashB = (hashB * 131 + byte) % HASH_MODULUS
+  end
+  return string.format("%x:%08x:%08x", length, hashA, hashB)
+end
+
 local function KeyRecord(key, config)
-  if not CanAccessValue(key) or IsSecretValue(key) then return nil end
+  if not CanAccessValue(key) or IsSecretValue(key) then return nil, "inaccessible-key" end
   local ordinary = Scrub(key)
   local keyType = type(ordinary)
-  local keyText
+  local keyText, identity, rawSort
 
   if keyType == "string" then
-    keyText = TruncateUTF8(FilterString(TruncateUTF8(ordinary, config.maxKeyBytes)), config.maxKeyBytes)
+    keyText = TruncateUTF8Exact(FilterString(ordinary), config.maxKeyBytes)
+    identity = KeyFingerprint(ordinary)
+    rawSort = ordinary
   elseif keyType == "number" and IsFiniteNumber(ordinary) then
     keyText = tostring(ordinary)
+    identity = keyText
   elseif keyType == "boolean" then
     keyText = ordinary and "true" or "false"
+    identity = keyText
   else
-    keyText = TruncateUTF8(RenderUnsupported(ordinary), config.maxKeyBytes)
+    -- Tables/functions/threads/userdata have no stable cross-run identity.
+    -- Skipping them with an explicit marker is deterministic; rendering an
+    -- address or assigning sequence suffixes from hash iteration order is not.
+    return nil, "unsupported-key"
   end
 
   local rank = keyType == "string" and "1"
     or keyType == "number" and "2"
-    or keyType == "boolean" and "3"
-    or "9"
+    or "3"
   return {
     key = keyText,
     keyType = keyType,
-    sortKey = rank .. "\031" .. keyText,
+    sortKey = rank .. "\031" .. keyText .. "\031" .. identity,
+    rawSort = rawSort,
   }
 end
 
@@ -283,16 +338,16 @@ local function ResolveDuplicateObjectKeys(records, config)
   local used = {}
   for index = 1, #records do
     local record = records[index]
-    local base = record.key
+    local base = TruncateUTF8Exact(record.key, config.maxKeyBytes)
     local candidate = base
     if used[candidate] then
       local prefix = "[" .. record.keyType .. "]"
-      candidate = TruncateUTF8(prefix .. base, config.maxKeyBytes)
+      candidate = TruncateUTF8Exact(prefix .. base, config.maxKeyBytes)
       local suffix = 2
       while used[candidate] do
         local suffixText = "#" .. suffix
-        local available = math.max(1, config.maxKeyBytes - #prefix - #suffixText)
-        candidate = prefix .. TruncateUTF8(base, available) .. suffixText
+        local available = math.max(0, config.maxKeyBytes - #prefix - #suffixText)
+        candidate = prefix .. TruncateUTF8Exact(base, available) .. suffixText
         suffix = suffix + 1
       end
     end
@@ -373,17 +428,27 @@ local function EncodeObject(value, state, depth, seen, indent)
       break
     end
 
-    local record = KeyRecord(nextKey, config)
+    local record, keyError = KeyRecord(nextKey, config)
     if not record then
-      EmitString(state, "<inaccessible-table>")
-      return
+      if keyError == "inaccessible-key" then
+        EmitString(state, "<inaccessible-table>")
+        return
+      end
+      truncationReason = truncationReason or keyError or "unsupported-key"
+    else
+      record.rawValue = nextValue
+      records[#records + 1] = record
+      emitted = emitted + 1
     end
-    record.rawValue = nextValue
-    records[#records + 1] = record
-    emitted = emitted + 1
   end
 
-  table.sort(records, function(a, b) return a.sortKey < b.sortKey end)
+  table.sort(records, function(a, b)
+    if a.sortKey ~= b.sortKey then return a.sortKey < b.sortKey end
+    if a.rawSort ~= nil and b.rawSort ~= nil and a.rawSort ~= b.rawSort then
+      return a.rawSort < b.rawSort
+    end
+    return false
+  end)
   local usedKeys = ResolveDuplicateObjectKeys(records, config)
   if truncationReason then AddTruncationRecord(records, usedKeys, truncationReason) end
   table.sort(records, function(a, b) return a.key < b.key end)
@@ -397,7 +462,7 @@ local function EncodeObject(value, state, depth, seen, indent)
     if index > 1 then Emit(state, pretty and ",\n" or ",") end
     if pretty then EmitIndent(state, childIndent) end
     local record = records[index]
-    EmitString(state, record.key, config.maxKeyBytes)
+    EmitString(state, record.key, config.maxKeyBytes, true)
     Emit(state, pretty and ": " or ":")
     EncodeValue(record.rawValue, state, depth + 1, seen, childIndent)
   end

@@ -70,6 +70,39 @@ local hostileOptions = setmetatable({ sampleRate = 1, spikeMs = 999999, spikeKB 
 assert(RDL.CPU:Measure('Addon', 'hostile-options', function() return true end, hostileOptions) == true)
 assert(RDL.Mem:Measure('Addon', 'hostile-options', function() return true end, hostileOptions) == true)
 
+-- Wrapper construction must detach identities/options from mutable caller state.
+RDL.CPU:ResetStats()
+RDL.Mem:ResetStats()
+local cpuDisabledOptions = { sampleRate = 0 }
+local cpuDisabled = assert(RDL.CPU:Wrap('Snapshot', 'cpu-off', function() return true end,
+  cpuDisabledOptions))
+cpuDisabledOptions.sampleRate = 1
+assert(cpuDisabled() == true)
+assert(next(RDL.CPU:GetStats()) == nil)
+
+local cpuEnabledOptions = { sampleRate = 1 }
+local cpuEnabled = assert(RDL.CPU:Wrap('Snapshot', 'cpu-on', function() return true end,
+  cpuEnabledOptions))
+cpuEnabledOptions.sampleRate = 0
+assert(cpuEnabled() == true)
+assert(RDL.CPU:GetStats()['Snapshot:cpu-on'] ~= nil)
+
+local alerts = 0
+RDL.Alert = function() alerts = alerts + 1 end
+local memQuietOptions = { spikeKB = 999999, alertMinIntervalMs = 0 }
+local memQuiet = assert(RDL.Mem:Wrap('Snapshot', 'mem-quiet', function() return true end,
+  memQuietOptions))
+memQuietOptions.spikeKB = 1
+assert(memQuiet() == true and alerts == 0)
+local memAlertOptions = { spikeKB = 1, alertMinIntervalMs = 0 }
+local memAlert = assert(RDL.Mem:Wrap('Snapshot', 'mem-alert', function() return true end,
+  memAlertOptions))
+memAlertOptions.spikeKB = 999999
+assert(memAlert() == true and alerts == 1)
+RDL.Alert = function() error('alert sink failed') end
+RDL.CPU:ResetStats()
+RDL.Mem:ResetStats()
+
 -- Dynamic labels cannot grow long-lived telemetry maps without a hard bound.
 for index = 1, 1100 do
   RDL.CPU:Measure('Addon', 'cpu-' .. index, function() return index end, {})

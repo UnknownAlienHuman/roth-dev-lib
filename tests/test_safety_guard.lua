@@ -37,4 +37,15 @@ local captured = RDL.Capture:OnLuaError('boom', 'stack', true)
 assert(captured == false)
 assert(RDL.Capture._inHandler == false)
 
+
+-- In chain mode the wrapper owns forwarding. A nested intake failure with
+-- noForward=true must not call the previous handler a second time.
+forwarded = 0
+RDL.Capture._inHandler = true
+assert(RDL.Capture:OnLuaError('nested', 'stack', true) == false)
+assert(forwarded == 0)
+assert(RDL.Capture:OnLuaError('nested', 'stack', false) == false)
+assert(forwarded == 1)
+RDL.Capture._inHandler = false
+
 print('capture safety guard tests: ok')

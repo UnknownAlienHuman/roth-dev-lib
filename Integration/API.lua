@@ -292,10 +292,12 @@ function RDL:Enter(addonName, funcName, ctx)
   return nil
 end
 
-function RDL:Leave()
+function RDL:Leave(token)
   if self.Doctor and self.Doctor.Leave then
-    SinkCall("Doctor:Leave", self.Doctor.Leave, self.Doctor)
+    local ok, result = SinkCall("Doctor:Leave", self.Doctor.Leave, self.Doctor, token)
+    if ok then return result end
   end
+  return false
 end
 
 -- Per-addon client -------------------------------------------------------
@@ -367,8 +369,8 @@ function RDL:NewAddon(addonName, opts)
   function client:Enter(funcName, ctx)
     return RDL:Enter(addon, funcName, ctx)
   end
-  function client:Leave()
-    return RDL:Leave()
+  function client:Leave(token)
+    return RDL:Leave(token)
   end
   function client:Log(level, category, message, data)
     local normalizedLevel = SafeText(level, "INFO", 32):upper()

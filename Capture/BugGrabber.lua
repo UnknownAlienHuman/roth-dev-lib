@@ -182,17 +182,22 @@ local function NormalizeRecord(raw)
   }
 end
 
--- RothDevLib's LUA_ERROR grouping signature is kind + normalized message; stack
--- is intentionally absent. Do not run full stack normalization on every
--- BugGrabber baseline poll only to discard it in the final signature.
+-- BugGrabber owns one counter per source record. RothDevLib may later group
+-- records by normalized message, but counter state must still distinguish two
+-- independent records with the same message and different stack origins.
 local function RecordKey(record)
-  local message = SafeText(record.message, "", 260)
+  local message = SafeText(record.message, "", 1024)
+  local stack = SafeText(record.stack, "", 2048)
   local util = RDL.Util
   if util and type(util.NormalizeMessage) == "function" then
     local ok, normalized = pcall(util.NormalizeMessage, util, message)
     if ok and type(normalized) == "string" then message = normalized end
   end
-  return "LUA_ERROR|" .. SafeText(message, "", 2048)
+  if util and type(util.NormalizeStack) == "function" then
+    local ok, normalized = pcall(util.NormalizeStack, util, stack)
+    if ok and type(normalized) == "string" then stack = normalized end
+  end
+  return SafeText("LUA_ERROR|" .. message .. "|" .. stack, "LUA_ERROR|<?>|", 4096)
 end
 
 local function ResetAttachment(self)

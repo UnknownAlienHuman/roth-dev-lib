@@ -54,4 +54,19 @@ assert(ContainsMarker(byteBounded, '<byte-limit>')
 local serialized = U:SafeSerializeTable(byteBounded)
 assert(#serialized < 4096)
 
+
+-- Complete and incomplete secret escapes must never retain opaque payloads.
+local complete = U:FilterSecretEscapes('before|Kopaque|kafter')
+assert(complete == 'before<filtered>after')
+local incomplete = U:FilterSecretEscapes('before|Kopaque-without-terminator')
+assert(incomplete == 'before<filtered>')
+local copiedEscape = U:CopyDiagnosticValue({
+  complete = 'x|Ksecret|ky',
+  incomplete = 'x|Ksecret-tail',
+})
+assert(copiedEscape.complete == 'x<filtered>y')
+assert(copiedEscape.incomplete == 'x<filtered>')
+assert(not copiedEscape.complete:find('|K', 1, true))
+assert(not copiedEscape.incomplete:find('secret-tail', 1, true))
+
 print('utility traversal-bound tests: ok')

@@ -279,7 +279,15 @@ end
 function Util:FilterSecretEscapes(value)
   local s = self:Scrub(value)
   if type(s) ~= "string" then return s end
-  return s:gsub("|K[^|]*|k", "<filtered>")
+
+  local filtered = (s:gsub("|K[^|]*|k", "<filtered>"))
+  -- Truncation or malformed foreign text may omit the closing |k. Never let
+  -- the remaining opaque payload escape as ordinary diagnostic text.
+  local incomplete = filtered:find("|K", 1, true)
+  if incomplete then
+    filtered = filtered:sub(1, incomplete - 1) .. "<filtered>"
+  end
+  return filtered
 end
 
 -- Filter and trim an already-readable locals string.

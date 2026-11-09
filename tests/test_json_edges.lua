@@ -67,4 +67,44 @@ for i = 1, 100 do broad[i] = { value = i } end
 out = J:Encode(broad, { maxNodes = 10, maxArrayLen = 200 })
 assert(out:find('<node-limit>', 1, true), out)
 
+
+-- Distinct long object keys must remain distinct after the final key-byte cap.
+local collidingKeys = {}
+for index = 1, 6 do
+  collidingKeys[string.rep('x', 100) .. tostring(index)] = index
+end
+local collidingJSON = J:Encode(collidingKeys, {
+  maxKeyBytes = 64,
+  maxOutputBytes = 8192,
+})
+local emittedKeys, emittedCount = {}, 0
+for key in collidingJSON:gmatch('"([^"]+)":') do
+  emittedCount = emittedCount + 1
+  assert(#key <= 64)
+  assert(emittedKeys[key] == nil, 'duplicate emitted JSON key: ' .. key)
+  emittedKeys[key] = true
+end
+assert(emittedCount == 6)
+
+-- Encoding must not depend on Lua table insertion/hash order after key
+-- truncation. The same source mapping produces byte-identical output.
+local orderedKeys = {}
+for index = 1, 50 do
+  orderedKeys[index] = string.rep('q', 100) .. string.format('%03d', index)
+end
+local forward, reverse = {}, {}
+for index = 1, #orderedKeys do forward[orderedKeys[index]] = index end
+for index = #orderedKeys, 1, -1 do reverse[orderedKeys[index]] = index end
+local forwardJSON = J:Encode(forward, { maxKeyBytes = 64, maxOutputBytes = 65536 })
+local reverseJSON = J:Encode(reverse, { maxKeyBytes = 64, maxOutputBytes = 65536 })
+assert(forwardJSON == reverseJSON)
+
+-- Unsupported object-key identities are skipped with a stable marker instead
+-- of leaking addresses or assigning values by hash iteration order.
+local unsupportedKey = {}
+local mixedKeys = { ordinary = 1, [unsupportedKey] = 2 }
+local mixedJSON = J:Encode(mixedKeys, { maxOutputBytes = 4096 })
+assert(mixedJSON:find('"ordinary":1', 1, true))
+assert(mixedJSON:find('"__truncated":"unsupported-key"', 1, true))
+
 print('json edge tests: ok')

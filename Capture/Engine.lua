@@ -20,18 +20,6 @@ local function Now()
   return type(_G.time) == "function" and _G.time() or 0
 end
 
-local function PreciseNow()
-  if type(_G.GetTimePreciseSec) == "function" then
-    local ok, value = pcall(_G.GetTimePreciseSec)
-    if ok and type(value) == "number" then return value end
-  end
-  if type(_G.GetTime) == "function" then
-    local ok, value = pcall(_G.GetTime)
-    if ok and type(value) == "number" then return value end
-  end
-  return Now()
-end
-
 local function Settings()
   if RDL.DB and type(RDL.DB.GetSettings) == "function" then
     local ok, settings = pcall(RDL.DB.GetSettings, RDL.DB)
@@ -358,21 +346,23 @@ function Capture:EnsureHandler(previous)
 
       local stack = SafeStack(2)
       Capture._inChainWrapper = true
-      local captured, key, messageKey = Capture:OnLuaError(errorValue, stack, true)
+      local ok = pcall(Capture.OnLuaError, Capture, errorValue, stack, true)
       Capture._inChainWrapper = false
+      if not ok then
+        -- The base handler is installed before Safety.lua replaces it. Keep the
+        -- process handler recoverable even if intake fails in that short window.
+        Capture._inHandler = false
+        if RDL.Doctor and type(RDL.Doctor.Reset) == "function" then
+          pcall(RDL.Doctor.Reset, RDL.Doctor)
+        end
+      end
 
       local settings = Settings()
       if settings.chainCallPrevHandler ~= false and type(previous) == "function"
           and previous ~= Capture._handler and not Capture._callingPrevHandler then
         Capture._callingPrevHandler = true
-        Capture._forwardingPrevErrorKey = captured and key or nil
-        Capture._forwardingPrevErrorMsgKey = captured and messageKey or nil
-        Capture._forwardingPrevAt = captured and PreciseNow() or nil
         pcall(previous, errorValue)
         Capture._callingPrevHandler = false
-        Capture._forwardingPrevErrorKey = nil
-        Capture._forwardingPrevErrorMsgKey = nil
-        Capture._forwardingPrevAt = nil
       end
     end
   else
@@ -380,7 +370,14 @@ function Capture:EnsureHandler(previous)
     self._handlerMode = "exclusive"
     self._handlerPrev = nil
     self._handler = function(errorValue)
-      Capture:OnLuaError(errorValue, SafeStack(2), false)
+      local ok = pcall(Capture.OnLuaError, Capture, errorValue, SafeStack(2), false)
+      if not ok then
+        Capture._inHandler = false
+        Capture._inChainWrapper = false
+        if RDL.Doctor and type(RDL.Doctor.Reset) == "function" then
+          pcall(RDL.Doctor.Reset, RDL.Doctor)
+        end
+      end
     end
   end
 
@@ -508,9 +505,9 @@ function Capture:Init()
   self:EarlyInit()
 
   if self.ChatTap and type(self.ChatTap.Init) == "function" then
-    pcall(self.ChatTap.Init, self.ChatTap)
+    local ok, hooked = pcall(self.ChatTap.Init, self.ChatTap)
     self._fallback = self._fallback or {}
-    self._fallback.chatTapHooked = true
+    self._fallback.chatTapHooked = ok and (hooked == true or self.ChatTap._hooked == true)
   end
 
   self:SyncOwnership("init")

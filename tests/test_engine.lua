@@ -43,6 +43,19 @@ assert(previousCalls == 1)
 assert(RDL.DB.session.errors == 1)
 assert(Capture._lastStoredSig ~= nil)
 
+-- The installed process handler must contain intake failures even before the
+-- richer Safety.lua owner has replaced the base implementation.
+local originalOnLuaError = Capture.OnLuaError
+Capture.OnLuaError = function(self)
+  self._inHandler = true
+  error('bootstrap intake failure')
+end
+local beforeBootstrapForward = previousCalls
+assert(pcall(currentHandler, 'bootstrap-broken') == true)
+assert(previousCalls == beforeBootstrapForward + 1)
+assert(Capture._inHandler == false and Capture._inChainWrapper == false)
+Capture.OnLuaError = originalOnLuaError
+
 local replacement = function() end
 currentHandler = replacement
 Capture:SyncOwnership('external')
@@ -55,5 +68,14 @@ assert(setCalls == 1)
 assert(Capture:TryReclaimHandler('slash') == true)
 assert(currentHandler == Capture._handler)
 assert(setCalls == 2)
+
+
+-- Fallback diagnostics must reflect actual ChatTap installation state.
+Capture.ChatTap = { _hooked = false, Init = function() return false end }
+Capture:Init()
+assert(Capture._fallback.chatTapHooked == false)
+Capture.ChatTap = { _hooked = false, Init = function(self) self._hooked = true; return true end }
+Capture:Init()
+assert(Capture._fallback.chatTapHooked == true)
 
 print('capture engine tests: ok')

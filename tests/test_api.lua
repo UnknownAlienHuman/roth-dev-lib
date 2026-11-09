@@ -98,4 +98,16 @@ client:Log(secret, secret, secret, { x = secret })
 assert(calls.breadcrumb[1] == 'Client')
 assert(calls.breadcrumb[2] == '<inaccessible>')
 
+
+-- Public Doctor helpers must preserve exact opaque-token cleanup semantics.
+local doctorToken = {}
+local leftToken
+RDL.Doctor = {
+  Enter = function() return doctorToken end,
+  Leave = function(_, token) leftToken = token; return token == doctorToken end,
+}
+assert(RDL:Enter('Client', 'Scope', { n = 1 }) == doctorToken)
+assert(RDL:Leave(doctorToken) == true and leftToken == doctorToken)
+assert(client:Leave(doctorToken) == true and leftToken == doctorToken)
+
 print('integration API tests: ok')

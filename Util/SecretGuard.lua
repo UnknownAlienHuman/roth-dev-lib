@@ -138,5 +138,11 @@ function SG:FilterLocals(localsStr)
   if not self:CanAccess(localsStr) then return "<inaccessible>" end
   if self:IsSecret(localsStr) then return "<secret>" end
   if type(localsStr) ~= "string" then return localsStr end
-  return localsStr:gsub("|K[^|]*|k", "<filtered>")
+
+  local filtered = (localsStr:gsub("|K[^|]*|k", "<filtered>"))
+  local incomplete = filtered:find("|K", 1, true)
+  if incomplete then
+    filtered = filtered:sub(1, incomplete - 1) .. "<filtered>"
+  end
+  return filtered
 end

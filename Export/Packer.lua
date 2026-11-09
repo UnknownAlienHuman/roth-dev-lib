@@ -583,7 +583,9 @@ function Packer:BuildPackedJSON(options)
 
   local degradation = {}
   local stage = 0
+  local attemptsMade = 0
   for attempt = 1, MAX_ATTEMPTS do
+    attemptsMade = attempt
     local json = TryEncode(context, limits, attempt, degradation)
     if json then
       self._lastStats = {
@@ -603,9 +605,9 @@ function Packer:BuildPackedJSON(options)
     degradation[#degradation + 1] = record
   end
 
-  local output = FallbackJSON(limits.maxBytes, MAX_ATTEMPTS, #degradation)
+  local output = FallbackJSON(limits.maxBytes, attemptsMade, #degradation)
   self._lastStats = {
-    attempts = MAX_ATTEMPTS,
+    attempts = attemptsMade,
     sourceGroups = #context.groups,
     sourceTimeline = #context.recent,
     degradationCount = #degradation,

@@ -129,6 +129,18 @@ local function Identity(addonName, label)
   return addon, name, addon .. ":" .. name
 end
 
+local function SnapshotOptions(opts)
+  local output = {}
+  local function CopyNumber(key, minimum, maximum)
+    local value = SafeNumber(Option(opts, key), nil)
+    if value ~= nil then output[key] = Clamp(value, minimum, maximum) end
+  end
+  CopyNumber("metricMinInterval", 0, 3600)
+  CopyNumber("spikeKB", 1, 1024 * 1024)
+  CopyNumber("alertMinIntervalMs", 0, 600000)
+  return next(output) and output or nil
+end
+
 local function AlertThrottleOK(key, nowMs, minimumIntervalMs)
   minimumIntervalMs = SafeNumber(minimumIntervalMs, 0)
   if minimumIntervalMs <= 0 then return true end
@@ -236,8 +248,10 @@ end
 
 function Mem:Wrap(addonName, funcName, fn, opts)
   if not IsCallable(fn) then return nil end
+  local addon, func = Identity(addonName, funcName)
+  local options = SnapshotOptions(opts)
   return function(...)
-    return Mem:Measure(addonName, funcName, fn, opts, ...)
+    return Mem:Measure(addon, func, fn, options, ...)
   end
 end
 

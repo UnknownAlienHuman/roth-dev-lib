@@ -18,6 +18,7 @@ Target: **Retail 12.1.5 / Interface 120105**
 - [x] Portable protected-call argument/return tuples, including interior and trailing nils.
 - [x] Complete repository regression suite and first-party Lua syntax gate in CI.
 - [x] Architecture, code index, agent guide and changelog synchronized with the executable load order.
+- [x] Second-pass logic audit: handler forwarding, BugGrabber record identity, JSON key uniqueness, Doctor tokens, profiler wrapper ownership, packer telemetry and retryable monitor construction.
 
 ### Named-client validation
 

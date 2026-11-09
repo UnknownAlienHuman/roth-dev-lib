@@ -170,6 +170,28 @@ for _, record in ipairs(_G.BugGrabberDB.errors) do record.counter = record.count
 assert(bug:ImportNew() == 0)
 assert(bug:GetStateStats().keys <= settings.bugGrabberScanMax)
 
+
+-- BugGrabber counters belong to source records, not final RothDevLib groups.
+-- Same-message records with different stacks must advance independently and
+-- must not be replayed on every poll.
+bug:Disable()
+RDL.Capture.StoreEntry = function() stored = stored + 1; return 'stored' end
+settings.importBugGrabberHistory = false
+settings.bugGrabberImportMaxPerPoll = 10
+settings.bugGrabberScanMax = 100
+local sameMessageErrors = {
+  { message = 'same-message', stack = 'Interface/AddOns/A/Core.lua:1', counter = 1 },
+  { message = 'same-message', stack = 'Interface/AddOns/B/Core.lua:2', counter = 1 },
+}
+_G.BugGrabberDB.errors = sameMessageErrors
+assert(bug:ImportNew() == 0 and bug._baselineComplete == true)
+sameMessageErrors[1].counter = 2
+assert(bug:ImportNew() == 1)
+assert(bug:ImportNew() == 0)
+sameMessageErrors[2].counter = 2
+assert(bug:ImportNew() == 1)
+assert(bug:ImportNew() == 0)
+
 RDL.Capture.ownsHandler = true
 bug._enabled = true
 assert(bug:ImportNew() == 0 and bug._enabled == false)
