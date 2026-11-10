@@ -1,0 +1,208 @@
++assert(D:Checkpoint('setting'))
++assert(nativeCalls == before)
++DB:GetSettings().persistDiagnostics = false
++local ticker = D._ticker
++D:Init()
++assert(ticker.cancelled and D._ticker == nil and D:Checkpoint('disabled') == false)
++DB:GetSettings().persistDiagnostics = true
++-- Existing session evidence survives a simulated reload through the real normalizer.
++local sid = DB.sessionId
++DB.raw, DB.session, DB.sessionId, DB._normalizedRoot = nil, nil, nil, nil
++assert(DB:Init())
++assert(DB.raw.sessions[2].id == sid and DB.raw.sessions[2].diagnostics)
++assert(DB.raw.sessions[2].diagnostics.samples[60].fps == 90)
++-- Only five recent sessions retain evidence; session metadata remains available.
++for i = 1, 6 do
++  D:Checkpoint('next-session')
++  DB.raw, DB.session, DB.sessionId, DB._normalizedRoot = nil, nil, nil, nil
++  assert(DB:Init())
++end
++D:Checkpoint('final')
++assert(#DB:GetDiagnosticSessions() == 5)
++assert(DB.raw.sessions[6].diagnostics == nil)
++local snapshot = DB:GetDiagnosticSessions()
++snapshot[1].diagnostics.coverage.handlerOwned = true
++assert(DB.session.diagnostics.coverage.handlerOwned == false)
++assert(DB:HandlePersistenceFailure('!RothDevLib'))
++assert(D:Checkpoint('suspended') == false)
++for _, session in ipairs(DB.raw.sessions) do assert(session.diagnostics == nil) end
++print('agent diagnostic persistence tests: ok')
+--- /dev/null
++++ b/tests/test_agent_evidence.lua
+@@ -0,0 +1,92 @@
++local F = assert(loadfile('tests/helpers/mission_fixture.lua'))()
++local R, DB = RothDevLib, RothDevLib.DB
++F.Load('Doctor/Validation.lua')
++R.Validation:Init()
++F.Load('Capture/Engine.lua')
++F.Load('Capture/Taint.lua')
++F.Load('Capture/Reported.lua')
++F.Load('Capture/Screenshots.lua')
++local capture, screenshots = R.Capture, R.Screenshots
++_G.Screenshot = function() screenshots:OnEvent('SCREENSHOT_SUCCEEDED') end
++screenshots:Init()
++assert(screenshots:SetEnabled(true))
++local callbackCount = 0
++R:RegisterCallback('RDL_CAPTURE', 'verify-committed', function(entry, group)
++  callbackCount = callbackCount + 1
++  local saved = DB:GetGroup(entry.sig)
++  assert(saved and saved.occurrences[1].compact)
++  assert(DB:GetSessionIndex(entry.sessionId)[entry.sig])
++  assert(group.occurrences[1].compact and group.occurrences[1].locals == nil)
++end)
++local state = assert(capture:OnRestrictionStateChanged('ADDON_RESTRICTION_STATE_CHANGED', 1, 2))
++assert(DB.session.taints == 0 and DB.session.restrictionChanges == 1)
++assert(screenshots._pending == nil)
++assert(state.origin == nil and state.ctx.extra.observerOrigin.addon == 'Observer')
++assert(state.ctx.extra.evidence.stackProvenance == 'event-observer')
++_G.debugstack = function() return 'Interface/AddOns/!RothDevLib/Capture/Taint.lua:71' end
++local taint = assert(capture:OnTaintEvent('ADDON_ACTION_BLOCKED', 'Target', 'SetPoint'))
++assert(DB.session.taints == 1 and taint.addon == 'Target')
++assert(R.Validation.taint.selfBlocked == 0 and R.Validation.taint.selfState == 0)
++assert(taint.origin == nil and taint.ctx.extra.blocked == 'SetPoint')
++assert(taint.ctx.extra.evidence.rootCause == 'not-established')
++assert(taint.ctx.extra.faultAddon == nil and taint.ctx.extra.reportedAddon == 'Target')
++assert(screenshots._pending.signature == taint.sig)
++F.RunTimer(0.1)
++local savedTaint = DB:GetGroup(taint.sig)
++assert(savedTaint.occurrences[1].evidence.blocked == 'SetPoint')
++assert(savedTaint.occurrences[1].evidence.evidence.stackProvenance == 'event-observer')
++local hidden = capture.BuildEntry('LUA_ERROR', 'Interface/AddOns/Target/Core.lua:9: attempt to compare a secret value',
++  'Interface/AddOns/Target/Core.lua:9', { value = F.secret }, nil, nil, { observed = F.secret })
++assert(hidden.ctx.extra.evidence.category == 'SECRET_ACCESS_MESSAGE')
++assert(hidden.ctx.extra.evidence.classification == 'message-heuristic')
++assert(hidden.locals.value == '<inaccessible>')
++assert(capture.StoreEntry(hidden) == 'stored')
++assert(DB:GetGroup(hidden.sig).ctx.extra.observed == '<inaccessible>')
++-- Per-occurrence evidence must not be overwritten by the latest occurrence.
++for i = 1, 2 do
++  local entry = capture.BuildEntry('ANOMALY', 'layout differs', '', nil, 'Target', 'Layout',
++    { expected = 'visible', observed = 'hidden-' .. i })
++  assert(capture.StoreEntry(entry) == 'stored')
++end
++local anomalySig = capture._lastStoredSig
++local anomaly = DB:GetGroup(anomalySig)
++assert(anomaly.occurrences[1].evidence.observed == 'hidden-2')
++assert(anomaly.occurrences[2].evidence.observed == 'hidden-1')
++assert(callbackCount == 5 and R._callbacks.RDL_CAPTURE['verify-committed'])
++-- Export carries saved performance/screenshot evidence without live module dependence.
++assert(DB:SaveDiagnostics({ schema = 1, ts = time(), coverage = { handlerOwned = true },
++  wrappedCPU = { status = 'available', rows = { { key = 'Target:Layout', total = 12, n = 3 } } },
++  nativeProfiler = { status = 'available', timeUnit = 'ms', countUnit = 'ticks',
++    rows = { { addon = 'Target', RecentAverageTime = 2 } } } }))
++F.Load('Util/JSON.lua')
++F.Load('Export/Export.lua')
++F.Load('Export/Packer.lua')
++local full = R.Export:BuildFullObject({ includeOccurrences = true })
++assert(full.session.id == DB.sessionId and full.session.diagnostics == nil)
++assert(#full.diagnosticSessions == 1)
++assert(full.diagnosticSessions[1].screenshots.records[1].signature == taint.sig)
++local found
++for _, group in ipairs(full.groups) do if group.sig == anomalySig then found = group end end
++assert(found and found.occurrences[2].evidence.observed == 'hidden-1')
++local packed = R.Export.Packer:BuildPackedJSON({ maxBytes = 32000 })
++assert(#packed <= 32000 and packed:find('Target:Layout', 1, true))
++assert(packed:find('success-event-observed', 1, true))
++assert(packed:find('event-observer', 1, true))
++local small = R.Export.Packer:BuildPackedJSON({ maxBytes = 4096, maxGroups = 50 })
++assert(#small <= 4096 and not small:find('pack_budget_exhausted', 1, true))
++assert(small:find('"diagnostics"', 1, true)) -- summary or explicit omission marker
++-- A callback that clears the database must not charge the new session for an old error.
++R:UnregisterCallback('RDL_CAPTURE', 'verify-committed')
++R:RegisterCallback('RDL_CAPTURE', 'clear-after-commit', function() DB:Clear() end)
++local oldSession = DB.session
++local entry = capture.BuildEntry('LUA_ERROR', 'clear in callback', '', nil, 'Target')
++assert(capture.StoreEntry(entry) == 'stored')
++assert(DB.session ~= oldSession and DB.session.errors == 0)
++assert(oldSession.errors > 0)
++R:UnregisterCallback('RDL_CAPTURE', 'clear-after-commit')
++capture:OnTaintEvent('ADDON_ACTION_FORBIDDEN', '!RothDevLib', 'SetPoint')
++assert(R.Validation.taint.selfForbidden == 1)
++local observed = capture.BuildEntry('TAINT_BLOCKED', 'Interface/AddOns/Other/Frame.lua:5',
++  debugstack(), nil, 'Target', nil, { stackProvenance = 'event-observer', evidence = { note = 'reporter-data' } })
++assert(observed.addon == 'Target' and observed.ctx.extra.reportedEvidence.note == 'reporter-data')
++print('agent evidence pipeline tests: ok')
+--- /dev/null
++++ b/tests/test_diagnostics_lifecycle.lua
+@@ -0,0 +1,40 @@
++local F = assert(loadfile('tests/helpers/mission_fixture.lua'))()
++local R, DB = RothDevLib, RothDevLib.DB
++local registered, frame = {}, {}
++function frame:RegisterEvent(event) registered[event] = true end
++function frame:SetScript(name, fn) self[name] = fn end
++_G.CreateFrame = function() return frame end
++R.Capture = {
++  Init = function() return true end, FlushBootQueue = function() return 0 end,
++  _fallback = { kind = 'owned' }, ownsHandler = true,
++}
++F.Load('Capture/Screenshots.lua')
++F.Load('Core/Diagnostics.lua')
++F.Load('Core/Events.lua')
++assert(registered.SCREENSHOT_SUCCEEDED and registered.SCREENSHOT_FAILED)
++frame.OnEvent(frame, 'PLAYER_LOGIN')
++assert(R._initialized and R.Diagnostics._ticker and DB.session.diagnostics)
++local ticker = R.Diagnostics._ticker
++frame.OnEvent(frame, 'PLAYER_LOGIN')
++assert(R.Diagnostics._ticker == ticker) -- one sampler owner
++frame.OnEvent(frame, 'ADDON_LOADED', 'AnotherAddon')
++assert(R.Diagnostics._inventoryDirty)
++_G.Screenshot = function() frame.OnEvent(frame, 'SCREENSHOT_FAILED') end
++assert(R.Screenshots:Request('manual'))
++F.RunTimer(0.1)
++assert(DB.session.screenshots.records[1].status == 'failure-event-observed')
++-- Persistence failure stops new data producers, clear resumes them once.
++frame.OnEvent(frame, 'SAVED_VARIABLES_TOO_LARGE', '!RothDevLib')
++assert(ticker.cancelled and R.Diagnostics._ticker == nil and R.Screenshots._stopped)
++assert(DB.session.diagnostics == nil and DB.session.screenshots == nil)
++DB:Clear()
++assert(not R.Screenshots._stopped and R.Diagnostics._ticker and not DB:IsWriteSuspended())
++local resumed = R.Diagnostics._ticker
++frame.OnEvent(frame, 'PLAYER_LOGOUT')
++assert(resumed.cancelled and R.Diagnostics._ticker == nil)
++assert(DB.session.ended and DB.session.diagnostics.reason == 'PLAYER_LOGOUT')
++local final = DB.session.diagnostics
++resumed.fn() -- stale tick is inert
++frame.OnEvent(frame, 'ADDONS_UNLOADING', true)
++assert(DB.session.diagnostics == final)
++print('diagnostics event lifecycle tests: ok')
+--- /dev/null
++++ b/tests/test_screenshots.lua
+@@ -0,0 +1,76 @@
++local F = assert(loadfile('tests/helpers/mission_fixture.lua'))()
++local R, DB = RothDevLib, RothDevLib.DB
++F.Load('Capture/Screenshots.lua')
++local S = R.Screenshots
++local calls = 0
++_G.Screenshot = function() calls = calls + 1 end
++S:Init()
++assert(DB:GetSettings().autoScreenshots == false)
++R:Fire('RDL_CAPTURE', { kind = 'LUA_ERROR', sig = 'off' })
++assert(#F.timers == 0 and calls == 0)
++assert(S:SetEnabled(true))
++R:Fire('RDL_CAPTURE', { kind = 'TAINT_STATE', sig = 'state' })
++assert(#F.timers == 0) -- normal transitions must not trigger pictures
++R:Fire('RDL_CAPTURE', { kind = 'LUA_ERROR', sig = 'first' })
++assert(calls == 0 and S._pending.status == 'queued')
++assert(DB.session.screenshots.records[1].signature == 'first')
++assert(S:Request('manual') == false) -- one in flight
++assert(F.RunTimer(0.1) and calls == 1)
++S:OnEvent('SCREENSHOT_SUCCEEDED')
++assert(S._pending == nil)
++assert(DB.session.screenshots.records[1].status == 'success-event-observed')
++assert(DB.session.screenshots.records[1].filename == nil)
++local ok, why = S:Request('manual')
++assert(not ok and why == 'cooldown')
++F.clock = F.clock + 31
++ok, why = S:Request('duplicate', 'first', true)
++assert(not ok and why == 'already-requested')
++-- Cancel queued work on opt-out, leaving the timer as a harmless no-op.
++assert(S:Request('second', 'second', true))
++assert(S:SetEnabled(false))
++F.RunTimer(0.1)
++assert(calls == 1 and DB.session.screenshots.records[2].status == 'cancelled-before-request')
++-- Manual request remains available with automation disabled; synchronous events work.
++F.clock = F.clock + 31
++_G.Screenshot = function() calls = calls + 1; S:OnEvent('SCREENSHOT_SUCCEEDED') end
++assert(S:Request(F.secret, F.secret, false))
++assert(F.RunTimer(0.1))
++assert(S._pending == nil and calls == 2)

@@ -1,0 +1,184 @@
++`TAINT_STATE` is a normal restriction transition, not a failure: it increments `restrictionChanges`, not the session taint-error count, and never triggers an automatic screenshot. Blocked/forbidden events still count as taint incidents.
++
++Ordinary Lua error messages mentioning secret values/tables get the searchable `SECRET_ACCESS_MESSAGE` category with `classification = "message-heuristic"`. This is not a hidden-value reader. Inaccessible values and opaque escape text remain markers; no declassification, private UI inspection, protected-action retry or inferred combat data is attempted.
++
++Capture is best-effort. The library cannot guarantee every failure: another owner may hide hard errors, a foreign `pcall` may swallow errors without reporting, and a logic/UI defect may never raise an exception. Ignore rules, throttling, queue eviction and retention limits can omit records. Intake counters count attempts, including boot-queue retries, not unique errors.
++
++## Report incorrect behavior explicitly
++
++Use existing integration APIs for invariant failures and ordinary addon-owned state. Do not pass managed/forbidden frame objects, secret values or unbounded gameplay logs as diagnostic payloads.
++
++```lua
++local RDL = _G.RothDevLib
++if RDL then
++    -- Evaluate only your own ordinary configuration/model state here.
++    RDL:Report("MyAddon", "ANOMALY", "Layout result differs from requested state", {
++        func = "ApplyLayout",
++        code = "LAYOUT_MISMATCH",
++        extra = {
++            scenario = "profile-switch",
++            expected = "two-columns",
++            observed = "one-column",
++            revision = "my-addon-commit-or-version",
++        },
++    })
++end
++```
++
++`SafeCall`, `Assert`, breadcrumbs and explicit reports remain useful for swallowed errors and failed expectations. They cannot automatically establish that arbitrary gameplay or UI behavior is wrong.
++
++## Screenshots
++
++```text
++/rdev screenshot on       enable automatic requests
++/rdev screenshot off      disable automatic requests and cancel queued work
++/rdev screenshot now      request one manual diagnostic image
++/rdev screenshot status   inspect enablement and the request budget
++```
++
++Automatic capture is **off by default**. It responds only to newly committed `LUA_ERROR`, `SUPPRESSED`, `ASSERT`, `TAINT_BLOCKED`, `TAINT_FORBIDDEN` and explicit `ANOMALY` records after initialization. It does not screenshot every ordinary restriction event, warning, CPU alert or repeated signature.
++
++Requests are deferred outside immediate error processing, at least 30 seconds apart, with one pending request and a total limit of 20 attempts per UI session. `/rdev clear` does not reset that attempt/cooldown budget. A missing completion event becomes `completion-unconfirmed` after 10 seconds; there is no retry loop.
++
++The image is written by the normal client `Screenshot()` facility, separately from SavedVariables. The ledger `sessions[i].screenshots.records` stores request/session ID, signature, timestamps and observed outcome. Screenshot result events have **no request ID or filename**. A success event observed while our request is pending is useful correlation, not guaranteed file attribution when the user/another addon also takes screenshots. No filename is fabricated. Deferred images show the later rendered scene, not necessarily the exact error frame.
++
++Screenshots contain the **whole visible screen, potentially names, chat and other private information**. RothDevLib does not hide the UI, alter CVars, read image pixels, upload files or send anything to an agent. Review images and SavedVariables before sharing them.
++
++## Source and validation boundary
++
++Public contracts inspected:
++
++- `Gethe/wow-ui-source@297d7aaaa736f346b3e036f38ee088eaf7f8c07f`, Retail 12.1.5.70783: `Interface/AddOns/Blizzard_APIDocumentationGenerated/ClientDocumentation.lua:Screenshot` and `VideoDocumentation.lua:SCREENSHOT_SUCCEEDED/SCREENSHOT_FAILED`. No filename/request payload is declared.
++- `Gethe/wow-ui-source@d07eb00237d8891f153215db98a5df880a26cfe5`, Retail 12.1.5.70688: `AddOnProfilerDocumentation.lua:IsEnabled/GetTopKAddOnsForMetric/GetAddOnMetric/GetOverallMetric`; the KB's reviewed 70783 delta does not change this contract.
++- Owning KB guides: `KB/deep/WoWDevSecretValue_KB_12.1.5.md`, `KB/core/BlizzardUI_Performance_Modules.md`, selected 12.1.5 contract overlays.
++
++Offline tests exercise persistence/reload normalization, measurement status/limits, the error-to-export path, screenshot lifecycle and failure paths, and event teardown. Actual WoW capture/rendering, hardware/client policy, real taint/Secret Values and save timing remain **NOT-RUN**. Verify screenshots, shutdown save/reload, native metric readings and no self-caused blocked actions in the named client before declaring runtime PASS.
+--- /dev/null
++++ b/tests/helpers/mission_fixture.lua
+@@ -0,0 +1,61 @@
++-- Small ordinary-client fixture; production code is loaded unmodified by callers.
++local F = { clock = 100, epoch = 1700000000, timers = {}, tickers = {} }
++_G.RothDevLib = { name = 'RothDevLib', addonName = '!RothDevLib', version = 'test' }
++_G.RothDevLibDB = nil
++_G.time = function() return F.epoch + math.floor(F.clock) end
++_G.GetTime = function() return F.clock end
++_G.GetTimePreciseSec = GetTime
++_G.date = os.date
++_G.GetBuildInfo = function() return '12.1.5', '70783', 'date', 120105 end
++_G.GetLocale = function() return 'enUS' end
++_G.UnitName = function() return 'Tester' end
++_G.UnitClass = function() return 'Mage', 'MAGE', 8 end
++_G.GetRealmName = function() return 'Realm' end
++_G.IsInInstance = function() return false, 'none' end
++_G.GetInstanceInfo = function() return 'Zone', 'none', 0, '', 0, 0, false, 0 end
++_G.UnitAffectingCombat = function() return false end
++_G.IsEncounterInProgress = function() return false end
++_G.GetRealZoneText = function() return 'Zone' end
++_G.GetSubZoneText = function() return '' end
++_G.InCombatLockdown = function() return false end
++_G.GetFramerate = function() return 90 end
++_G.wipe = function(t) for k in pairs(t) do t[k] = nil end; return t end
++_G.debugstack = function() return 'Interface/AddOns/Observer/Event.lua:71: in function observer' end
++local handler = function() end
++_G.geterrorhandler = function() return handler end
++_G.seterrorhandler = function(fn) handler = fn end
++_G.hooksecurefunc = function() end
++F.secret = setmetatable({}, { __index = function() error('secret read') end,
++  __tostring = function() error('secret stringify') end })
++_G.canaccessvalue = function(v) return v ~= F.secret end
++_G.issecretvalue = function(v) return v == F.secret end
++_G.canaccesstable = function(v) return v ~= F.secret end
++_G.issecrettable = function(v) return v == F.secret end
++_G.canaccessallvalues = function(...) for i = 1, select('#', ...) do
++  if select(i, ...) == F.secret then return false end
++end; return true end
++_G.C_Timer = {
++  After = function(delay, fn) F.timers[#F.timers + 1] = { delay = delay, fn = fn } end,
++  NewTicker = function(interval, fn)
++    local ticker = { interval = interval, fn = fn }
++    function ticker:Cancel() self.cancelled = true end
++    F.tickers[#F.tickers + 1] = ticker
++    return ticker
++  end,
++}
++function F.RunTimer(delay)
++  for i, timer in ipairs(F.timers) do
++    if timer.delay == delay then table.remove(F.timers, i); timer.fn(); return true end
++  end
++  return false
++end
++function F.Load(path) return assert(loadfile(path))() end
++F.Load('Util/SecretGuard.lua')
++F.Load('Util/Util.lua')
++F.Load('Util/BoundedCopy.lua')
++F.Load('Core/DB.lua')
++F.Load('Core/DBLifecycle.lua')
++RothDevLib.DB:MarkPlayerReady()
++assert(RothDevLib.DB:Init())
++F.Load('Integration/Callbacks.lua')
++return F
+--- /dev/null
++++ b/tests/test_agent_diagnostics.lua
+@@ -0,0 +1,91 @@
++local F = assert(loadfile('tests/helpers/mission_fixture.lua'))()
++local R, DB = RothDevLib, RothDevLib.DB
++local addonCount = 130
++_G.C_AddOns = {
++  GetNumAddOns = function() return addonCount end,
++  GetAddOnInfo = function(i) return 'Addon' .. i end,
++  IsAddOnLoaded = function(i) return true, i ~= 2 end,
++  GetAddOnMetadata = function(i) return i == 1 and F.secret or 'v1' end,
++}
++_G.Enum = { AddOnProfilerMetric = { RecentAverageTime = 1, SessionAverageTime = 2,
++  PeakTime = 3, CountTimeOver5Ms = 4, CountTimeOver50Ms = 5 } }
++local enabled, nativeCalls = true, 0
++_G.C_AddOnProfiler = {
++  IsEnabled = function() return enabled end,
++  GetTopKAddOnsForMetric = function(metric, k)
++    nativeCalls = nativeCalls + 1
++    assert(metric == 1 and k == 20)
++    return { { addOnName = 'Addon1', metricValue = 3.5 },
++      { addOnName = F.secret, metricValue = F.secret } }
++  end,
++  GetAddOnMetric = function(name, metric)
++    assert(name == 'Addon1')
++    return metric == 5 and F.secret or metric * 2
++  end,
++  GetOverallMetric = function() return 8 end,
++}
++local stats = {}
++for i = 1, 40 do stats['Addon:Fn' .. i] = { n = i, total = i * 10, max = i, last = i, ema = i } end
++R.CPU = { GetStats = function() return stats end }
++R.Mem = { GetStats = function() return stats end, GetKB = function() return 1234 end }
++R.Logger = { GetText = function() return string.rep('x', 10000) .. 'LATEST' end }
++R.Capture = { ownsHandler = false, _fallback = { kind = 'unavailable' },
++  _intakeStats = { stored = 3, throttled = 5 }, _bootQueue = {} }
++F.Load('Core/Diagnostics.lua')
++local D = R.Diagnostics
++D:Init()
++local evidence = DB.session.diagnostics
++assert(evidence and evidence.schema == 1)
++assert(evidence.system.build.build == '70783' and evidence.system.inCombat == false)
++assert(evidence.coverage.handlerOwned == false and evidence.coverage.intakeAttempts.throttled == 5)
++assert(#evidence.addons.rows == 128 and evidence.addons.omitted == 2)
++assert(evidence.addons.rows[2].loaded == false)
++assert(evidence.addons.rows[1].version == '<inaccessible>')
++assert(#evidence.wrappedCPU.rows == 32 and evidence.wrappedCPU.omitted == 8)
++assert(evidence.wrappedCPU.rows[1].key == 'Addon:Fn40')
++assert(evidence.nativeProfiler.status == 'available' and #evidence.nativeProfiler.rows == 1)
++assert(evidence.nativeProfiler.rows[1].CountTimeOver5Ms == 8)
++assert(evidence.nativeProfiler.rows[1].CountTimeOver50Ms == nil)
++assert(evidence.nativeProfiler.countUnit == 'ticks')
++assert(#evidence.log == 8192 and evidence.log:sub(-6) == 'LATEST')
++assert(evidence.samples[1].fps == 90 and evidence.samples[1].globalLuaHeapKB == 1234)
++assert(F.tickers[1].interval == 30)
++stats['Addon:Fn40'].total = 99999
++assert(evidence.wrappedCPU.rows[1].total == 400) -- detached, not a live reference
++for i = 1, 70 do F.clock = F.clock + 30; assert(D:Checkpoint('test')) end
++assert(#DB.session.diagnostics.samples == 60)
++enabled = false
++assert(D:Checkpoint('disabled'))
++assert(DB.session.diagnostics.nativeProfiler.status == 'disabled')
++assert(DB.session.diagnostics.nativeProfiler.overallRecentMs == nil)
++local before = nativeCalls
++DB:GetSettings().enablePerfProfiling = false

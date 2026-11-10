@@ -1,0 +1,64 @@
+name: Validate agent evidence changes
+on:
+  push:
+    branches: [gpt/rdl-evidence-staging-20261110]
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/gpt/rdl-evidence-staging-20261110'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Apply checksum-verified patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "22b53f89695875a5e82fa8e799feb8bf73383abd"
+          cat .rdl-evidence/evidence-*.txt > /tmp/rdl-mission.patch
+          echo "e932097cd0ceacacfe9a252381be7eddd794d86b5bd175bd0c2444464807ac02  /tmp/rdl-mission.patch" | sha256sum -c -
+          cp .rdl-evidence/manifest.json /tmp/rdl-manifest.json
+          git apply --check /tmp/rdl-mission.patch
+          git apply /tmp/rdl-mission.patch
+          rm -r .rdl-evidence
+          rm .github/workflows/rdl-evidence-apply.yml
+      - name: Install Lua test runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y texlive-binaries
+      - name: Regression and syntax gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh tests/run.sh
+          while IFS= read -r -d '' file; do texluac -p "$file"; done < <(find Capture Core Doctor Export Integration Perf UI Util -type f -name '*.lua' -print0)
+          git diff --check
+          printf 'Regression files: '
+          find tests -maxdepth 1 -name 'test_*.lua' | wc -l
+      - name: Verify exact final source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -A
+          python3 - <<'PY'
+          import hashlib, json, pathlib, subprocess
+          expected = json.loads(pathlib.Path('/tmp/rdl-manifest.json').read_text())
+          for name, sha in expected.items():
+              data = pathlib.Path(name).read_bytes()
+              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              assert actual == sha, (name, actual, sha)
+          changed = subprocess.check_output(['git', 'diff', '--cached', '--name-only', '22b53f89695875a5e82fa8e799feb8bf73383abd'], text=True).splitlines()
+          assert set(changed) == set(expected), changed
+          print('Exact source verified:', len(expected), 'files')
+          PY
+      - name: Retain validated tree on staging branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Validate persisted agent evidence and optional screenshots'
+          git push origin "HEAD:${GITHUB_REF_NAME}"

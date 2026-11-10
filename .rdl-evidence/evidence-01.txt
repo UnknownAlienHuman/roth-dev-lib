@@ -1,0 +1,297 @@
+   while #db.sessions > FAILURE_MAX_SESSIONS do table.remove(db.sessions) end
+   NormalizeSessions(db)
+   db._schema = SCHEMA
++  for _, session in ipairs(db.sessions) do
++    session.diagnostics = nil
++    session.screenshots = nil
++  end
+   db.persistence = {
+     event = "SAVED_VARIABLES_TOO_LARGE",
+     lastFailureAt = Now(),
+@@ -642,6 +672,39 @@
+     if not ok or ready ~= true then return false end
+   end
+   return NormalizeDatabase(self) and true
++end
++
++function DB:SaveDiagnostics(evidence)
++  if self._writesSuspended or not self:IsReady() or type(self.session) ~= "table" then return false end
++  local copy = CompactDiagnostic(evidence, DIAGNOSTIC_LIMITS)
++  if type(copy) ~= "table" then return false end
++  self.session.diagnostics = copy
++  for index = 6, #(self.raw.sessions or {}) do
++    self.raw.sessions[index].diagnostics = nil
++    self.raw.sessions[index].screenshots = nil
++  end
++  return true
++end
++
++function DB:SaveScreenshotEvidence(evidence)
++  if self._writesSuspended or not self:IsReady() or type(self.session) ~= "table" then return false end
++  local copy = CompactDiagnostic(evidence, SCREENSHOT_LIMITS)
++  if type(copy) ~= "table" then return false end
++  self.session.screenshots = copy
++  return true
++end
++
++function DB:GetDiagnosticSessions()
++  local result = {}
++  for index = 1, math.min(#(self.raw and self.raw.sessions or {}), 5) do
++    local session = self.raw.sessions[index]
++    if session.diagnostics or session.screenshots then
++      result[#result + 1] = { id = session.id, started = session.started, ended = session.ended,
++        diagnostics = CompactDiagnostic(session.diagnostics, DIAGNOSTIC_LIMITS),
++        screenshots = CompactDiagnostic(session.screenshots, SCREENSHOT_LIMITS) }
++    end
++  end
++  return result
+ end
+ 
+ function DB:IsWriteSuspended()
+@@ -685,7 +748,11 @@
+   end
+   HardTrimRuntimeGroups(self)
+   if type(self.raw) == "table" and type(self.raw.groups) == "table" then
+-    return self.raw.groups[entry.sig]
++    local committed = self.raw.groups[entry.sig]
++    if committed and type(RDL.Fire) == "function" then
++      pcall(RDL.Fire, RDL, "RDL_CAPTURE", entry, committed)
++    end
++    return committed
+   end
+   return group
+ end
+@@ -698,6 +765,13 @@
+     local db = type(self.raw) == "table" and self.raw or _G.RothDevLibDB
+     if type(db) == "table" then db.persistence = nil end
+     self._normalizedRoot = nil
+-    return OriginalClear(self)
+-  end
+-end
++    local result = OriginalClear(self)
++    if RDL.Screenshots and type(RDL.Screenshots.ClearSession) == "function" then
++      pcall(RDL.Screenshots.ClearSession, RDL.Screenshots)
++    end
++    if RDL.Diagnostics and type(RDL.Diagnostics.Init) == "function" then
++      pcall(RDL.Diagnostics.Init, RDL.Diagnostics)
++    end
++    return result
++  end
++end
+--- a/Core/Events.lua
++++ b/Core/Events.lua
+@@ -80,6 +80,8 @@
+ SafeRegisterEvent("MACRO_ACTION_FORBIDDEN")
+ SafeRegisterEvent("ADDON_RESTRICTION_STATE_CHANGED")
+ SafeRegisterEvent("PLAYER_REGEN_ENABLED")
++SafeRegisterEvent("SCREENSHOT_SUCCEEDED")
++SafeRegisterEvent("SCREENSHOT_FAILED")
+ 
+ local shutdownDone = false
+ 
+@@ -92,6 +94,8 @@
+ end
+ 
+ local function StopRuntimeConsumers()
++  if RDL.Diagnostics then ICall("Diagnostics:Stop", RDL.Diagnostics.Stop, RDL.Diagnostics) end
++  if RDL.Screenshots then ICall("Screenshots:Stop", RDL.Screenshots.Stop, RDL.Screenshots) end
+   InvalidateChatTap()
+   local capture = RDL.Capture
+   if capture and capture.BugGrabber and type(capture.BugGrabber.Disable) == "function" then
+@@ -181,6 +185,9 @@
+     OptionalCall("Mem:StartWatcher", RDL.Mem.StartWatcher, RDL.Mem)
+   end
+ 
++  if RDL.Screenshots then OptionalCall("Screenshots:Init", RDL.Screenshots.Init, RDL.Screenshots) end
++  if RDL.Diagnostics then OptionalCall("Diagnostics:Init", RDL.Diagnostics.Init, RDL.Diagnostics) end
++
+   RDL._initFailure = nil
+   RDL._initialized = true
+   RDL._initializing = false
+@@ -224,6 +231,9 @@
+   RDL._initializing = false
+ 
+   StopRuntimeConsumers()
++  if RDL.Diagnostics then
++    ICall("Diagnostics:Checkpoint", RDL.Diagnostics.Checkpoint, RDL.Diagnostics, reason)
++  end
+   if RDL.DB and type(RDL.DB.OnShutdown) == "function" then
+     ICall("DB:OnShutdown", RDL.DB.OnShutdown, RDL.DB, reason)
+   end
+@@ -239,7 +249,13 @@
+   local db = RDL.DB
+   if not (db and type(db.HandlePersistenceFailure) == "function") then return false end
+   local ok, handled = pcall(db.HandlePersistenceFailure, db, addonName)
+-  if ok then return handled == true end
++  if ok then
++    if handled == true then
++      if RDL.Diagnostics then ICall("Diagnostics:Stop", RDL.Diagnostics.Stop, RDL.Diagnostics) end
++      if RDL.Screenshots then ICall("Screenshots:Stop", RDL.Screenshots.Stop, RDL.Screenshots) end
++    end
++    return handled == true
++  end
+ 
+   if type(_G.print) == "function" then
+     pcall(_G.print,
+@@ -272,6 +288,7 @@
+ frame:SetScript("OnEvent", function(_, event, ...)
+   if event == "ADDON_LOADED" then
+     local name = ...
++    if RDL.Diagnostics then RDL.Diagnostics._inventoryDirty = true end
+     if name == RDL.addonName then
+       -- File loading is complete, but player/session state is still deferred.
+       if RDL.Logger then OptionalCall("Logger:Init", RDL.Logger.Init, RDL.Logger) end
+@@ -317,6 +334,13 @@
+     return
+   end
+ 
++  if event == "SCREENSHOT_SUCCEEDED" or event == "SCREENSHOT_FAILED" then
++    if RDL.Screenshots then
++      ICall("Screenshots:OnEvent", RDL.Screenshots.OnEvent, RDL.Screenshots, event)
++    end
++    return
++  end
++
+   local capture = RDL.Capture
+   if not capture then return end
+ 
+--- a/Doctor/Validation.lua
++++ b/Doctor/Validation.lua
+@@ -23,11 +23,6 @@
+ local function SafeCall(fn, ...)
+   if type(fn) ~= "function" then return false, nil end
+   return pcall(fn, ...)
+-end
+-
+-local function HasAddonPath(stack)
+-  if type(stack) ~= "string" then return false end
+-  return stack:find("Interface/AddOns/" .. tostring(RDL.addonName) .. "/", 1, true) ~= nil
+ end
+ 
+ local function GetSettings()
+@@ -97,21 +92,16 @@
+     self.taint.state = (self.taint.state or 0) + 1
+   end
+ 
+-  if kind:match("^TAINT_") then
+-    local isSelf = false
+-    if entry.addon == RDL.addonName then
+-      isSelf = true
+-    elseif HasAddonPath(entry.stack) then
+-      isSelf = true
+-    end
++  if kind == "TAINT_BLOCKED" or kind == "TAINT_FORBIDDEN" then
++    -- Native taint events expose the blocked addon, not the original taint
++    -- source. An observer stack inevitably contains our own handler path.
++    local isSelf = entry.addon == RDL.addonName or entry.addon == RDL.name
+ 
+     if isSelf then
+       if kind == "TAINT_BLOCKED" then
+         self.taint.selfBlocked = (self.taint.selfBlocked or 0) + 1
+       elseif kind == "TAINT_FORBIDDEN" then
+         self.taint.selfForbidden = (self.taint.selfForbidden or 0) + 1
+-      elseif kind == "TAINT_STATE" then
+-        self.taint.selfState = (self.taint.selfState or 0) + 1
+       end
+     end
+   end
+--- a/Export/Export.lua
++++ b/Export/Export.lua
+@@ -247,6 +247,10 @@
+           message = OptionalText(RawField(entry, "message"), 4096),
+           origin = OriginSnapshot(RawField(entry, "origin")),
+           stackTop = StackTopLines(RawField(entry, "stack"), 6),
++          evidence = SafeCopy(RawField(entry, "evidence"), {
++            maxDepth = 4, maxEntries = 24, maxNodes = 120,
++            maxStringBytes = 512, maxTotalBytes = 4096,
++          }),
+         }
+       end
+       if #occurrences > 0 then object.occurrences = occurrences end
+@@ -303,6 +307,16 @@
+     while #candidates > maximum do candidates[#candidates] = nil end
+   end
+   return candidates, total
++end
++
++local function SessionMetadata()
++  local source = RDL.DB and RDL.DB.session
++  local metadata = {}
++  local fields = { "id", "started", "ended", "build", "character", "class", "spec",
++    "errors", "warnings", "taints", "restrictionChanges", "suppressed", "alerts", "asserts", "throttledCount" }
++  for _, key in ipairs(fields) do metadata[key] = RawField(source, key) end
++  return SafeCopy(metadata, { maxDepth = 2, maxEntries = 32, maxNodes = 64,
++    maxStringBytes = 1024, maxTotalBytes = 8192 })
+ end
+ 
+ local function BuildBaseEnvelope(kind)
+@@ -344,10 +358,7 @@
+       name = "!RothDevLib",
+       version = SafeText(RDL.version, "", 128),
+     },
+-    session = RDL.DB and SafeCopy(RDL.DB.session, {
+-      maxDepth = 3, maxEntries = 40, maxNodes = 200,
+-      maxStringBytes = 1024, maxTotalBytes = 32 * 1024,
+-    }) or nil,
++    session = SessionMetadata(),
+   }
+ end
+ 
+@@ -371,6 +382,15 @@
+ function Export:BuildFullObject(options)
+   local limits = NormalizeFullOptions(options)
+   local envelope = BuildBaseEnvelope(limits.exportKind)
++  if RDL.DB and type(RDL.DB.GetDiagnosticSessions) == "function" then
++    local ok, sessions = pcall(RDL.DB.GetDiagnosticSessions, RDL.DB)
++    if ok then
++      envelope.diagnosticSessions = SafeCopy(sessions, {
++        maxDepth = 10, maxEntries = 256, maxNodes = 20000,
++        maxStringBytes = 8192, maxTotalBytes = 2 * 1024 * 1024,
++      })
++    end
++  end
+   envelope.limits = {
+     maxGroups = limits.maxGroups,
+     maxOccurrences = limits.maxOccurrences,
+--- a/Export/Packer.lua
++++ b/Export/Packer.lua
+@@ -107,13 +107,23 @@
+   return SafeText(value, "<unavailable>", 8192)
+ end
+ 
++local function EvidenceCopy(value, entries, bytes)
++  local util = RDL.Util
++  if not util or type(util.CopyDiagnosticValue) ~= "function" then return nil end
++  local ok, copy = pcall(util.CopyDiagnosticValue, util, value, {
++    maxDepth = 6, maxEntries = entries or 24, maxNodes = 500,
++    maxStringBytes = 512, maxTotalBytes = bytes or 4096,
++  })
++  if ok then return copy end
++end
++
+ local function KindWeight(kind)
+   if kind == "LUA_ERROR" then return 100 end
+   if kind == "TAINT_FORBIDDEN" then return 85 end
+-  if kind == "TAINT_STATE" then return 80 end
++  if kind == "TAINT_STATE" then return 5 end
+   if kind == "TAINT_BLOCKED" then return 75 end
+   if kind == "ALERT" then return 60 end
+-  if kind == "ASSERT" then return 55 end
++  if kind == "ASSERT" or kind == "ANOMALY" then return 70 end
+   if kind == "LUA_WARNING" then return 40 end
+   if kind == "SUPPRESSED" then return 30 end
+   return 10
+@@ -324,6 +334,7 @@
+     object.locals = SafeText(RawField(group, "locals"), nil, limits.maxLocalsBytes)
+   end
+   object.doctor = CompactDoctor(RawField(group, "ctx"), limits.maxDoctorBytes)
++  object.evidence = EvidenceCopy(RawField(RawField(RawField(group, "ctx"), "extra"), "evidence"), 12, 2048)
+ 
+   local bus = RawField(group, "bus")
+   if CanAccessTable(bus) then
+@@ -380,6 +391,7 @@
+     maxLocalsBytes = ClampInteger(RawOption(options, "maxLocalsBytes"), 1600, 0, 64 * 1024),
+     maxDoctorBytes = ClampInteger(RawOption(options, "maxDoctorBytes"), 640, 0, 16 * 1024),
+     includeLog = RawOption(options, "includeLog") == true,
++    includeDiagnostics = RawOption(options, "includeDiagnostics") ~= false,
+     maxLogBytes = ClampInteger(RawOption(options, "maxLogBytes"), 4000, 0, 64 * 1024),

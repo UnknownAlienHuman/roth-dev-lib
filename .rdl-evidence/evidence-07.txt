@@ -1,0 +1,38 @@
++assert(DB.session.screenshots.records[3].reason == '<inaccessible>')
++-- No event: record uncertainty, do not retry or assert success.
++F.clock = F.clock + 31
++_G.Screenshot = function() calls = calls + 1 end
++assert(S:Request('no-event'))
++F.RunTimer(0.1)
++while F.RunTimer(10) do end
++assert(DB.session.screenshots.records[4].status == 'completion-unconfirmed')
++-- API failure is terminal and does not recurse through error intake.
++F.clock = F.clock + 31
++_G.Screenshot = function() error('denied') end
++assert(S:Request('failure'))
++F.RunTimer(0.1)
++assert(DB.session.screenshots.records[5].status == 'call-failed')
++-- Stop invalidates queued requests, including delayed callbacks from older generations.
++F.clock = F.clock + 31
++assert(S:Request('stop'))
++S:Stop()
++F.RunTimer(0.1)
++assert(DB.session.screenshots.records[6].status == 'interrupted')
++S:Init()
++-- The total attempt budget cannot be bypassed by /rdev clear.
++local attempts = S._attempts
++DB:Clear()
++assert(S._attempts == attempts and #DB.session.screenshots.records == 0)
++_G.Screenshot = function() S:OnEvent('SCREENSHOT_FAILED') end
++while S._attempts < 20 do
++  F.clock = F.clock + 31
++  assert(S:Request('limit'))
++  F.RunTimer(0.1)
++end
++F.clock = F.clock + 31
++ok, why = S:Request('overflow')
++assert(not ok and why == 'session-limit')
++assert(#DB.session.screenshots.records == 20 - attempts)
++assert(DB:HandlePersistenceFailure('!RothDevLib'))
++assert(S:Request('suspended') == false)
++print('screenshot lifecycle tests: ok')

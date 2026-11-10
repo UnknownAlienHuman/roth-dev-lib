@@ -1,0 +1,243 @@
+     timelineMax = ClampInteger(RawOption(options, "timelineMax"), 24, 0, MAX_TIMELINE),
+     timelineMsgBytes = ClampInteger(RawOption(options, "timelineMsgBytes"), 200, 32, 4096),
+@@ -441,6 +453,7 @@
+     SetAtMost(limits, "maxGroups", 32, changes)
+     SetAtMost(limits, "maxLogBytes", 1024, changes)
+   elseif stage == 3 then
++    Disable(limits, "includeDiagnostics", changes)
+     SetAtMost(limits, "maxStackLines", 2, changes)
+     Disable(limits, "maxLocalsBytes", changes)
+     SetAtMost(limits, "maxMsgBytes", 256, changes)
+@@ -477,6 +490,56 @@
+   }
+ end
+ 
++-- Full evidence stays in SavedVariables/full JSON. A pack has only the newest
++-- session, three ranked rows per profiler, and three recent screenshot outcomes.
++local function DiagnosticSummary(source)
++  local session = RawField(source, 1)
++  if not CanAccessTable(session) then return nil end
++  local diagnostic = RawField(session, "diagnostics")
++  local output = { sessionId = RawField(session, "id"),
++    checkpointAt = RawField(diagnostic, "ts"),
++    detail = "Newest session summary; full evidence: diagnosticSessions in full JSON / sessions in SavedVariables" }
++  output.coverage = EvidenceCopy(RawField(diagnostic, "coverage"), 24, 4096)
++  output.nativeProfiler = EvidenceCopy(RawField(diagnostic, "nativeProfiler"), 24, 8192)
++  if type(output.nativeProfiler) == "table" and type(output.nativeProfiler.rows) == "table" then
++    local rows = output.nativeProfiler.rows
++    output.nativeProfiler.omittedFromPack = math.max(0, #rows - 3)
++    for i = #rows, 4, -1 do rows[i] = nil end
++  end
++  for _, key in ipairs({ "wrappedCPU", "wrappedMemory" }) do
++    local snapshot = RawField(diagnostic, key)
++    local rows = RawField(snapshot, "rows")
++    local top = {}
++    for i = 1, 3 do
++      local row = RawField(rows, i)
++      if not CanAccessTable(row) then break end
++      top[#top + 1] = EvidenceCopy(row, 8, 1024)
++    end
++    output[key] = { status = RawField(snapshot, "status"), rows = top,
++      unit = key == "wrappedCPU" and "ms" or "global-Lua-heap-delta-KB",
++      scope = "instrumented-calls-only" }
++  end
++  output.cpuSampleRate = RawField(diagnostic, "cpuSampleRate")
++  local screenshots = RawField(session, "screenshots")
++  if CanAccessTable(screenshots) then
++    output.screenshots = { attempts = RawField(screenshots, "attempts"),
++      correlation = "global-events-without-request-id-or-filename", records = {} }
++    local records = RawField(screenshots, "records")
++    local count = 0
++    for i = 1, 20 do if CanAccessTable(RawField(records, i)) then count = i else break end end
++    for i = math.max(1, count - 2), count do
++      local item = RawField(records, i)
++      output.screenshots.records[#output.screenshots.records + 1] = {
++        id = RawField(item, "id"), requestedAt = RawField(item, "requestedAt"),
++        status = SafeText(RawField(item, "status"), nil, 64),
++        signaturePrefix = SafeText(RawField(item, "signature"), nil, 256),
++      }
++    end
++    output.screenshots.omittedFromPack = math.max(0, count - 3)
++  end
++  return output
++end
++
+ local function BuildPolicyDoc()
+   return {
+     strategy = "single-snapshot-coarse-degradation",
+@@ -502,6 +565,7 @@
+   local groups = {}
+   for index = 1, groupCount do groups[index] = SerializeGroup(context.groups[index], limits) end
+   object.groups = groups
++  if limits.includeDiagnostics then object.diagnostics = context.diagnostics end
+   object.addonStats = BuildAddonStats(context.groups, groupCount)
+   object.timeline = SerializeTimeline(context.recent, limits.timelineMax, limits.timelineMsgBytes)
+   if limits.includeLog and context.log then
+@@ -523,6 +587,7 @@
+       timelineMax = limits.timelineMax,
+       timelineMsgBytes = limits.timelineMsgBytes,
+       includeLog = limits.includeLog == true,
++      includeDiagnostics = limits.includeDiagnostics == true,
+       maxLogBytes = limits.maxLogBytes,
+     },
+     byteBudget = {
+@@ -532,6 +597,8 @@
+     },
+     byteBudgetPolicy = BuildPolicyDoc(),
+     degradation = DegradationTail(degradation),
++    diagnostics = context.diagnostics and (limits.includeDiagnostics and "summary" or "omitted-by-budget-or-option")
++      or "unavailable",
+     limitations = {
+       "Packed export is size-constrained and fields are truncated deterministically.",
+       "WoW sandbox output is copy-only; no external attachment is created.",
+@@ -579,6 +646,7 @@
+     includeOccurrences = false,
+     includeLog = false,
+   })
++  context.diagnostics = DiagnosticSummary(context.base.diagnosticSessions)
+   context.log = limits.includeLog and SnapshotLog(limits.maxLogBytes) or nil
+ 
+   local degradation = {}
+--- a/README.md
++++ b/README.md
+@@ -6,7 +6,7 @@
+ 
+ - Retail target: **12.1.5**
+ - Interface: **120105**
+-- Version: **1.0.0-alpha.20.0**
++- Version: **1.0.0-alpha.20.1**
+ - Saved variables: `RothDevLibDB`
+ 
+ The implementation is aligned with Blizzard UI source build **12.1.5 (70783)**. The complete offline regression suite and first-party Lua syntax gate pass in GitHub Actions. The named-client validation matrix remains required before release.
+@@ -45,6 +45,21 @@
+ - File-load errors use a bounded boot queue and receive the real session only when committed.
+ - Blizzard UI is observed or post-hooked. RothDevLib does not replace Blizzard frame methods, mutate popup definitions or unregister events owned by other frames.
+ 
++## Evidence for offline agents
++
++Session diagnostics now survive reload: native addon CPU metrics, instrumented
++CPU/memory summaries, FPS/heap samples, capture coverage and recent breadcrumbs
++are checkpointed into `RothDevLibDB.sessions`. Use `/rdev checkpoint`, then normal
++`/reload` or logout to let the client write SavedVariables. A checkpoint alone
++is not a disk flush.
++
++Optional `/rdev screenshot on` captures diagnostic images with a cooldown and
++session limit; it is off by default and includes the visible UI/chat. Screenshot
++metadata is saved separately from the image; the API does not return a filename.
++
++See [the agent evidence guide](docs/AGENT_DIAGNOSTICS.md) for data locations,
++commands, performance semantics, anomaly instrumentation and attribution limits.
++
+ ## Validation
+ 
+ Offline checks live in `tests/` and run through `.github/workflows/ci.yml`. Runtime gates are `/rdev gate`, `/rdev stress`, `/rdev reloadloop`, and the matrix in [todo.md](todo.md).
+--- a/UI/Slash.lua
++++ b/UI/Slash.lua
+@@ -11,6 +11,40 @@
+ SlashCmdList["ROTHDEVLIB"] = function(msg)
+   local rawMsg = (msg or ""):match("^%s*(.-)%s*$")
+   msg = rawMsg:lower()
++
++  local screenshotArg = msg:match("^screenshot%s*(.*)$")
++  if screenshotArg ~= nil then
++    local screenshots = RDL.Screenshots
++    if not screenshots or not RDL.DB or not RDL.DB:IsReady() then
++      print("RothDevLib: screenshot service is not ready.")
++      return
++    end
++    if screenshotArg == "on" or screenshotArg == "off" then
++      if not screenshots:SetEnabled(screenshotArg == "on") then
++        print("RothDevLib: automatic screenshot callback could not be registered.")
++        return
++      end
++      print("RothDevLib: automatic screenshots " .. screenshotArg
++        .. ". Screenshots include visible UI/chat; limits: 20 per UI session, 30 seconds apart.")
++    elseif screenshotArg == "now" or screenshotArg == "" then
++      local ok, detail = screenshots:Request("manual", nil, false)
++      print("RothDevLib: screenshot " .. (ok and "queued #" or "not requested: ") .. tostring(detail))
++    elseif screenshotArg == "status" then
++      local state = screenshots:GetSnapshot()
++      print("RothDevLib: auto screenshots=" .. tostring(state.enabled)
++        .. "; attempts=" .. tostring(state.attempts) .. "/" .. tostring(state.limit))
++    else
++      print("Usage: /rdev screenshot on|off|now|status")
++    end
++    return
++  end
++
++  if msg == "checkpoint" then
++    local ok = RDL.Diagnostics and RDL.Diagnostics:Checkpoint("manual")
++    print(ok and "RothDevLib: diagnostics checkpoint updated in SavedVariables memory; /reload or logout writes the file."
++      or "RothDevLib: checkpoint unavailable, disabled or writes suspended.")
++    return
++  end
+ 
+   -- ChatTap helpers
+   local chatCmd, chatArg = msg:match("^(chat)%s*(.*)$")
+@@ -79,6 +113,7 @@
+       memWatchIntervalSec = "number",
+       memWatchEnabled = "bool",
+       enablePerfProfiling = "bool",
++      persistDiagnostics = "bool",
+       uiUseScrollBoxList = "bool",
+       uiUseButtonFrameShell = "bool",
+       maxBreadcrumbsPerAddon = "number",
+@@ -120,6 +155,7 @@
+ 
+     local old = settings[setKey]
+     settings[setKey] = parsed
++    if setKey == "persistDiagnostics" and RDL.Diagnostics then RDL.Diagnostics:Init() end
+     print("|cffffff00RothDevLib|r set " .. tostring(setKey) .. " = " .. tostring(parsed) .. " (was " .. tostring(old) .. ")")
+     if UI and UI.Refresh then pcall(function() UI:Refresh() end) end
+     if UI and UI.RefreshMonitor then pcall(function() UI:RefreshMonitor() end) end
+@@ -667,6 +703,8 @@
+   print("|cffffff00RothDevLib|r commands:")
+   print("  /rdev open")
+   print("  /rdev clear")
++  print("  /rdev checkpoint")
++  print("  /rdev screenshot on|off|now|status")
+   print("  /rdev report | export")
+   print("  /rdev export json")
+   print("  /rdev export pack")
+--- a/tests/test_export_bounds.lua
++++ b/tests/test_export_bounds.lua
+@@ -85,10 +85,10 @@
+   assert(group.sig ~= 'ignored' and group.message ~= 'must-not-export')
+ end
+ 
+--- Session and nested diagnostics are detached from live DB state.
+-assert(full.session.nested.value == 7)
+-full.session.nested.value = 99
+-assert(DB.session.nested.value == 7)
++-- Metadata is small and detached; heavy evidence uses diagnosticSessions.
++assert(full.session.id == 1 and full.session.nested == nil)
++full.session.id = 99
++assert(DB.session.id == 1 and DB.session.nested.value == 7)
+ 
+ local zero = E:BuildFullObject({ maxGroups = 0 })
+ assert(#zero.groups == 0 and zero.summary.groupCount == 520)
+--- /dev/null
++++ b/Capture/Screenshots.lua
+@@ -0,0 +1,168 @@
++-- Public Screenshot() only: opt-in, one pending request, no UI manipulation,
++-- no filesystem access, no filename guesses, and no protected-action retries.
++local RDL = _G.RothDevLib
++if not RDL then return end
++local Screenshots = { _records = {}, _seen = {}, _attempts = 0, _generation = 0, _stopped = true }
++RDL.Screenshots = Screenshots
++local LIMIT, COOLDOWN, TIMEOUT = 20, 30, 10
++local CALLBACK_KEY = "RothDevLib:Screenshots"
++local AUTO_KINDS = { LUA_ERROR = true, SUPPRESSED = true, ASSERT = true,
++  TAINT_BLOCKED = true, TAINT_FORBIDDEN = true, ANOMALY = true }
++
++local function Copy(value)
++  local util = RDL.Util
++  if not util or type(util.CopyDiagnosticValue) ~= "function" then return nil end
++  local ok, result = pcall(util.CopyDiagnosticValue, util, value, {
++    maxDepth = 4, maxEntries = 32, maxNodes = 600,
++    maxStringBytes = 4096, maxTotalBytes = 128 * 1024,
++  })
++  if ok then return result end
++end
++
++local function Now(fn)
