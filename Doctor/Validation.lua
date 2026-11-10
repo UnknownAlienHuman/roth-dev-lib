@@ -25,11 +25,6 @@ local function SafeCall(fn, ...)
   return pcall(fn, ...)
 end
 
-local function HasAddonPath(stack)
-  if type(stack) ~= "string" then return false end
-  return stack:find("Interface/AddOns/" .. tostring(RDL.addonName) .. "/", 1, true) ~= nil
-end
-
 local function GetSettings()
   if RDL.DB and RDL.DB.GetSettings then
     local ok, s = pcall(RDL.DB.GetSettings, RDL.DB)
@@ -97,21 +92,16 @@ function V:OnEntryStored(entry, status)
     self.taint.state = (self.taint.state or 0) + 1
   end
 
-  if kind:match("^TAINT_") then
-    local isSelf = false
-    if entry.addon == RDL.addonName then
-      isSelf = true
-    elseif HasAddonPath(entry.stack) then
-      isSelf = true
-    end
+  if kind == "TAINT_BLOCKED" or kind == "TAINT_FORBIDDEN" then
+    -- Native taint events expose the blocked addon, not the original taint
+    -- source. An observer stack inevitably contains our own handler path.
+    local isSelf = entry.addon == RDL.addonName or entry.addon == RDL.name
 
     if isSelf then
       if kind == "TAINT_BLOCKED" then
         self.taint.selfBlocked = (self.taint.selfBlocked or 0) + 1
       elseif kind == "TAINT_FORBIDDEN" then
         self.taint.selfForbidden = (self.taint.selfForbidden or 0) + 1
-      elseif kind == "TAINT_STATE" then
-        self.taint.selfState = (self.taint.selfState or 0) + 1
       end
     end
   end

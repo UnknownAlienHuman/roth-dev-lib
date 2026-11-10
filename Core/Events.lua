@@ -80,6 +80,8 @@ SafeRegisterEvent("MACRO_ACTION_BLOCKED")
 SafeRegisterEvent("MACRO_ACTION_FORBIDDEN")
 SafeRegisterEvent("ADDON_RESTRICTION_STATE_CHANGED")
 SafeRegisterEvent("PLAYER_REGEN_ENABLED")
+SafeRegisterEvent("SCREENSHOT_SUCCEEDED")
+SafeRegisterEvent("SCREENSHOT_FAILED")
 
 local shutdownDone = false
 
@@ -92,6 +94,8 @@ local function InvalidateChatTap()
 end
 
 local function StopRuntimeConsumers()
+  if RDL.Diagnostics then ICall("Diagnostics:Stop", RDL.Diagnostics.Stop, RDL.Diagnostics) end
+  if RDL.Screenshots then ICall("Screenshots:Stop", RDL.Screenshots.Stop, RDL.Screenshots) end
   InvalidateChatTap()
   local capture = RDL.Capture
   if capture and capture.BugGrabber and type(capture.BugGrabber.Disable) == "function" then
@@ -181,6 +185,9 @@ local function InitAll()
     OptionalCall("Mem:StartWatcher", RDL.Mem.StartWatcher, RDL.Mem)
   end
 
+  if RDL.Screenshots then OptionalCall("Screenshots:Init", RDL.Screenshots.Init, RDL.Screenshots) end
+  if RDL.Diagnostics then OptionalCall("Diagnostics:Init", RDL.Diagnostics.Init, RDL.Diagnostics) end
+
   RDL._initFailure = nil
   RDL._initialized = true
   RDL._initializing = false
@@ -224,6 +231,9 @@ local function Shutdown(reason)
   RDL._initializing = false
 
   StopRuntimeConsumers()
+  if RDL.Diagnostics then
+    ICall("Diagnostics:Checkpoint", RDL.Diagnostics.Checkpoint, RDL.Diagnostics, reason)
+  end
   if RDL.DB and type(RDL.DB.OnShutdown) == "function" then
     ICall("DB:OnShutdown", RDL.DB.OnShutdown, RDL.DB, reason)
   end
@@ -239,7 +249,13 @@ local function HandlePersistenceFailure(addonName)
   local db = RDL.DB
   if not (db and type(db.HandlePersistenceFailure) == "function") then return false end
   local ok, handled = pcall(db.HandlePersistenceFailure, db, addonName)
-  if ok then return handled == true end
+  if ok then
+    if handled == true then
+      if RDL.Diagnostics then ICall("Diagnostics:Stop", RDL.Diagnostics.Stop, RDL.Diagnostics) end
+      if RDL.Screenshots then ICall("Screenshots:Stop", RDL.Screenshots.Stop, RDL.Screenshots) end
+    end
+    return handled == true
+  end
 
   if type(_G.print) == "function" then
     pcall(_G.print,
@@ -272,6 +288,7 @@ end
 frame:SetScript("OnEvent", function(_, event, ...)
   if event == "ADDON_LOADED" then
     local name = ...
+    if RDL.Diagnostics then RDL.Diagnostics._inventoryDirty = true end
     if name == RDL.addonName then
       -- File loading is complete, but player/session state is still deferred.
       if RDL.Logger then OptionalCall("Logger:Init", RDL.Logger.Init, RDL.Logger) end
@@ -314,6 +331,13 @@ frame:SetScript("OnEvent", function(_, event, ...)
 
   if event == "SAVED_VARIABLES_TOO_LARGE" then
     HandlePersistenceFailure(...)
+    return
+  end
+
+  if event == "SCREENSHOT_SUCCEEDED" or event == "SCREENSHOT_FAILED" then
+    if RDL.Screenshots then
+      ICall("Screenshots:OnEvent", RDL.Screenshots.OnEvent, RDL.Screenshots, event)
+    end
     return
   end
 

@@ -13,6 +13,7 @@ local Capture = {
   _earlyInited = false,
   _bootQueue = {},
   _bootQueueMax = 50,
+  _intakeStats = { stored = 0, queued = 0, ignored = 0, throttled = 0, failed = 0, bootEvicted = 0 },
 }
 RDL.Capture = Capture
 
@@ -176,6 +177,32 @@ local function BuildEntry(kind, message, stack, locals, addonName, funcName, ext
     extraContext.wrapperAddon = addonFromStack
   end
 
+  -- These are evidence labels, not a claim that a guessed addon caused taint.
+  local category = kindText
+  local lowerMessage = messageText:lower()
+  if (kindText == "LUA_ERROR" or kindText == "SUPPRESSED")
+      and (lowerMessage:find("secret value", 1, true)
+        or lowerMessage:find("secret table", 1, true)) then
+    category = "SECRET_ACCESS_MESSAGE"
+  end
+  if extraContext.evidence ~= nil then extraContext.reportedEvidence = extraContext.evidence end
+  extraContext.evidence = {
+    category = category,
+    classification = category == "SECRET_ACCESS_MESSAGE" and "message-heuristic" or "event-or-reporter-kind",
+    attribution = extraContext.attribution or (addonFromMessage and "message-path") or (addonArgument and "reported-addon")
+      or (addonFromStack and "stack-heuristic") or "unknown",
+    rootCause = "not-established",
+    stackProvenance = extraContext.stackProvenance or "capture-or-reporter-stack",
+  }
+  if extraContext.stackProvenance == "event-observer" then
+    extraContext.observerOrigin = originFromStack
+    extraContext.reportedAddon = addonArgument
+    extraContext.faultAddon, extraContext.wrapperAddon = nil, nil
+    addonGuess = addonArgument or "<?>"
+    origin = nil
+    extraContext.originAddon, extraContext.originFile, extraContext.originLine = nil, nil, nil
+  end
+
   local busContext
   if RDL.Breadcrumbs and type(RDL.Breadcrumbs.GetForError) == "function" then
     local ok, value = pcall(RDL.Breadcrumbs.GetForError, RDL.Breadcrumbs, addonGuess)
@@ -217,8 +244,14 @@ local function BuildEntry(kind, message, stack, locals, addonName, funcName, ext
 end
 Capture.BuildEntry = BuildEntry
 
+local function StoreOutcome(status)
+  local stats = Capture._intakeStats
+  stats[status] = (stats[status] or 0) + 1
+  return status
+end
+
 local function StoreEntry(entry)
-  if type(entry) ~= "table" then return "failed" end
+  if type(entry) ~= "table" then return StoreOutcome("failed") end
 
   local ready = false
   if RDL.DB and type(RDL.DB.EnsureReady) == "function" then
@@ -231,8 +264,11 @@ local function StoreEntry(entry)
     entry.sys.bootQueued = true
     Capture._bootQueue[#Capture._bootQueue + 1] = entry
     local maximum = tonumber(Capture._bootQueueMax) or 50
-    while #Capture._bootQueue > maximum do table.remove(Capture._bootQueue, 1) end
-    return "queued"
+    while #Capture._bootQueue > maximum do
+      table.remove(Capture._bootQueue, 1)
+      Capture._intakeStats.bootEvicted = Capture._intakeStats.bootEvicted + 1
+    end
+    return StoreOutcome("queued")
   end
 
   if RDL.Storm and type(RDL.Storm.Allow) == "function" then
@@ -241,29 +277,31 @@ local function StoreEntry(entry)
       if RDL.DB.session then
         RDL.DB.session.throttledCount = (tonumber(RDL.DB.session.throttledCount) or 0) + 1
       end
-      return "throttled"
+      return StoreOutcome("throttled")
     end
   end
 
   if type(RDL.DB.IsIgnored) == "function" then
     local ok, ignored = pcall(RDL.DB.IsIgnored, RDL.DB, entry.sig, entry.addon, entry.message)
-    if ok and ignored then return "ignored" end
+    if ok and ignored then return StoreOutcome("ignored") end
   end
 
-  if type(RDL.DB.UpsertGroup) ~= "function" then return "failed" end
+  if type(RDL.DB.UpsertGroup) ~= "function" then return StoreOutcome("failed") end
+  local session = RDL.DB.session -- callbacks may clear/start another session
   local ok, group = pcall(RDL.DB.UpsertGroup, RDL.DB, entry)
-  if not ok or type(group) ~= "table" then return "failed" end
+  if not ok or type(group) ~= "table" then return StoreOutcome("failed") end
 
   Capture._lastStoredSig = entry.sig
   Capture._lastStoredKind = entry.kind
   Capture._lastStoredAddon = entry.addon
 
-  local session = RDL.DB.session
   if type(session) == "table" then
     session.errors = (tonumber(session.errors) or 0) + (entry.kind == "LUA_ERROR" and 1 or 0)
     session.warnings = (tonumber(session.warnings) or 0) + (entry.kind == "LUA_WARNING" and 1 or 0)
     session.taints = (tonumber(session.taints) or 0)
-      + ((entry.kind == "TAINT_BLOCKED" or entry.kind == "TAINT_FORBIDDEN" or entry.kind == "TAINT_STATE") and 1 or 0)
+      + ((entry.kind == "TAINT_BLOCKED" or entry.kind == "TAINT_FORBIDDEN") and 1 or 0)
+    session.restrictionChanges = (tonumber(session.restrictionChanges) or 0)
+      + (entry.kind == "TAINT_STATE" and 1 or 0)
     session.suppressed = (tonumber(session.suppressed) or 0) + (entry.kind == "SUPPRESSED" and 1 or 0)
     session.alerts = (tonumber(session.alerts) or 0) + (entry.kind == "ALERT" and 1 or 0)
     session.asserts = (tonumber(session.asserts) or 0) + (entry.kind == "ASSERT" and 1 or 0)
@@ -272,7 +310,7 @@ local function StoreEntry(entry)
   if RDL.Validation and type(RDL.Validation.OnEntryStored) == "function" then
     pcall(RDL.Validation.OnEntryStored, RDL.Validation, entry, "stored")
   end
-  return "stored"
+  return StoreOutcome("stored")
 end
 Capture.StoreEntry = StoreEntry
 
