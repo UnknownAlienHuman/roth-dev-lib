@@ -1,339 +1,604 @@
 -- !RothDevLib/Export/Export.lua
--- Phase 4: JSON export + share string (optional LibDeflate).
+-- Bounded JSON/share/GitHub export surfaces. Export callers receive detached
+-- ordinary snapshots; ignored groups are evaluated through authoritative DB
+-- policy instead of stale per-group flags.
 
 local RDL = _G.RothDevLib
 local Export = {}
 RDL.Export = Export
 
-local function Now() return time() end
-local function SafeDate(ts)
-  local t = tonumber(ts) or time()
-  return date("%Y-%m-%d %H:%M:%S", t)
-end
+local MAX_EXPORT_GROUPS = 500
+local MAX_EXPORT_OCCURRENCES = 20
+local MAX_STACK_LINES = 200
+local MAX_MESSAGE_BYTES = 16 * 1024
+local MAX_LOCALS_BYTES = 64 * 1024
+local MAX_BREADCRUMBS = 100
+local MAX_LOG_BYTES = 64 * 1024
+local MAX_ISSUE_BYTES = 512 * 1024
+local MAX_SHARE_INPUT_BYTES = 1024 * 1024
 
-local function TrimStr(s, maxBytes)
-  if type(s) ~= "string" then
-    if s == nil then return nil end
-    s = tostring(s)
+local function CanAccess(value)
+  local guard = RDL.SecretGuard
+  if guard and type(guard.CanAccess) == "function" then
+    local ok, allowed = pcall(guard.CanAccess, guard, value)
+    if not ok or allowed ~= true then return false end
+  elseif type(_G.canaccessvalue) == "function" then
+    local ok, allowed = pcall(_G.canaccessvalue, value)
+    if not ok or allowed ~= true then return false end
   end
-  maxBytes = maxBytes or 4096
-  if #s <= maxBytes then return s end
-  return s:sub(1, maxBytes) .. "\n... (trimmed to " .. tostring(maxBytes) .. " bytes)"
+
+  if guard and type(guard.IsSecret) == "function" then
+    local ok, secret = pcall(guard.IsSecret, guard, value)
+    if not ok or secret == true then return false end
+  elseif type(_G.issecretvalue) == "function" then
+    local ok, secret = pcall(_G.issecretvalue, value)
+    if not ok or secret == true then return false end
+  end
+  return true
 end
 
-local function StackTopLines(stack, maxLines)
-  if type(stack) ~= "string" then return nil end
-  maxLines = maxLines or 20
+local function CanAccessTable(value)
+  if not CanAccess(value) or type(value) ~= "table" then return false end
+  local guard = RDL.SecretGuard
+  if guard and type(guard.CanAccessTable) == "function" then
+    local ok, allowed = pcall(guard.CanAccessTable, guard, value)
+    return ok and allowed == true
+  end
+  if type(_G.canaccesstable) == "function" then
+    local ok, allowed = pcall(_G.canaccesstable, value)
+    return ok and allowed == true
+  end
+  return true
+end
+
+local function RawOption(options, key)
+  if not CanAccessTable(options) then return nil end
+  local ok, value = pcall(rawget, options, key)
+  if not ok or not CanAccess(value) then return nil end
+  return value
+end
+
+local function FiniteNumber(value)
+  return type(value) == "number" and value == value
+    and value ~= math.huge and value ~= -math.huge
+end
+
+local function ClampInteger(value, fallback, minimum, maximum)
+  if not CanAccess(value) or not FiniteNumber(value) then return fallback end
+  value = math.floor(value)
+  if value < minimum then return minimum end
+  if value > maximum then return maximum end
+  return value
+end
+
+local function SafeText(value, fallback, maximum)
+  if not CanAccess(value) then return "<inaccessible>" end
+  if value == nil then return fallback or "" end
+
+  local text = fallback or ""
+  local util = RDL.Util
+  if util and type(util.SafeToString) == "function" then
+    local ok, rendered = pcall(util.SafeToString, util, value)
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(value) == "string" then
+    text = value
+  elseif type(value) == "number" or type(value) == "boolean" then
+    text = tostring(value)
+  end
+
+  if util and type(util.FilterSecretEscapes) == "function" then
+    local ok, filtered = pcall(util.FilterSecretEscapes, util, text)
+    if ok and type(filtered) == "string" then text = filtered end
+  end
+  if type(text) ~= "string" then text = fallback or "" end
+
+  maximum = ClampInteger(maximum, 4096, 1, 1024 * 1024)
+  if #text > maximum then
+    return text:sub(1, maximum) .. "\n... (trimmed to " .. maximum .. " bytes)"
+  end
+  return text
+end
+
+local function OptionalText(value, maximum)
+  if not CanAccess(value) then return "<inaccessible>" end
+  if value == nil then return nil end
+  return SafeText(value, "", maximum)
+end
+
+local function SafeCopy(value, options)
+  if not CanAccess(value) then return "<inaccessible>" end
+  if value == nil then return nil end
+  local util = RDL.Util
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, options or {
+      maxDepth = 4,
+      maxEntries = 80,
+      maxNodes = 500,
+      maxStringBytes = 4096,
+      maxTotalBytes = 128 * 1024,
+    })
+    if ok then return copy end
+  end
+  return SafeText(value, "<unavailable>", 4096)
+end
+
+local function RawField(value, key)
+  if not CanAccessTable(value) then return nil end
+  local ok, field = pcall(rawget, value, key)
+  if not ok or not CanAccess(field) then return nil end
+  return field
+end
+
+local function Now()
+  if type(_G.time) ~= "function" then return 0 end
+  local ok, value = pcall(_G.time)
+  return ok and FiniteNumber(value) and value or 0
+end
+
+local function SafeDate(value)
+  local timestamp = FiniteNumber(value) and value or Now()
+  if type(_G.date) ~= "function" then return tostring(timestamp) end
+  local ok, rendered = pcall(_G.date, "%Y-%m-%d %H:%M:%S", timestamp)
+  return ok and type(rendered) == "string" and rendered or tostring(timestamp)
+end
+
+local function StackTopLines(stack, maximumLines)
+  local text = OptionalText(stack, 128 * 1024)
+  if type(text) ~= "string" then return nil end
+  maximumLines = ClampInteger(maximumLines, 20, 1, MAX_STACK_LINES)
+
   local out = {}
-  local n = 0
-  for line in stack:gmatch("[^\n]+") do
-    n = n + 1
+  for line in text:gmatch("[^\n]+") do
     out[#out + 1] = line
-    if n >= maxLines then break end
+    if #out >= maximumLines then break end
   end
   return table.concat(out, "\n")
 end
 
-local function EscapeFence(s)
-  if s == nil then return "" end
-  return tostring(s):gsub("```", "``\\`")
+local function EscapeFence(value)
+  return SafeText(value, "", 128 * 1024):gsub("```", "``\\`")
 end
 
-local function SafeCopyTable(t, depth, maxDepth)
-  depth = depth or 0
-  maxDepth = maxDepth or 4
-  if type(t) ~= "table" then return t end
-  if depth >= maxDepth then return "<depth>" end
+local function OriginSnapshot(origin)
+  if not CanAccessTable(origin) then return nil end
+  local addon = OptionalText(RawField(origin, "addon"), 128)
+  local file = OptionalText(RawField(origin, "file"), 1024)
+  local line = RawField(origin, "line")
+  line = FiniteNumber(line) and math.floor(line) or nil
+  if addon == nil and file == nil and line == nil then return nil end
+  return { addon = addon, file = file, line = line }
+end
+
+local function SerializeBreadcrumbs(source, maximum)
+  if not CanAccessTable(source) then return nil end
+  maximum = ClampInteger(maximum, 12, 0, MAX_BREADCRUMBS)
   local out = {}
-  local n = 0
-  for k, v in pairs(t) do
-    n = n + 1
-    if n > 80 then out["__truncated"] = true; break end
-    if type(v) == "table" then
-      out[tostring(k)] = SafeCopyTable(v, depth + 1, maxDepth)
-    else
-      out[tostring(k)] = v
-    end
+  for index = 1, maximum do
+    local breadcrumb = RawField(source, index)
+    if not CanAccessTable(breadcrumb) then break end
+    out[#out + 1] = {
+      ts = FiniteNumber(RawField(breadcrumb, "ts")) and RawField(breadcrumb, "ts") or nil,
+      cat = OptionalText(RawField(breadcrumb, "cat"), 128),
+      msg = OptionalText(RawField(breadcrumb, "msg"), 4096),
+      data = OptionalText(RawField(breadcrumb, "data"), 8192),
+    }
   end
-  return out
+  return #out > 0 and out or nil
 end
 
-local function SerializeBreadcrumbs(bcs, max)
-  if type(bcs) ~= "table" then return nil end
-  max = max or 12
-  local out = {}
-  for i = 1, math.min(#bcs, max) do
-    local bc = bcs[i]
-    if type(bc) == "table" then
-      out[#out + 1] = {
-        ts = bc.ts,
-        cat = bc.cat,
-        msg = bc.msg,
-        data = bc.data,
-      }
-    end
-  end
-  return out
-end
+local function SerializeGroup(group, limits)
+  if not CanAccessTable(group) then return nil end
+  limits = limits or {}
 
-local function SerializeGroup(g, opts)
-  opts = opts or {}
-  local maxStackLines = opts.maxStackLines or 40
-  local maxMsgBytes = opts.maxMsgBytes or 2048
-  local maxLocalsBytes = opts.maxLocalsBytes or 4096
-  local maxBreadcrumbs = opts.maxBreadcrumbs or 12
-  local maxOcc = opts.maxOccurrences or 3
+  local count = RawField(group, "count")
+  count = FiniteNumber(count) and math.max(0, math.floor(count)) or 0
+  local firstSession = RawField(group, "firstSessionId")
+  local lastSession = RawField(group, "lastSessionId")
 
-  local obj = {
-    sig = g.sig,
-    kind = g.kind,
-    count = g.count,
-    firstSeen = g.firstSeen,
-    lastSeen = g.lastSeen,
-    firstSessionId = g.firstSessionId,
-    lastSessionId = g.lastSessionId,
-    addon = g.addon,
-    func = g.func,
-    message = TrimStr(g.message, maxMsgBytes),
-    origin = g.origin and {
-      addon = g.origin.addon,
-      file = g.origin.file,
-      line = g.origin.line,
-    } or nil,
-    stack = StackTopLines(g.stack or "", maxStackLines),
-    locals = g.locals and TrimStr(g.locals, maxLocalsBytes) or nil,
+  local object = {
+    sig = OptionalText(RawField(group, "sig"), 4096),
+    kind = OptionalText(RawField(group, "kind"), 64),
+    count = count,
+    firstSeen = FiniteNumber(RawField(group, "firstSeen")) and RawField(group, "firstSeen") or nil,
+    lastSeen = FiniteNumber(RawField(group, "lastSeen")) and RawField(group, "lastSeen") or nil,
+    firstSessionId = FiniteNumber(firstSession) and math.floor(firstSession) or nil,
+    lastSessionId = FiniteNumber(lastSession) and math.floor(lastSession) or nil,
+    addon = OptionalText(RawField(group, "addon"), 128),
+    func = OptionalText(RawField(group, "func"), 512),
+    message = OptionalText(RawField(group, "message"), limits.maxMessageBytes),
+    origin = OriginSnapshot(RawField(group, "origin")),
+    stack = StackTopLines(RawField(group, "stack"), limits.maxStackLines),
+    locals = OptionalText(RawField(group, "locals"), limits.maxLocalsBytes),
   }
 
-  if g.sys then obj.sys = SafeCopyTable(g.sys, 0, 4) end
-  if g.ctx then
-    obj.ctx = {
-      top = g.ctx.top and SafeCopyTable(g.ctx.top, 0, 4) or nil,
-      chain = g.ctx.chain and SafeCopyTable(g.ctx.chain, 0, 4) or nil,
-      extra = g.ctx.extra and SafeCopyTable(g.ctx.extra, 0, 4) or nil,
-    }
-  end
+  object.sys = SafeCopy(RawField(group, "sys"), {
+    maxDepth = 4, maxEntries = 80, maxNodes = 500,
+    maxStringBytes = 4096, maxTotalBytes = 64 * 1024,
+  })
+  object.ctx = SafeCopy(RawField(group, "ctx"), {
+    maxDepth = 5, maxEntries = 120, maxNodes = 800,
+    maxStringBytes = 4096, maxTotalBytes = 96 * 1024,
+  })
 
-  if g.bus then
-    obj.bus = {
-      breadcrumbs = g.bus.breadcrumbs and SerializeBreadcrumbs(g.bus.breadcrumbs, maxBreadcrumbs) or nil,
-      metrics = g.bus.metrics and SafeCopyTable(g.bus.metrics, 0, 4) or nil,
-    }
-  end
-
-  if opts.includeOccurrences and g.occurrences and type(g.occurrences) == "table" then
-    local occ = {}
-    for i = 1, math.min(#g.occurrences, maxOcc) do
-      local e = g.occurrences[i]
-      occ[#occ + 1] = {
-        ts = e.ts,
-        kind = e.kind,
-        addon = e.addon,
-        func = e.func,
-        message = TrimStr(e.message, 512),
-        origin = e.origin and { addon = e.origin.addon, file = e.origin.file, line = e.origin.line } or nil,
-        stackTop = StackTopLines(e.stack or "", 6),
-        sys = e.sys and SafeCopyTable(e.sys, 0, 3) or nil,
-      }
+  local bus = RawField(group, "bus")
+  if CanAccessTable(bus) then
+    local breadcrumbs = SerializeBreadcrumbs(RawField(bus, "breadcrumbs"), limits.maxBreadcrumbs)
+    local metrics = SafeCopy(RawField(bus, "metrics"), {
+      maxDepth = 4, maxEntries = 80, maxNodes = 500,
+      maxStringBytes = 4096, maxTotalBytes = 64 * 1024,
+    })
+    if breadcrumbs ~= nil or metrics ~= nil then
+      object.bus = { breadcrumbs = breadcrumbs, metrics = metrics }
     end
-    obj.occurrences = occ
   end
 
-  return obj
+  if limits.includeOccurrences then
+    local source = RawField(group, "occurrences")
+    if CanAccessTable(source) then
+      local occurrences = {}
+      for index = 1, limits.maxOccurrences do
+        local entry = RawField(source, index)
+        if not CanAccessTable(entry) then break end
+        occurrences[#occurrences + 1] = {
+          ts = FiniteNumber(RawField(entry, "ts")) and RawField(entry, "ts") or nil,
+          kind = OptionalText(RawField(entry, "kind"), 64),
+          addon = OptionalText(RawField(entry, "addon"), 128),
+          func = OptionalText(RawField(entry, "func"), 512),
+          message = OptionalText(RawField(entry, "message"), 4096),
+          origin = OriginSnapshot(RawField(entry, "origin")),
+          stackTop = StackTopLines(RawField(entry, "stack"), 6),
+          evidence = SafeCopy(RawField(entry, "evidence"), {
+            maxDepth = 4, maxEntries = 24, maxNodes = 120,
+            maxStringBytes = 512, maxTotalBytes = 4096,
+          }),
+        }
+      end
+      if #occurrences > 0 then object.occurrences = occurrences end
+    end
+  end
+  return object
 end
 
-local function CollectGroups(opts)
-  opts = opts or {}
-  local onlySig = opts.sig
-  local out = {}
-  if not (RDL.DB and RDL.DB.IsReady and RDL.DB:IsReady()) then
-    return out
+local function IsIgnored(signature, group)
+  local db = RDL.DB
+  if not (db and type(db.IsIgnored) == "function") then return false end
+  local ok, ignored = pcall(db.IsIgnored, db, signature,
+    RawField(group, "addon"), RawField(group, "message"))
+  return ok and ignored == true
+end
+
+local function CollectGroups(signatureFilter, includeIgnored, maximum)
+  local db = RDL.DB
+  if not (db and type(db.IsReady) == "function" and type(db.IterGroups) == "function") then
+    return {}, 0
   end
-  for sig, g in RDL.DB:IterGroups() do
-    if not onlySig or sig == onlySig then
-      if not (opts.includeIgnored ~= true and g.ignored == true) then
-        out[#out + 1] = g
-      end
+  local okReady, ready = pcall(db.IsReady, db)
+  if not okReady or ready ~= true then return {}, 0 end
+
+  local okIterator, iterator, state, control = pcall(db.IterGroups, db)
+  if not okIterator or type(iterator) ~= "function" then return {}, 0 end
+
+  local candidates, total, scanned = {}, 0, 0
+  while scanned < 5000 do
+    local okNext, signature, group = pcall(iterator, state, control)
+    if not okNext or signature == nil then break end
+    control = signature
+    scanned = scanned + 1
+
+    if type(signature) == "string" and (not signatureFilter or signature == signatureFilter)
+        and CanAccessTable(group) and (includeIgnored or not IsIgnored(signature, group)) then
+      total = total + 1
+      if maximum > 0 then candidates[#candidates + 1] = group end
     end
   end
-  table.sort(out, function(a, b)
-    return (a.lastSeen or 0) > (b.lastSeen or 0)
-  end)
-  return out
+
+  if maximum > 0 then
+    table.sort(candidates, function(a, b)
+      local aLast = RawField(a, "lastSeen")
+      local bLast = RawField(b, "lastSeen")
+      aLast = FiniteNumber(aLast) and aLast or 0
+      bLast = FiniteNumber(bLast) and bLast or 0
+      if aLast == bLast then
+        return SafeText(RawField(a, "sig"), "", 4096)
+          < SafeText(RawField(b, "sig"), "", 4096)
+      end
+      return aLast > bLast
+    end)
+    while #candidates > maximum do candidates[#candidates] = nil end
+  end
+  return candidates, total
+end
+
+local function SessionMetadata()
+  local source = RDL.DB and RDL.DB.session
+  local metadata = {}
+  local fields = { "id", "started", "ended", "build", "character", "class", "spec",
+    "errors", "warnings", "taints", "restrictionChanges", "suppressed", "alerts", "asserts", "throttledCount" }
+  for _, key in ipairs(fields) do metadata[key] = RawField(source, key) end
+  return SafeCopy(metadata, { maxDepth = 2, maxEntries = 32, maxNodes = 64,
+    maxStringBytes = 1024, maxTotalBytes = 8192 })
 end
 
 local function BuildBaseEnvelope(kind)
-  local U = RDL.Util
-  local sys = (U and U.SnapshotSys) and U:SnapshotSys() or nil
+  local system
+  local util = RDL.Util
+  if util and type(util.SnapshotSys) == "function" then
+    local ok, value = pcall(util.SnapshotSys, util)
+    if ok then system = SafeCopy(value) end
+  end
+
+  local interfaceVersion
+  if type(_G.GetBuildInfo) == "function" then
+    local ok, _, _, _, toc = pcall(_G.GetBuildInfo)
+    if ok and CanAccess(toc) then interfaceVersion = toc end
+  end
+
+  local locale
+  if type(_G.GetLocale) == "function" then
+    local ok, value = pcall(_G.GetLocale)
+    if ok then locale = OptionalText(value, 32) end
+  end
+
   return {
     type = "RothDevLibExport",
     schema = 1,
-    exportKind = kind or "full",
+    exportKind = SafeText(kind, "full", 64),
     generatedAt = Now(),
     env = {
-      build = sys and sys.build or nil,
-      locale = GetLocale and GetLocale() or nil,
-      client = { interface = select(4, GetBuildInfo()) },
-      player = sys and sys.player or nil,
-      zone = sys and { zone = sys.zone, subzone = sys.subzone } or nil,
+      build = RawField(system, "build"),
+      locale = locale,
+      client = { interface = interfaceVersion },
+      player = SafeCopy(RawField(system, "player")),
+      zone = CanAccessTable(system) and {
+        zone = OptionalText(RawField(system, "zone"), 256),
+        subzone = OptionalText(RawField(system, "subzone"), 256),
+      } or nil,
     },
     addon = {
       name = "!RothDevLib",
-      version = tostring(RDL.version or ""),
+      version = SafeText(RDL.version, "", 128),
     },
-    session = RDL.DB and RDL.DB.session or nil,
+    session = SessionMetadata(),
   }
 end
 
-function Export:BuildFullObject(opts)
-  opts = opts or {}
-  local env = BuildBaseEnvelope(opts.exportKind or "full")
-  env.limits = {
-    maxGroups = opts.maxGroups,
-    maxOccurrences = opts.maxOccurrences,
-    maxStackLines = opts.maxStackLines,
-    maxLocalsBytes = opts.maxLocalsBytes,
+local function NormalizeFullOptions(options)
+  return {
+    exportKind = SafeText(RawOption(options, "exportKind"), "full", 64),
+    signature = OptionalText(RawOption(options, "sig"), 4096),
+    includeIgnored = RawOption(options, "includeIgnored") == true,
+    includeOccurrences = RawOption(options, "includeOccurrences") ~= false,
+    includeLog = RawOption(options, "includeLog") == true,
+    maxGroups = ClampInteger(RawOption(options, "maxGroups"), 200, 0, MAX_EXPORT_GROUPS),
+    maxOccurrences = ClampInteger(RawOption(options, "maxOccurrences"), 3, 0, MAX_EXPORT_OCCURRENCES),
+    maxStackLines = ClampInteger(RawOption(options, "maxStackLines"), 40, 1, MAX_STACK_LINES),
+    maxLocalsBytes = ClampInteger(RawOption(options, "maxLocalsBytes"), 4096, 256, MAX_LOCALS_BYTES),
+    maxMessageBytes = ClampInteger(RawOption(options, "maxMsgBytes"), 2048, 256, MAX_MESSAGE_BYTES),
+    maxBreadcrumbs = ClampInteger(RawOption(options, "maxBreadcrumbs"), 12, 0, MAX_BREADCRUMBS),
+    maxLogBytes = ClampInteger(RawOption(options, "maxLogBytes"), 12000, 0, MAX_LOG_BYTES),
+  }
+end
+
+function Export:BuildFullObject(options)
+  local limits = NormalizeFullOptions(options)
+  local envelope = BuildBaseEnvelope(limits.exportKind)
+  if RDL.DB and type(RDL.DB.GetDiagnosticSessions) == "function" then
+    local ok, sessions = pcall(RDL.DB.GetDiagnosticSessions, RDL.DB)
+    if ok then
+      envelope.diagnosticSessions = SafeCopy(sessions, {
+        maxDepth = 10, maxEntries = 256, maxNodes = 20000,
+        maxStringBytes = 8192, maxTotalBytes = 2 * 1024 * 1024,
+      })
+    end
+  end
+  envelope.limits = {
+    maxGroups = limits.maxGroups,
+    maxOccurrences = limits.maxOccurrences,
+    maxStackLines = limits.maxStackLines,
+    maxLocalsBytes = limits.maxLocalsBytes,
+    maxMessageBytes = limits.maxMessageBytes,
+    maxBreadcrumbs = limits.maxBreadcrumbs,
   }
 
-  local groups = CollectGroups({ sig = opts.sig, includeIgnored = opts.includeIgnored })
-  local maxGroups = opts.maxGroups or #groups
-  local arr = {}
-  for i = 1, math.min(#groups, maxGroups) do
-    arr[#arr + 1] = SerializeGroup(groups[i], {
-      includeOccurrences = opts.includeOccurrences ~= false,
-      maxOccurrences = opts.maxOccurrences or 3,
-      maxStackLines = opts.maxStackLines or 40,
-      maxLocalsBytes = opts.maxLocalsBytes or 4096,
-      maxMsgBytes = opts.maxMsgBytes or 2048,
-      maxBreadcrumbs = opts.maxBreadcrumbs or 12,
+  local groups, total = CollectGroups(limits.signature, limits.includeIgnored, limits.maxGroups)
+  local serialized = {}
+  for index = 1, #groups do
+    local object = SerializeGroup(groups[index], {
+      includeOccurrences = limits.includeOccurrences,
+      maxOccurrences = limits.maxOccurrences,
+      maxStackLines = limits.maxStackLines,
+      maxLocalsBytes = limits.maxLocalsBytes,
+      maxMessageBytes = limits.maxMessageBytes,
+      maxBreadcrumbs = limits.maxBreadcrumbs,
     })
+    if object then serialized[#serialized + 1] = object end
   end
-  env.groups = arr
-  env.summary = {
-    groupCount = #groups,
-    activeGroupCount = (RDL.DB and RDL.DB.GetActiveGroupCount) and RDL.DB:GetActiveGroupCount() or nil,
+  envelope.groups = serialized
+
+  local activeCount
+  if RDL.DB and type(RDL.DB.GetActiveGroupCount) == "function" then
+    local ok, value = pcall(RDL.DB.GetActiveGroupCount, RDL.DB)
+    if ok and FiniteNumber(value) then activeCount = math.max(0, math.floor(value)) end
+  end
+  envelope.summary = {
+    groupCount = total,
+    exportedGroupCount = #serialized,
+    activeGroupCount = activeCount,
   }
 
-  if opts.includeLog and RDL.Logger and RDL.Logger.GetText then
-    env.log = TrimStr(RDL.Logger:GetText() or "", opts.maxLogBytes or 12000)
+  if limits.includeLog and limits.maxLogBytes > 0
+      and RDL.Logger and type(RDL.Logger.GetText) == "function" then
+    local ok, text = pcall(RDL.Logger.GetText, RDL.Logger)
+    if ok then envelope.log = OptionalText(text, limits.maxLogBytes) end
   end
-
-  return env
+  return envelope
 end
 
-function Export:BuildGitHubIssueText(sig, opts)
-  opts = opts or {}
-  if not sig or not RDL.DB or not RDL.DB.IsReady or not RDL.DB:IsReady() then
+local function BuildInfo()
+  if type(_G.GetBuildInfo) ~= "function" then return nil, nil, nil, nil end
+  local ok, version, number, buildDate, interfaceVersion = pcall(_G.GetBuildInfo)
+  if not ok then return nil, nil, nil, nil end
+  return version, number, buildDate, interfaceVersion
+end
+
+local function CallText(fn, fallback, maximum, ...)
+  if type(fn) ~= "function" then return fallback end
+  local ok, value = pcall(fn, ...)
+  return ok and SafeText(value, fallback, maximum) or fallback
+end
+
+function Export:BuildGitHubIssueText(signature, options)
+  signature = OptionalText(signature, 4096)
+  if not signature or not RDL.DB or type(RDL.DB.IsReady) ~= "function"
+      or type(RDL.DB.GetGroup) ~= "function" then
     return nil, "Select an error group first."
   end
+  local okReady, ready = pcall(RDL.DB.IsReady, RDL.DB)
+  if not okReady or ready ~= true then return nil, "Select an error group first." end
 
-  local g = RDL.DB:GetGroup(sig)
-  if not g then
+  local okGroup, group = pcall(RDL.DB.GetGroup, RDL.DB, signature)
+  if not okGroup or not CanAccessTable(group) then
     return nil, "Selected signature not found."
   end
 
-  local buildVersion, buildNumber, buildDate, interfaceVersion = GetBuildInfo()
-  local addonName = tostring(g.addon or "<?>")
-  local kind = tostring(g.kind or "<?>")
-  local oneLineMsg = tostring(g.message or ""):gsub("\r", " "):gsub("\n", " ")
-  oneLineMsg = TrimStr(oneLineMsg, 120)
-  local issueTitle = string.format("[%s] %s: %s", addonName, kind, oneLineMsg)
+  local maxMessage = ClampInteger(RawOption(options, "maxMessageBytes"), 1200, 256, MAX_MESSAGE_BYTES)
+  local maxStackLines = ClampInteger(RawOption(options, "maxStackLines"), 80, 1, MAX_STACK_LINES)
+  local maxLocals = ClampInteger(RawOption(options, "maxLocalsBytes"), 2400, 256, MAX_LOCALS_BYTES)
+  local maxBreadcrumbs = ClampInteger(RawOption(options, "maxBreadcrumbs"), 8, 0, MAX_BREADCRUMBS)
+  local maxBreadcrumbData = ClampInteger(RawOption(options, "maxBreadcrumbDataBytes"), 220, 64, 4096)
+  local maxDoctor = ClampInteger(RawOption(options, "maxDoctorBytes"), 1400, 128, 16 * 1024)
+  local maxTotal = ClampInteger(RawOption(options, "maxTotalBytes"), 128 * 1024, 4096, MAX_ISSUE_BYTES)
 
-  local lines = {}
-  lines[#lines + 1] = "## Bug Report (auto-generated by RothDevLib)"
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "### Suggested Title"
-  lines[#lines + 1] = "`" .. EscapeFence(issueTitle) .. "`"
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "### Environment"
-  lines[#lines + 1] = "- Addon: `" .. EscapeFence(addonName) .. "`"
-  lines[#lines + 1] = "- Kind: `" .. EscapeFence(kind) .. "`"
-  lines[#lines + 1] = "- Count: `" .. tostring(g.count or 0) .. "`"
-  lines[#lines + 1] = "- Signature: `" .. EscapeFence(tostring(sig)) .. "`"
-  lines[#lines + 1] = "- RothDevLib: `" .. EscapeFence(tostring(RDL.version or "")) .. "`"
-  lines[#lines + 1] = "- WoW Build: `" .. EscapeFence(tostring(buildVersion or "?")) .. " (" .. EscapeFence(tostring(buildNumber or "?")) .. ")`"
-  lines[#lines + 1] = "- Interface: `" .. EscapeFence(tostring(interfaceVersion or "?")) .. "`"
-  lines[#lines + 1] = "- Build Date: `" .. EscapeFence(tostring(buildDate or "?")) .. "`"
-  lines[#lines + 1] = "- Locale: `" .. EscapeFence(tostring(GetLocale and GetLocale() or "?")) .. "`"
-  lines[#lines + 1] = "- Player: `" .. EscapeFence(tostring(UnitName("player") or "?")) .. "-" .. EscapeFence(tostring(GetRealmName and GetRealmName() or "?")) .. "`"
-  lines[#lines + 1] = "- Zone: `" .. EscapeFence(tostring(GetRealZoneText and GetRealZoneText() or "?")) .. " / " .. EscapeFence(tostring(GetSubZoneText and GetSubZoneText() or "?")) .. "`"
-  lines[#lines + 1] = "- First Seen: `" .. EscapeFence(SafeDate(g.firstSeen)) .. "`"
-  lines[#lines + 1] = "- Last Seen: `" .. EscapeFence(SafeDate(g.lastSeen)) .. "`"
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "### Error Message"
-  lines[#lines + 1] = "```"
-  lines[#lines + 1] = EscapeFence(TrimStr(g.message or "", opts.maxMessageBytes or 1200))
-  lines[#lines + 1] = "```"
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "### Stack Trace"
-  lines[#lines + 1] = "```lua"
-  lines[#lines + 1] = EscapeFence(StackTopLines(g.stack or "", opts.maxStackLines or 80) or "")
-  lines[#lines + 1] = "```"
+  local buildVersion, buildNumber, buildDate, interfaceVersion = BuildInfo()
+  local addonName = SafeText(RawField(group, "addon"), "<?>" , 128)
+  local kind = SafeText(RawField(group, "kind"), "<?>" , 64)
+  local oneLineMessage = SafeText(RawField(group, "message"), "", 120)
+    :gsub("\r", " "):gsub("\n", " ")
+  local issueTitle = SafeText("[" .. addonName .. "] " .. kind .. ": " .. oneLineMessage,
+    "RothDevLib report", 240)
 
-  if g.locals and g.locals ~= "" then
+  local playerName = CallText(_G.UnitName, "?", 128, "player")
+  local realmName = CallText(_G.GetRealmName, "?", 128)
+  local zoneName = CallText(_G.GetRealZoneText, "?", 256)
+  local subzoneName = CallText(_G.GetSubZoneText, "?", 256)
+  local locale = CallText(_G.GetLocale, "?", 32)
+
+  local lines = {
+    "## Bug Report (auto-generated by RothDevLib)",
+    "",
+    "### Suggested Title",
+    "`" .. EscapeFence(issueTitle) .. "`",
+    "",
+    "### Environment",
+    "- Addon: `" .. EscapeFence(addonName) .. "`",
+    "- Kind: `" .. EscapeFence(kind) .. "`",
+    "- Count: `" .. SafeText(RawField(group, "count"), "0", 32) .. "`",
+    "- Signature: `" .. EscapeFence(signature) .. "`",
+    "- RothDevLib: `" .. EscapeFence(SafeText(RDL.version, "", 128)) .. "`",
+    "- WoW Build: `" .. EscapeFence(SafeText(buildVersion, "?", 64)) .. " ("
+      .. EscapeFence(SafeText(buildNumber, "?", 64)) .. ")`",
+    "- Interface: `" .. EscapeFence(SafeText(interfaceVersion, "?", 32)) .. "`",
+    "- Build Date: `" .. EscapeFence(SafeText(buildDate, "?", 64)) .. "`",
+    "- Locale: `" .. EscapeFence(locale) .. "`",
+    "- Player: `" .. EscapeFence(playerName) .. "-" .. EscapeFence(realmName) .. "`",
+    "- Zone: `" .. EscapeFence(zoneName) .. " / " .. EscapeFence(subzoneName) .. "`",
+    "- First Seen: `" .. EscapeFence(SafeDate(RawField(group, "firstSeen"))) .. "`",
+    "- Last Seen: `" .. EscapeFence(SafeDate(RawField(group, "lastSeen"))) .. "`",
+    "",
+    "### Error Message",
+    "```",
+    EscapeFence(OptionalText(RawField(group, "message"), maxMessage) or ""),
+    "```",
+    "",
+    "### Stack Trace",
+    "```lua",
+    EscapeFence(StackTopLines(RawField(group, "stack"), maxStackLines) or ""),
+    "```",
+  }
+
+  local locals = OptionalText(RawField(group, "locals"), maxLocals)
+  if type(locals) == "string" and locals ~= "" then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "<details><summary>Locals</summary>"
     lines[#lines + 1] = ""
     lines[#lines + 1] = "```"
-    lines[#lines + 1] = EscapeFence(TrimStr(g.locals, opts.maxLocalsBytes or 2400))
+    lines[#lines + 1] = EscapeFence(locals)
     lines[#lines + 1] = "```"
     lines[#lines + 1] = "</details>"
   end
 
-  if g.bus and g.bus.breadcrumbs and #g.bus.breadcrumbs > 0 then
+  local bus = RawField(group, "bus")
+  local breadcrumbs = CanAccessTable(bus) and SerializeBreadcrumbs(RawField(bus, "breadcrumbs"), maxBreadcrumbs) or nil
+  if breadcrumbs then
     lines[#lines + 1] = ""
     lines[#lines + 1] = "<details><summary>Bus Breadcrumbs</summary>"
     lines[#lines + 1] = ""
     lines[#lines + 1] = "```"
-    for i = 1, math.min(#g.bus.breadcrumbs, opts.maxBreadcrumbs or 8) do
-      local bc = g.bus.breadcrumbs[i]
-      local ts = bc.ts and SafeDate(bc.ts) or "<?>"
-      lines[#lines + 1] = string.format("%d) %s [%s] %s", i, ts, tostring(bc.cat or "?"), tostring(bc.msg or ""))
-      if bc.data and bc.data ~= "" then
-        lines[#lines + 1] = "   data: " .. TrimStr(tostring(bc.data), opts.maxBreadcrumbDataBytes or 220)
+    for index = 1, #breadcrumbs do
+      local breadcrumb = breadcrumbs[index]
+      lines[#lines + 1] = string.format("%d) %s [%s] %s", index,
+        breadcrumb.ts and SafeDate(breadcrumb.ts) or "<?>",
+        SafeText(breadcrumb.cat, "?", 128), SafeText(breadcrumb.msg, "", 4096))
+      if breadcrumb.data and breadcrumb.data ~= "" then
+        lines[#lines + 1] = "   data: " .. SafeText(breadcrumb.data, "", maxBreadcrumbData)
       end
     end
     lines[#lines + 1] = "```"
     lines[#lines + 1] = "</details>"
   end
 
-  if g.ctx and g.ctx.extra then
-    local U = RDL.Util
+  local context = RawField(group, "ctx")
+  local extra = CanAccessTable(context) and RawField(context, "extra") or nil
+  if extra ~= nil then
+    local rendered = SafeText(extra, "<unavailable>", maxDoctor)
+    if RDL.Util and type(RDL.Util.SafeSerializeTable) == "function" then
+      local ok, value = pcall(RDL.Util.SafeSerializeTable, RDL.Util, extra)
+      if ok then rendered = SafeText(value, "", maxDoctor) end
+    end
     lines[#lines + 1] = ""
     lines[#lines + 1] = "<details><summary>Doctor Extra</summary>"
     lines[#lines + 1] = ""
     lines[#lines + 1] = "```"
-    lines[#lines + 1] = EscapeFence(TrimStr((U and U:SafeSerializeTable(g.ctx.extra)) or tostring(g.ctx.extra), opts.maxDoctorBytes or 1400))
+    lines[#lines + 1] = EscapeFence(rendered)
     lines[#lines + 1] = "```"
     lines[#lines + 1] = "</details>"
   end
 
-  return table.concat(lines, "\n"), issueTitle
+  local output = table.concat(lines, "\n")
+  if #output > maxTotal then
+    output = output:sub(1, maxTotal) .. "\n\n...[report truncated]"
+  end
+  return output, issueTitle
 end
 
-function Export:ToJSON(obj, opts)
-  local J = RDL.JSON
-  if not J or not J.Encode then return "{}" end
-  opts = opts or {}
-  return J:Encode(obj, opts)
+function Export:ToJSON(object, options)
+  local json = RDL.JSON
+  if not json or type(json.Encode) ~= "function" then return "{}" end
+  local ok, output = pcall(json.Encode, json, object, options)
+  return ok and type(output) == "string" and output or '{"error":"json_encode_failed"}'
 end
 
--- Optional share string: uses LibDeflate if present (do not hard-depend).
-function Export:ToShareString(json)
+-- Optional share string: use LibDeflate when the normal callable LibStub table
+-- or a function facade is present. Input is bounded before compression.
+function Export:ToShareString(value)
+  local json = SafeText(value, "", MAX_SHARE_INPUT_BYTES)
   local prefix = "RDL1:"
-  if type(json) ~= "string" then json = tostring(json or "") end
   local LibStub = _G.LibStub
-  if type(LibStub) ~= "function" then
-    return prefix .. json
-  end
-  local ok, LibDeflate = pcall(function() return LibStub("LibDeflate") end)
-  if not ok or not LibDeflate or type(LibDeflate.CompressDeflate) ~= "function" then
+  local libStubType = type(LibStub)
+  if libStubType ~= "table" and libStubType ~= "function" then return prefix .. json end
+
+  local okLibrary, LibDeflate = pcall(function()
+    return LibStub("LibDeflate", true)
+  end)
+  if not okLibrary or not LibDeflate
+      or type(LibDeflate.CompressDeflate) ~= "function"
+      or type(LibDeflate.EncodeForPrint) ~= "function" then
     return prefix .. json
   end
 
-  local compressed = LibDeflate:CompressDeflate(json, { level = 7 })
-  if not compressed then
-    return prefix .. json
-  end
-  local encoded = LibDeflate:EncodeForPrint(compressed)
-  return prefix .. (encoded or json)
+  local okCompress, compressed = pcall(LibDeflate.CompressDeflate, LibDeflate, json, { level = 7 })
+  if not okCompress or type(compressed) ~= "string" then return prefix .. json end
+  local okEncode, encoded = pcall(LibDeflate.EncodeForPrint, LibDeflate, compressed)
+  if not okEncode or type(encoded) ~= "string" then return prefix .. json end
+  return prefix .. encoded
 end

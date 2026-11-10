@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "gpt/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install texlua
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y texlive-binaries
+
+      - name: Run regression suite
+        run: ./tests/run.sh
+
+      - name: Parse first-party Lua
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            texluac -p "$file"
+          done < <(find Capture Core Doctor Export Integration Perf UI Util \
+            -type f -name '*.lua' -print0)

@@ -1,345 +1,375 @@
 -- !RothDevLib/Capture/ChatTap.lua
--- Optional "chat tap" that parses addon-printed error stacks from chat.
--- Motivation: some addons wrap errors in xpcall and only print to chat (no Blizzard error UI).
--- This module attempts to reconstruct a suppressed-error entry from those chat lines.
---
--- Design constraints:
---   - Low overhead: fast pre-filter; only parses when it sees an error header or is in an active capture window.
---   - No overrides: uses hooksecurefunc on AddMessage.
---   - Best-effort: patterns vary by addon; this is a heuristic.
+-- Optional bounded heuristic for addon-printed error stacks in local chat.
 
 local RDL = _G.RothDevLib
-local Capture = RDL.Capture
+local Capture = RDL and RDL.Capture
 if not Capture then return end
 
-local ChatTap = {}
+local ChatTap = {
+  _hooked = false,
+  _dynamicHooked = false,
+  _active = nil,
+  _timerToken = 0,
+  _dedup = {},
+  _hookedFrames = setmetatable({}, { __mode = "k" }),
+}
 Capture.ChatTap = ChatTap
 
-ChatTap._hooked = false
-ChatTap._active = nil
-ChatTap._timerToken = 0
+local ACCEPTED_STATUS = { stored = true, queued = true, ignored = true }
 
 local function Settings()
-  return (RDL.DB and RDL.DB.GetSettings and RDL.DB:GetSettings()) or {}
-end
-
-local function StripTimestamp(msg)
-  -- Chat timestamps vary by user settings/addons.
-  -- Strip several common leading formats so stack-line detection still works:
-  --   "[HH:MM:SS] ..." / "[HH:MM] ..." / "[1:02:03] ..."
-  --   "HH:MM:SS ..." / "HH:MM ..."
-  local s = tostring(msg or "")
-  s = s:gsub("^%s*%[[%d:]+%]%s*", "")
-  s = s:gsub("^%s*%d%d:%d%d:%d%d%s*", "")
-  s = s:gsub("^%s*%d%d:%d%d%s*", "")
-  return s
-end
-
-local function StripDecorations(msg)
-  -- Parsing should not be fooled by color/texture/link markup.
-  -- Keep this conservative: we only remove markup patterns; content remains.
-  msg = tostring(msg or "")
-  local s = Settings()
-  if s.chatTapStripColors ~= false then
-    msg = msg:gsub("|c%x%x%x%x%x%x%x%x", "")
-    msg = msg:gsub("|r", "")
+  if RDL.DB and type(RDL.DB.GetSettings) == "function" then
+    local ok, value = pcall(RDL.DB.GetSettings, RDL.DB)
+    if ok and type(value) == "table" then return value end
   end
-  -- textures: |T...|t
-  msg = msg:gsub("|T[^|]*|t", "")
-  -- links: keep visible text |H...|hTEXT|h
-  msg = msg:gsub("|H[^|]*|h([^|]*)|h", "%1")
-  return msg
+  return {}
 end
 
-local function IsStackLine(msg)
-  if not msg or msg == "" then return false end
-  -- Allow both bracketed and unbracketed stack formats.
-  if msg:find("^%s*%[C%]:") then return true end
-  if msg:find("^%s*%[tail call%]" ) then return true end
-  if msg:find("^%s*%[Interface/AddOns/") then return true end
-  if msg:find("^%s*Interface/AddOns/") then return true end
-  if msg:find("^%s*%[string ") then return true end
-  if msg:find("^%s*Interface/AddOns/[^:]+:%d+:") then return true end
-  -- Some addons print without brackets for their own frames; keep conservative.
-  return false
-end
-
-local function ParseHeader(msg)
-  -- Patterns to capture:
-  --   "RDM: error[event:PLAYER_ENTERING_WORLD]: <file>:<line>: <message>"
-  --   "|cff...RDM|r: error[event:...] ..." (colored prefix)
-  --   "AddonName: error: <...>" (fallback)
-  local cleaned = StripDecorations(msg)
-
-  -- Strip chat timestamps like "[01:01:16] " to avoid confusing ":"-based prefix parsing.
-  cleaned = cleaned:gsub("^%s*%[[%d:]+%]%s*", "")
-  cleaned = cleaned:gsub("^%s*%d%d:%d%d:%d%d%s*", "")
-
-  -- Allow case variations: "error" / "Error" / "ERROR"
-  local prefix, event, rest = cleaned:match("^([^:]+):%s*[Ee][Rr][Rr][Oo][Rr]%[event:([%w_]+)%]%s*:%s*(.+)$")
-  if prefix and rest then
-    return true, { prefix = prefix, event = event, rest = rest }
+local function SafeText(value, fallback, maximum)
+  local util = RDL.Util
+  local text = type(fallback) == "string" and fallback or ""
+  if util and type(util.SafeToString) == "function" then
+    local ok, rendered = pcall(util.SafeToString, util, value)
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(value) == "string" then
+    text = value
   end
+  if util and type(util.FilterSecretEscapes) == "function" then
+    local ok, filtered = pcall(util.FilterSecretEscapes, util, text)
+    if ok and type(filtered) == "string" then text = filtered end
+  end
+  maximum = tonumber(maximum) or 32 * 1024
+  if #text > maximum then text = text:sub(1, maximum) .. "<truncated>" end
+  return text
+end
 
-  -- Generic bracketed tag: error[Something]: ...
+local function SafeCopy(value)
+  local util = RDL.Util
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, {
+      maxDepth = 3,
+      maxEntries = 40,
+      maxNodes = 200,
+      maxStringBytes = 4096,
+      maxTotalBytes = 64 * 1024,
+    })
+    if ok then return copy end
+  end
+  return nil
+end
+
+local function Finite(value)
+  return type(value) == "number" and value == value
+    and value ~= math.huge and value ~= -math.huge
+end
+
+local function Now()
+  if type(_G.GetTime) == "function" then
+    local ok, value = pcall(_G.GetTime)
+    if ok and Finite(value) then return value end
+  end
+  if type(_G.time) == "function" then
+    local ok, value = pcall(_G.time)
+    if ok and Finite(value) then return value end
+  end
+  return 0
+end
+
+local function StripTimestamp(message)
+  return message
+    :gsub("^%s*%[[%d:]+%]%s*", "")
+    :gsub("^%s*%d%d:%d%d:%d%d%s*", "")
+    :gsub("^%s*%d%d:%d%d%s*", "")
+end
+
+local function StripDecorations(message)
+  local settings = Settings()
+  if settings.chatTapStripColors ~= false then
+    message = message:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+  end
+  return message
+    :gsub("|T[^|]*|t", "")
+    :gsub("|H[^|]*|h([^|]*)|h", "%1")
+end
+
+local function IsStackLine(message)
+  return message:find("^%s*%[C%]:") ~= nil
+    or message:find("^%s*%[tail call%]") ~= nil
+    or message:find("^%s*%[Interface/AddOns/") ~= nil
+    or message:find("^%s*Interface/AddOns/") ~= nil
+    or message:find("^%s*%[string ") ~= nil
+end
+
+local function ParseHeader(message)
+  local cleaned = StripTimestamp(StripDecorations(message))
+  local prefix, eventName, rest = cleaned:match(
+    "^([^:]+):%s*[Ee][Rr][Rr][Oo][Rr]%[event:([%w_]+)%]%s*:%s*(.+)$")
+  if prefix and rest then return { prefix = prefix, event = eventName, rest = rest } end
+
   local tag
-  prefix, tag, rest = cleaned:match("^([^:]+):%s*[Ee][Rr][Rr][Oo][Rr]%[([^%]]+)%]%s*:%s*(.+)$")
-  if prefix and rest then
-    return true, { prefix = prefix, event = tag, rest = rest }
-  end
+  prefix, tag, rest = cleaned:match(
+    "^([^:]+):%s*[Ee][Rr][Rr][Oo][Rr]%[([^%]]+)%]%s*:%s*(.+)$")
+  if prefix and rest then return { prefix = prefix, event = tag, rest = rest } end
 
   prefix, rest = cleaned:match("^([^:]+):%s*[Ee][Rr][Rr][Oo][Rr]%s*:%s*(.+)$")
-  if prefix and rest then
-    return true, { prefix = prefix, event = nil, rest = rest }
-  end
+  if prefix and rest then return { prefix = prefix, rest = rest } end
 
-  -- Some addons print just a file:line:error (no prefix)
   rest = cleaned:match("^%s*%[?Interface/AddOns/[^:]+:%d+:%s*.+")
-  if rest then
-    return true, { prefix = nil, event = nil, rest = rest }
-  end
+  if rest then return { rest = rest } end
 
-  -- Generic "Lua error:" style
   rest = cleaned:match("^%s*[Ll]ua%s+[Ee]rror:%s*(.+)$")
-  if rest then
-    return true, { prefix = nil, event = nil, rest = rest }
-  end
-
-  return false, nil
+  if rest then return { rest = rest } end
+  return nil
 end
 
-local function GuessAddonFromText(text)
-  if not text or text == "" then return nil end
-  return text:match("Interface/AddOns/([^/]+)/")
+local function GuessAddon(text)
+  return type(text) == "string" and text:match("Interface/AddOns/([^/]+)/") or nil
 end
 
-local function TopAddonFrameLine(stack)
-  if not stack or stack == "" then return nil end
-  -- First line containing an addon file reference.
-  local line = stack:match("(Interface/AddOns/[^\n]+)")
-  return line
+local function TopAddonLine(stack)
+  return type(stack) == "string" and stack:match("(Interface/AddOns/[^\n]+)") or nil
 end
 
-local function IsDuplicateSuppressed(kind, msg, stack)
-  local U = RDL.Util
+local function RecentlyCaptured(message, stack)
+  local util = RDL.Util
   local db = RDL.DB
-  if not (U and db and db.GetGroup) then return false end
+  if not (util and type(util.MakeSignature) == "function" and db and type(db.GetGroup) == "function") then
+    return false
+  end
 
-  -- If the same error was already captured as a hard LUA_ERROR (or warning/taint) very recently,
-  -- avoid creating a separate SUPPRESSED group from chat-printing.
-  local candidates = { "LUA_ERROR", "LUA_WARNING", "TAINT_BLOCKED", "TAINT_FORBIDDEN" }
-  for _, k in ipairs(candidates) do
-    local sig = U:MakeSignature(k, msg, stack)
-    local g = db:GetGroup(sig)
-    if g and g.lastSeen and (time() - (g.lastSeen or 0)) <= 2 then
-      return true
+  local kinds = { "LUA_ERROR", "LUA_WARNING", "TAINT_BLOCKED", "TAINT_FORBIDDEN" }
+  local now = Now()
+  for index = 1, #kinds do
+    local okSig, signature = pcall(util.MakeSignature, util, kinds[index], message, stack)
+    if okSig then
+      local okGroup, group = pcall(db.GetGroup, db, signature)
+      if okGroup and type(group) == "table" and Finite(group.lastSeen) then
+        local age = now - group.lastSeen
+        if age >= 0 and age <= 2 then return true end
+      end
     end
   end
   return false
 end
 
-local function DedupWindowHit(self, sig)
-  local s = Settings()
-  local window = tonumber(s.chatTapDedupSec) or 0.6
-  if window <= 0 then return false end
-  self._dedup = self._dedup or {}
-  local now = (GetTime and GetTime()) or time()
-  local last = self._dedup[sig]
-  if last and (now - last) < window then
-    self._dedup[sig] = now
-    return true
-  end
-  self._dedup[sig] = now
+local function TrimDedup(self, now, window, maximum, keepKey)
+  maximum = tonumber(maximum) or 200
+  if maximum ~= maximum then maximum = 200 end
+  maximum = math.floor(maximum)
+  if maximum < 1 then maximum = 1 elseif maximum > 5000 then maximum = 5000 end
 
-  -- Opportunistic prune.
-  local max = tonumber(s.chatTapDedupMax) or 200
-  local n = 0
-  for _ in pairs(self._dedup) do n = n + 1 end
-  if n > max then
-    for k, ts in pairs(self._dedup) do
-      if (now - ts) > (window * 10) then self._dedup[k] = nil end
+  local entries = {}
+  for key, timestamp in pairs(self._dedup) do
+    if not Finite(timestamp) or now - timestamp > window * 10 then
+      self._dedup[key] = nil
+    else
+      entries[#entries + 1] = { key = key, timestamp = timestamp }
     end
   end
-  return false
+
+  local excess = #entries - maximum
+  if excess <= 0 then return end
+
+  table.sort(entries, function(a, b)
+    if a.timestamp == b.timestamp then return a.key < b.key end
+    return a.timestamp < b.timestamp
+  end)
+  for index = 1, #entries do
+    if excess <= 0 then break end
+    local key = entries[index].key
+    if key ~= keepKey then
+      self._dedup[key] = nil
+      excess = excess - 1
+    end
+  end
+end
+
+local function DedupHit(self, signature)
+  local settings = Settings()
+  local window = tonumber(settings.chatTapDedupSec) or 0.6
+  if window ~= window then window = 0.6 end
+  if window <= 0 then return false end
+
+  local now = Now()
+  local previous = self._dedup[signature]
+  self._dedup[signature] = now
+  local age = type(previous) == "number" and now - previous or math.huge
+  local hit = age >= 0 and age < window
+
+  -- Stale pruning alone is not a hard bound during a burst of unique errors.
+  -- Evict the oldest entries as a second step and preserve the current key.
+  TrimDedup(self, now, window, settings.chatTapDedupMax, signature)
+  return hit
 end
 
 local function Finalize(self)
-  local a = self._active
-  if not a then return end
+  local active = self._active
   self._active = nil
+  if not active or Settings().captureChatErrors ~= true then return nil end
 
-  local U = RDL.Util
-  local msg = a.header or ""
-  local stack = (a.stackLines and #a.stackLines > 0) and table.concat(a.stackLines, "\n") or ""
-
-  -- Ensure we keep at least the most useful line even if stack formatting was odd.
-  if (stack == "" or not stack:find("Interface/AddOns/")) and a.parsed and a.parsed.rest then
-    local restAddonLine = a.parsed.rest:match("(Interface/AddOns/[^\n]+)")
-    if restAddonLine then
-      stack = restAddonLine .. (stack ~= "" and ("\n" .. stack) or "")
-    end
+  local message = SafeText(active.header, "", 32 * 1024)
+  local stack = active.stackLines and table.concat(active.stackLines, "\n") or ""
+  if (stack == "" or not stack:find("Interface/AddOns/", 1, true))
+      and active.parsed and active.parsed.rest then
+    local line = active.parsed.rest:match("(Interface/AddOns/[^\n]+)")
+    if line then stack = line .. (stack ~= "" and ("\n" .. stack) or "") end
   end
+  stack = SafeText(stack, "", 128 * 1024)
 
-  -- Scrub secrets in both message and stack.
-  if U and U.Scrub then
-    msg = U:Scrub(msg)
-    stack = U:Scrub(stack)
-  end
-
-  local addonName = GuessAddonFromText(stack) or GuessAddonFromText(msg) or (a.parsed and a.parsed.prefix) or "<?>"
-  local funcName = (a.parsed and a.parsed.event) and ("event:" .. tostring(a.parsed.event)) or "<?>"
-
+  local addonName = GuessAddon(stack) or GuessAddon(message)
+    or (active.parsed and active.parsed.prefix) or "<?>"
+  local funcName = active.parsed and active.parsed.event
+    and ("event:" .. SafeText(active.parsed.event, "<?>" , 128)) or "<?>"
   local extra = {
     source = "chat",
-    prefix = a.parsed and a.parsed.prefix or nil,
-    event = a.parsed and a.parsed.event or nil,
-    topLine = TopAddonFrameLine(stack),
+    prefix = active.parsed and active.parsed.prefix or nil,
+    event = active.parsed and active.parsed.event or nil,
+    topLine = TopAddonLine(stack),
   }
 
-  -- Dedup policy:
-  --   (1) if this chat-printed stack matches a recently captured hard error, skip
-  --   (2) collapse duplicates of identical chat stacks within a small time window
-  local kind = "SUPPRESSED"
-  local sig = (U and U.MakeSignature) and U:MakeSignature(kind, msg, stack) or nil
-  if sig and DedupWindowHit(self, sig) then
+  local util = RDL.Util
+  local signature
+  if util and type(util.MakeSignature) == "function" then
+    local ok, value = pcall(util.MakeSignature, util, "SUPPRESSED", message, stack)
+    if ok then signature = SafeText(value, "", 4096) end
+  end
+  if signature and DedupHit(self, signature) then
     if RDL.DB and RDL.DB.session then
-      RDL.DB.session.chatTapDeduped = (RDL.DB.session.chatTapDeduped or 0) + 1
+      RDL.DB.session.chatTapDeduped = (tonumber(RDL.DB.session.chatTapDeduped) or 0) + 1
     end
-    return
+    return nil
   end
-  if IsDuplicateSuppressed(kind, msg, stack) then
+  if RecentlyCaptured(message, stack) then
     if RDL.DB and RDL.DB.session then
-      RDL.DB.session.chatTapMerged = (RDL.DB.session.chatTapMerged or 0) + 1
+      RDL.DB.session.chatTapMerged = (tonumber(RDL.DB.session.chatTapMerged) or 0) + 1
     end
-    return
+    return nil
   end
 
-  -- Represent as SUPPRESSED: this is an error that did not reach the global Lua error handler.
-  local entry = Capture.BuildEntry(kind, msg, stack, nil, addonName, funcName, extra)
-  Capture.StoreEntry(entry)
+  if type(Capture.BuildEntry) ~= "function" or type(Capture.StoreEntry) ~= "function" then return nil end
+  local okBuild, entry = pcall(Capture.BuildEntry, "SUPPRESSED", message, stack, nil,
+    addonName, funcName, SafeCopy(extra))
+  if not okBuild or type(entry) ~= "table" then return nil end
+  local okStore, status = pcall(Capture.StoreEntry, entry)
+  if not okStore or not ACCEPTED_STATUS[status] then return nil end
 
-  if RDL.DB and RDL.DB.session then
-    RDL.DB.session.chatTapCaptured = (RDL.DB.session.chatTapCaptured or 0) + 1
+  if status == "stored" or status == "queued" then
+    if RDL.DB and RDL.DB.session then
+      RDL.DB.session.chatTapCaptured = (tonumber(RDL.DB.session.chatTapCaptured) or 0) + 1
+    end
+    if type(RDL.Log) == "function" then
+      pcall(RDL.Log, RDL, "WARN", "CHAT", "Captured suppressed error from chat", {
+        addon = addonName,
+        func = funcName,
+      })
+    end
   end
-
-  if RDL and RDL.Log then
-    pcall(function()
-      RDL:Log("WARN", "CHAT", "Captured suppressed error from chat", { addon = addonName, func = funcName })
-    end)
-  end
+  return entry, status
 end
 
 local function ArmFinalizeTimer(self)
-  if not C_Timer or not C_Timer.After then return end
-  local s = Settings()
-  local window = tonumber(s.chatTapWindowSec) or 0.8
+  local timer = _G.C_Timer
+  if type(timer) ~= "table" or type(timer.After) ~= "function" then return false end
+  local window = tonumber(Settings().chatTapWindowSec) or 0.8
+  if window < 0.05 then window = 0.05 elseif window > 10 then window = 10 end
 
-  self._timerToken = (self._timerToken or 0) + 1
+  self._timerToken = self._timerToken + 1
   local token = self._timerToken
-
-  C_Timer.After(window, function()
-    if token ~= self._timerToken then return end
-    local a = self._active
-    if not a then return end
-
-    local now = (GetTime and GetTime()) or time()
-    local last = a.lastTs or now
-    if (now - last) >= window then
-      Finalize(self)
-    end
-  end)
-end
-
-function ChatTap:OnChatMessage(msg)
-  local s = Settings()
-  if not s.captureChatErrors then return end
-
-  msg = StripTimestamp(msg)
-
-  -- Avoid self-noise.
-  if msg:find("RothDevLib", 1, true) then return end
-
-  local active = self._active
-
-  -- Fast pre-filter: only do work if this looks like an error header OR we are already capturing.
-  if not active then
-    if (not msg:find("error", 1, true)) and (not msg:find("Error", 1, true)) then
+  local ok = pcall(timer.After, window, function()
+    if token ~= ChatTap._timerToken then return end
+    if Settings().captureChatErrors ~= true then
+      ChatTap._active = nil
       return
     end
+    local active = ChatTap._active
+    if active and Now() - (active.lastTs or 0) >= window then Finalize(ChatTap) end
+  end)
+  if not ok then self._timerToken = self._timerToken + 1 end
+  return ok
+end
+
+function ChatTap:OnChatMessage(rawMessage)
+  if Settings().captureChatErrors ~= true then
+    self._active = nil
+    self._timerToken = self._timerToken + 1
+    return
   end
 
-  local isHeader, parsed = ParseHeader(msg)
-  if isHeader then
-    if self._active then
+  local message = StripTimestamp(SafeText(rawMessage, "", 32 * 1024))
+  if message == "" or message == "<inaccessible>" or message == "<secret>" then return end
+  if message:find("RothDevLib", 1, true) then return end
+
+  local active = self._active
+  if not active and not message:lower():find("error", 1, true) then return end
+
+  -- Once a capture is active, addon-frame lines are continuation data, not
+  -- fresh generic headers. Check this before ParseHeader(), because a stack
+  -- line also matches the generic Interface/AddOns header shape.
+  if active and IsStackLine(message) then
+    local maximum = tonumber(Settings().chatTapMaxStackLines) or 60
+    if maximum < 1 then maximum = 1 elseif maximum > 200 then maximum = 200 end
+    if #active.stackLines >= maximum then
       Finalize(self)
+      return
     end
+    active.stackLines[#active.stackLines + 1] = message
+    active.lastTs = Now()
+    ArmFinalizeTimer(self)
+    return
+  end
+
+  local parsed = ParseHeader(message)
+  if parsed then
+    if active then Finalize(self) end
     self._active = {
-      header = msg,
+      header = message,
       parsed = parsed,
       stackLines = {},
-      lastTs = (GetTime and GetTime()) or time(),
+      lastTs = Now(),
     }
     ArmFinalizeTimer(self)
     return
   end
 
-  if active and IsStackLine(msg) then
-    local maxLines = tonumber(s.chatTapMaxStackLines) or 60
-    if #active.stackLines < maxLines then
-      active.stackLines[#active.stackLines + 1] = msg
-    else
-      -- Hit cap: finalize early to avoid unbounded memory/cpu.
-      Finalize(self)
-      return
-    end
-    active.lastTs = (GetTime and GetTime()) or time()
-    ArmFinalizeTimer(self)
-    return
-  end
+  if active then Finalize(self) end
+end
 
-  -- If we were capturing and got a non-stack, non-header line, finalize.
-  if active then
-    Finalize(self)
-  end
+local function HookFrame(frame)
+  if not frame or ChatTap._hookedFrames[frame] then return false end
+  if type(frame.AddMessage) ~= "function" or type(_G.hooksecurefunc) ~= "function" then return false end
+  local ok = pcall(_G.hooksecurefunc, frame, "AddMessage", function(_, message)
+    pcall(ChatTap.OnChatMessage, ChatTap, message)
+  end)
+  if ok then ChatTap._hookedFrames[frame] = true end
+  return ok
 end
 
 function ChatTap:Init()
-  if self._hooked then return end
-  self._hooked = true
+  -- Idempotent retries must preserve already-installed hooks. HookFrame returns
+  -- false for a frame that is already in the weak registry by design.
+  local hooked = self._hooked == true
+  hooked = HookFrame(_G.DEFAULT_CHAT_FRAME) or hooked
+  hooked = HookFrame(_G.ChatFrame1) or hooked
 
-  local function HookFrame(frame)
-    if not frame or frame.__RDL_ChatTapHooked then return false end
-    if type(frame.AddMessage) ~= "function" or type(hooksecurefunc) ~= "function" then return false end
-    frame.__RDL_ChatTapHooked = true
-    hooksecurefunc(frame, "AddMessage", function(_, msg)
-      pcall(function() ChatTap:OnChatMessage(msg) end)
-    end)
-    return true
-  end
+  if Settings().chatTapHookAllFrames ~= false then
+    local count = tonumber(_G.NUM_CHAT_WINDOWS) or 10
+    if count < 1 then count = 1 elseif count > 50 then count = 50 end
+    for index = 1, count do hooked = HookFrame(_G["ChatFrame" .. index]) or hooked end
 
-  local ok = false
-  -- Always hook DEFAULT_CHAT_FRAME and ChatFrame1.
-  ok = HookFrame(_G.DEFAULT_CHAT_FRAME) or ok
-  ok = HookFrame(_G.ChatFrame1) or ok
-
-  -- Optionally hook all chat windows (covers addons that print to non-primary frames).
-  local s = Settings()
-  if s.chatTapHookAllFrames ~= false then
-    local n = tonumber(_G.NUM_CHAT_WINDOWS) or 10
-    for i = 1, n do
-      ok = HookFrame(_G["ChatFrame" .. i]) or ok
-    end
-    -- Catch dynamically created chat frames.
-    if type(_G.FloatingChatFrame_OnLoad) == "function" then
-      hooksecurefunc("FloatingChatFrame_OnLoad", function(frame)
-        pcall(function() HookFrame(frame) end)
+    if not self._dynamicHooked and type(_G.FloatingChatFrame_OnLoad) == "function"
+        and type(_G.hooksecurefunc) == "function" then
+      local ok = pcall(_G.hooksecurefunc, "FloatingChatFrame_OnLoad", function(frame)
+        pcall(HookFrame, frame)
       end)
+      self._dynamicHooked = ok == true
     end
   end
 
-  if RDL and RDL.Log then
-    pcall(function()
-      RDL:Log(ok and "INFO" or "WARN", "CHAT", "ChatTap init", { hooked = ok })
-    end)
+  self._hooked = hooked or self._dynamicHooked
+  if type(RDL.Log) == "function" then
+    pcall(RDL.Log, RDL, self._hooked and "INFO" or "WARN", "CHAT", "ChatTap init", {
+      hooked = self._hooked,
+    })
   end
+  return self._hooked
 end

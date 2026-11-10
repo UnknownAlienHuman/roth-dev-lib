@@ -1,78 +1,125 @@
 -- !RothDevLib/Capture/Warnings.lua
--- LUA_WARNING event handler.
--- Extracted from monolithic Capture.lua.
--- Patch-safe: handles both old (warnType, warningText) and new signatures.
+-- Bounded LUA_WARNING intake for old and current payload shapes.
 
 local RDL = _G.RothDevLib
+local Capture = RDL and RDL.Capture
+if not Capture then return end
 
--- Called from Core/Events.lua when LUA_WARNING fires.
--- Uses Capture.BuildEntry / Capture.StoreEntry from ErrorHandler.lua.
-function RDL.Capture:OnLuaWarning(...)
-  if self._disabled then return end
+local ACCEPTED_STATUS = { stored = true, queued = true, ignored = true }
 
-  local Capture = self
-  local BuildEntry = Capture.BuildEntry
-  local StoreEntry = Capture.StoreEntry
-  if not BuildEntry or not StoreEntry then return end
+local function SafeCopy(value, options)
+  local util = RDL.Util
+  if util and type(util.CopyDiagnosticValue) == "function" then
+    local ok, copy = pcall(util.CopyDiagnosticValue, util, value, options or {
+      maxDepth = 3,
+      maxEntries = 40,
+      maxNodes = 200,
+      maxStringBytes = 4096,
+    })
+    if ok then return copy end
+  end
+  return nil
+end
 
-  local U = RDL.Util
-  local a1, a2, a3, a4, a5 = ...
-  if U and U.ScrubVarargs then
-    a1, a2, a3, a4, a5 = U:ScrubVarargs(a1, a2, a3, a4, a5)
+local function SafeText(value, fallback, maximum)
+  local util = RDL.Util
+  local text = type(fallback) == "string" and fallback or ""
+  if util and type(util.SafeToString) == "function" then
+    local ok, rendered = pcall(util.SafeToString, util, value)
+    if ok and type(rendered) == "string" then text = rendered end
+  elseif type(value) == "string" then
+    text = value
+  end
+  if util and type(util.FilterSecretEscapes) == "function" then
+    local ok, filtered = pcall(util.FilterSecretEscapes, util, text)
+    if ok and type(filtered) == "string" then text = filtered end
+  end
+  maximum = tonumber(maximum) or 8192
+  if #text > maximum then text = text:sub(1, maximum) .. "<truncated>" end
+  return text
+end
+
+local function Stack()
+  if type(_G.debugstack) ~= "function" then return "" end
+  local ok, value = pcall(_G.debugstack, 3, 40, 40)
+  return ok and SafeText(value, "", 128 * 1024) or ""
+end
+
+local function ContainsAddonPath(value)
+  return type(value) == "string" and value:find("Interface/AddOns/", 1, true) ~= nil
+end
+
+function Capture:OnLuaWarning(...)
+  if self._disabled then return nil end
+  if type(self.BuildEntry) ~= "function" or type(self.StoreEntry) ~= "function" then return nil end
+
+  local count = math.min(select("#", ...), 5)
+  local args = { n = count }
+  for index = 1, count do
+    args[index] = SafeCopy(select(index, ...), {
+      maxDepth = 2,
+      maxEntries = 20,
+      maxNodes = 80,
+      maxStringBytes = 32 * 1024,
+    })
   end
 
-  -- Patch drift: historically LUA_WARNING delivered (warnType, warningText).
-  -- In newer clients warnType may be removed and only warningText remains.
-  local warnType, warningText = nil, nil
-  if type(a1) == "string" and type(a2) == "string"
-     and (not a1:find("Interface/AddOns/"))
-     and a2:find("Interface/AddOns/") then
-    warnType, warningText = a1, a2
+  local first = SafeText(args[1], "", 32 * 1024)
+  local second = SafeText(args[2], "", 32 * 1024)
+  local third = SafeText(args[3], "", 32 * 1024)
+  local warningType, warningText
+
+  if first ~= "" and second ~= "" and not ContainsAddonPath(first) and ContainsAddonPath(second) then
+    warningType, warningText = first, second
   else
-    warningText = (type(a1) == "string") and a1 or (U and U:SafeToString(a1) or tostring(a1))
-    if type(a2) == "string" and a2 ~= ""
-       and not warningText:find("Interface/AddOns/")
-       and a2:find("Interface/AddOns/") then
-      warningText = a2
-      warnType = (type(a1) == "string") and a1 or nil
+    warningText = first
+    if warningText == "" and second ~= "" then warningText = second end
+    if second ~= "" and not ContainsAddonPath(warningText) and ContainsAddonPath(second) then
+      warningType, warningText = first ~= "" and first or nil, second
     end
   end
 
-  -- Origin detection: which addon / file / line
-  local originText = nil
-  if type(warningText) == "string" and warningText:find("Interface/AddOns/") then
+  local originText
+  if ContainsAddonPath(warningText) then
     originText = warningText
-  elseif type(a2) == "string" and a2:find("Interface/AddOns/") then
-    originText = a2
-  elseif type(a3) == "string" and a3:find("Interface/AddOns/") then
-    originText = a3
+  elseif ContainsAddonPath(second) then
+    originText = second
+  elseif ContainsAddonPath(third) then
+    originText = third
   end
 
   local originAddon = originText and originText:match("Interface/AddOns/([^/]+)/") or nil
-  local originFile, originLine = nil, nil
-  if originText then
-    originFile, originLine = originText:match("(Interface/AddOns/[^:]+):(%d+)")
-  end
+  local originFile, originLine
+  if originText then originFile, originLine = originText:match("(Interface/AddOns/[^:]+):(%d+)") end
 
-  local msg = "LUA_WARNING: " .. tostring(warningText or "")
-  if warnType then
-    msg = "LUA_WARNING(" .. tostring(warnType) .. "): " .. tostring(warningText or "")
-  end
-
-  local stack = debugstack(2, 40, 40)
+  local message = warningType and ("LUA_WARNING(" .. warningType .. "): " .. warningText)
+    or ("LUA_WARNING: " .. warningText)
   local extra = {
-    raw = { a1, a2, a3, a4, a5 },
-    warnType = warnType,
+    raw = args,
+    warnType = warningType,
     warningText = warningText,
-    origin = { addon = originAddon, file = originFile, line = originLine },
+    origin = {
+      addon = originAddon,
+      file = originFile,
+      line = originLine and tonumber(originLine) or nil,
+    },
   }
-
-  local funcGuess = (originFile and originLine)
-    and (originFile:match("Interface/AddOns/[^/]+/(.+)") .. ":" .. originLine)
+  local funcName = originFile and originLine
+    and ((originFile:match("Interface/AddOns/[^/]+/(.+)") or originFile) .. ":" .. originLine)
     or nil
 
-  local entry = BuildEntry("LUA_WARNING", msg, stack, nil, originAddon, funcGuess, extra)
-  entry.origin = extra.origin
-  StoreEntry(entry)
-  RDL:Log("WARN", "LUA_WARNING", "Lua warning captured", {})
+  local okBuild, entry = pcall(self.BuildEntry, "LUA_WARNING", message, Stack(), nil,
+    originAddon, funcName, SafeCopy(extra))
+  if not okBuild or type(entry) ~= "table" then return nil, "build-failed" end
+  entry.origin = SafeCopy(extra.origin)
+
+  local okStore, status = pcall(self.StoreEntry, entry)
+  if not okStore or not ACCEPTED_STATUS[status] then return nil, status or "store-failed" end
+  if (status == "stored" or status == "queued") and type(RDL.Log) == "function" then
+    pcall(RDL.Log, RDL, "WARN", "LUA_WARNING", "Lua warning captured", {
+      addon = originAddon,
+      warningType = warningType,
+    })
+  end
+  return entry, status
 end

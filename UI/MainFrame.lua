@@ -570,12 +570,14 @@ function UI:Init()
       ApplyErrorsLayout()
       if UI.StopMonitorEmbedTicker then UI:StopMonitorEmbedTicker() end
     elseif mode == MODE_MONITOR then
-      if not UI._monitorBuilt then
-        if UI.BuildMonitorContent then pcall(function() UI:BuildMonitorContent(contentMonitor) end) end
-        UI._monitorBuilt = true
+      if not UI._monitorBuilt and type(UI.BuildMonitorContent) == "function" then
+        local ok, built = pcall(UI.BuildMonitorContent, UI, contentMonitor)
+        UI._monitorBuilt = ok and built == true
       end
-      if UI.RefreshMonitor then pcall(function() UI:RefreshMonitor() end) end
-      if UI.StartMonitorEmbedTicker then UI:StartMonitorEmbedTicker() end
+      if UI._monitorBuilt then
+        if UI.RefreshMonitor then pcall(function() UI:RefreshMonitor() end) end
+        if UI.StartMonitorEmbedTicker then UI:StartMonitorEmbedTicker() end
+      end
     elseif mode == MODE_LOG then
       UI:RefreshLogContent()
       if UI.StopMonitorEmbedTicker then UI:StopMonitorEmbedTicker() end
