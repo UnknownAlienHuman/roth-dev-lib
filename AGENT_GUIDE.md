@@ -33,7 +33,11 @@ The executable contract is [`!RothDevLib.toc`](!RothDevLib.toc). Read it before 
 - `Capture/Safety.lua`: bounded hard/suppressed/integration intake and fallback selection.
 - `Capture/BugGrabber.lua`: the only supported hard-error fallback after handler ownership is lost; retained state is capped.
 - `Capture/ChatTap.lua`, `Capture/Locals.lua`, `Capture/Storm.lua`: bounded heuristic intake, calibration and flood-control state.
+- `Core/Diagnostics.lua`: periodic/shutdown session evidence, native profiler snapshots and coverage metadata; no per-error polling.
+- `Capture/Screenshots.lua`: opt-in, bounded public screenshot requests and timestamp-only outcome correlation.
 - UI modules are consumers; they do not own capture or persistence policy.
+
+Product purpose and the persisted evidence contract are in [docs/AGENT_DIAGNOSTICS.md](docs/AGENT_DIAGNOSTICS.md). Preserve useful ordinary evidence, distinguish observation from causality, and do not equate normal restriction transitions with errors.
 
 ## Non-negotiable invariants
 

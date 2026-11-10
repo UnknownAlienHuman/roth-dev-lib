@@ -107,13 +107,23 @@ local function SafeSerialize(value)
   return SafeText(value, "<unavailable>", 8192)
 end
 
+local function EvidenceCopy(value, entries, bytes)
+  local util = RDL.Util
+  if not util or type(util.CopyDiagnosticValue) ~= "function" then return nil end
+  local ok, copy = pcall(util.CopyDiagnosticValue, util, value, {
+    maxDepth = 6, maxEntries = entries or 24, maxNodes = 500,
+    maxStringBytes = 512, maxTotalBytes = bytes or 4096,
+  })
+  if ok then return copy end
+end
+
 local function KindWeight(kind)
   if kind == "LUA_ERROR" then return 100 end
   if kind == "TAINT_FORBIDDEN" then return 85 end
-  if kind == "TAINT_STATE" then return 80 end
+  if kind == "TAINT_STATE" then return 5 end
   if kind == "TAINT_BLOCKED" then return 75 end
   if kind == "ALERT" then return 60 end
-  if kind == "ASSERT" then return 55 end
+  if kind == "ASSERT" or kind == "ANOMALY" then return 70 end
   if kind == "LUA_WARNING" then return 40 end
   if kind == "SUPPRESSED" then return 30 end
   return 10
@@ -324,6 +334,7 @@ local function SerializeGroup(group, limits)
     object.locals = SafeText(RawField(group, "locals"), nil, limits.maxLocalsBytes)
   end
   object.doctor = CompactDoctor(RawField(group, "ctx"), limits.maxDoctorBytes)
+  object.evidence = EvidenceCopy(RawField(RawField(RawField(group, "ctx"), "extra"), "evidence"), 12, 2048)
 
   local bus = RawField(group, "bus")
   if CanAccessTable(bus) then
@@ -380,6 +391,7 @@ local function NormalizeOptions(options)
     maxLocalsBytes = ClampInteger(RawOption(options, "maxLocalsBytes"), 1600, 0, 64 * 1024),
     maxDoctorBytes = ClampInteger(RawOption(options, "maxDoctorBytes"), 640, 0, 16 * 1024),
     includeLog = RawOption(options, "includeLog") == true,
+    includeDiagnostics = RawOption(options, "includeDiagnostics") ~= false,
     maxLogBytes = ClampInteger(RawOption(options, "maxLogBytes"), 4000, 0, 64 * 1024),
     timelineMax = ClampInteger(RawOption(options, "timelineMax"), 24, 0, MAX_TIMELINE),
     timelineMsgBytes = ClampInteger(RawOption(options, "timelineMsgBytes"), 200, 32, 4096),
@@ -441,6 +453,7 @@ local function ApplyStage(limits, stage)
     SetAtMost(limits, "maxGroups", 32, changes)
     SetAtMost(limits, "maxLogBytes", 1024, changes)
   elseif stage == 3 then
+    Disable(limits, "includeDiagnostics", changes)
     SetAtMost(limits, "maxStackLines", 2, changes)
     Disable(limits, "maxLocalsBytes", changes)
     SetAtMost(limits, "maxMsgBytes", 256, changes)
@@ -477,6 +490,56 @@ local function ApplyStage(limits, stage)
   }
 end
 
+-- Full evidence stays in SavedVariables/full JSON. A pack has only the newest
+-- session, three ranked rows per profiler, and three recent screenshot outcomes.
+local function DiagnosticSummary(source)
+  local session = RawField(source, 1)
+  if not CanAccessTable(session) then return nil end
+  local diagnostic = RawField(session, "diagnostics")
+  local output = { sessionId = RawField(session, "id"),
+    checkpointAt = RawField(diagnostic, "ts"),
+    detail = "Newest session summary; full evidence: diagnosticSessions in full JSON / sessions in SavedVariables" }
+  output.coverage = EvidenceCopy(RawField(diagnostic, "coverage"), 24, 4096)
+  output.nativeProfiler = EvidenceCopy(RawField(diagnostic, "nativeProfiler"), 24, 8192)
+  if type(output.nativeProfiler) == "table" and type(output.nativeProfiler.rows) == "table" then
+    local rows = output.nativeProfiler.rows
+    output.nativeProfiler.omittedFromPack = math.max(0, #rows - 3)
+    for i = #rows, 4, -1 do rows[i] = nil end
+  end
+  for _, key in ipairs({ "wrappedCPU", "wrappedMemory" }) do
+    local snapshot = RawField(diagnostic, key)
+    local rows = RawField(snapshot, "rows")
+    local top = {}
+    for i = 1, 3 do
+      local row = RawField(rows, i)
+      if not CanAccessTable(row) then break end
+      top[#top + 1] = EvidenceCopy(row, 8, 1024)
+    end
+    output[key] = { status = RawField(snapshot, "status"), rows = top,
+      unit = key == "wrappedCPU" and "ms" or "global-Lua-heap-delta-KB",
+      scope = "instrumented-calls-only" }
+  end
+  output.cpuSampleRate = RawField(diagnostic, "cpuSampleRate")
+  local screenshots = RawField(session, "screenshots")
+  if CanAccessTable(screenshots) then
+    output.screenshots = { attempts = RawField(screenshots, "attempts"),
+      correlation = "global-events-without-request-id-or-filename", records = {} }
+    local records = RawField(screenshots, "records")
+    local count = 0
+    for i = 1, 20 do if CanAccessTable(RawField(records, i)) then count = i else break end end
+    for i = math.max(1, count - 2), count do
+      local item = RawField(records, i)
+      output.screenshots.records[#output.screenshots.records + 1] = {
+        id = RawField(item, "id"), requestedAt = RawField(item, "requestedAt"),
+        status = SafeText(RawField(item, "status"), nil, 64),
+        signaturePrefix = SafeText(RawField(item, "signature"), nil, 256),
+      }
+    end
+    output.screenshots.omittedFromPack = math.max(0, count - 3)
+  end
+  return output
+end
+
 local function BuildPolicyDoc()
   return {
     strategy = "single-snapshot-coarse-degradation",
@@ -502,6 +565,7 @@ local function BuildObject(context, limits, attempt, degradation)
   local groups = {}
   for index = 1, groupCount do groups[index] = SerializeGroup(context.groups[index], limits) end
   object.groups = groups
+  if limits.includeDiagnostics then object.diagnostics = context.diagnostics end
   object.addonStats = BuildAddonStats(context.groups, groupCount)
   object.timeline = SerializeTimeline(context.recent, limits.timelineMax, limits.timelineMsgBytes)
   if limits.includeLog and context.log then
@@ -523,6 +587,7 @@ local function BuildObject(context, limits, attempt, degradation)
       timelineMax = limits.timelineMax,
       timelineMsgBytes = limits.timelineMsgBytes,
       includeLog = limits.includeLog == true,
+      includeDiagnostics = limits.includeDiagnostics == true,
       maxLogBytes = limits.maxLogBytes,
     },
     byteBudget = {
@@ -532,6 +597,8 @@ local function BuildObject(context, limits, attempt, degradation)
     },
     byteBudgetPolicy = BuildPolicyDoc(),
     degradation = DegradationTail(degradation),
+    diagnostics = context.diagnostics and (limits.includeDiagnostics and "summary" or "omitted-by-budget-or-option")
+      or "unavailable",
     limitations = {
       "Packed export is size-constrained and fields are truncated deterministically.",
       "WoW sandbox output is copy-only; no external attachment is created.",
@@ -579,6 +646,7 @@ function Packer:BuildPackedJSON(options)
     includeOccurrences = false,
     includeLog = false,
   })
+  context.diagnostics = DiagnosticSummary(context.base.diagnosticSessions)
   context.log = limits.includeLog and SnapshotLog(limits.maxLogBytes) or nil
 
   local degradation = {}

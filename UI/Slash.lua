@@ -12,6 +12,40 @@ SlashCmdList["ROTHDEVLIB"] = function(msg)
   local rawMsg = (msg or ""):match("^%s*(.-)%s*$")
   msg = rawMsg:lower()
 
+  local screenshotArg = msg:match("^screenshot%s*(.*)$")
+  if screenshotArg ~= nil then
+    local screenshots = RDL.Screenshots
+    if not screenshots or not RDL.DB or not RDL.DB:IsReady() then
+      print("RothDevLib: screenshot service is not ready.")
+      return
+    end
+    if screenshotArg == "on" or screenshotArg == "off" then
+      if not screenshots:SetEnabled(screenshotArg == "on") then
+        print("RothDevLib: automatic screenshot callback could not be registered.")
+        return
+      end
+      print("RothDevLib: automatic screenshots " .. screenshotArg
+        .. ". Screenshots include visible UI/chat; limits: 20 per UI session, 30 seconds apart.")
+    elseif screenshotArg == "now" or screenshotArg == "" then
+      local ok, detail = screenshots:Request("manual", nil, false)
+      print("RothDevLib: screenshot " .. (ok and "queued #" or "not requested: ") .. tostring(detail))
+    elseif screenshotArg == "status" then
+      local state = screenshots:GetSnapshot()
+      print("RothDevLib: auto screenshots=" .. tostring(state.enabled)
+        .. "; attempts=" .. tostring(state.attempts) .. "/" .. tostring(state.limit))
+    else
+      print("Usage: /rdev screenshot on|off|now|status")
+    end
+    return
+  end
+
+  if msg == "checkpoint" then
+    local ok = RDL.Diagnostics and RDL.Diagnostics:Checkpoint("manual")
+    print(ok and "RothDevLib: diagnostics checkpoint updated in SavedVariables memory; /reload or logout writes the file."
+      or "RothDevLib: checkpoint unavailable, disabled or writes suspended.")
+    return
+  end
+
   -- ChatTap helpers
   local chatCmd, chatArg = msg:match("^(chat)%s*(.*)$")
   if chatCmd == "chat" then
@@ -79,6 +113,7 @@ SlashCmdList["ROTHDEVLIB"] = function(msg)
       memWatchIntervalSec = "number",
       memWatchEnabled = "bool",
       enablePerfProfiling = "bool",
+      persistDiagnostics = "bool",
       uiUseScrollBoxList = "bool",
       uiUseButtonFrameShell = "bool",
       maxBreadcrumbsPerAddon = "number",
@@ -120,6 +155,7 @@ SlashCmdList["ROTHDEVLIB"] = function(msg)
 
     local old = settings[setKey]
     settings[setKey] = parsed
+    if setKey == "persistDiagnostics" and RDL.Diagnostics then RDL.Diagnostics:Init() end
     print("|cffffff00RothDevLib|r set " .. tostring(setKey) .. " = " .. tostring(parsed) .. " (was " .. tostring(old) .. ")")
     if UI and UI.Refresh then pcall(function() UI:Refresh() end) end
     if UI and UI.RefreshMonitor then pcall(function() UI:RefreshMonitor() end) end
@@ -667,6 +703,8 @@ end
   print("|cffffff00RothDevLib|r commands:")
   print("  /rdev open")
   print("  /rdev clear")
+  print("  /rdev checkpoint")
+  print("  /rdev screenshot on|off|now|status")
   print("  /rdev report | export")
   print("  /rdev export json")
   print("  /rdev export pack")

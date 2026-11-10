@@ -100,6 +100,8 @@ local SETTING_FIELDS = {
   uiUseButtonFrameShell = true,
   _validationPassLog = true,
   _reloadLoop = true,
+  persistDiagnostics = true,
+  autoScreenshots = true,
 }
 
 local SESSION_FIELDS = {
@@ -117,11 +119,14 @@ local SESSION_FIELDS = {
   alerts = true,
   asserts = true,
   throttledCount = true,
+  restrictionChanges = true,
+  diagnostics = true,
+  screenshots = true,
 }
 
 local SESSION_COUNTERS = {
   "errors", "warnings", "taints", "suppressed",
-  "alerts", "asserts", "throttledCount",
+  "alerts", "asserts", "throttledCount", "restrictionChanges",
 }
 
 local function Now()
@@ -235,6 +240,8 @@ local function NormalizeSettings(settings)
   NormalizeBoolean(settings, "localsProbeCache", true)
   NormalizeBoolean(settings, "enablePerfProfiling", true)
   NormalizeBoolean(settings, "memWatchEnabled", false)
+  NormalizeBoolean(settings, "persistDiagnostics", true)
+  NormalizeBoolean(settings, "autoScreenshots", false)
   NormalizeBoolean(settings, "openOnErrorOutOfCombat", false)
   NormalizeBoolean(settings, "minimapForceShowOnNextLogin", true)
   NormalizeBoolean(settings, "uiUseScrollBoxList", true)
@@ -300,6 +307,10 @@ local function CompactOccurrence(entry)
       "<invalid persisted message>"),
     stack = TruncateString(entry.stack, OCCURRENCE_STACK_BYTES, ""),
     origin = CompactOrigin(entry.origin),
+    evidence = CompactDiagnostic(entry.evidence or (type(entry.ctx) == "table" and entry.ctx.extra), {
+      maxDepth = 4, maxEntries = 24, maxNodes = 120,
+      maxStringBytes = 512, maxTotalBytes = 4096,
+    }),
     compact = true,
   }
 end
@@ -390,12 +401,23 @@ local function NormalizeGroups(db)
   end
 end
 
+local DIAGNOSTIC_LIMITS = {
+  maxDepth = 8, maxEntries = 256, maxNodes = 6000,
+  maxStringBytes = 8192, maxTotalBytes = 256 * 1024,
+}
+local SCREENSHOT_LIMITS = {
+  maxDepth = 4, maxEntries = 32, maxNodes = 600,
+  maxStringBytes = 4096, maxTotalBytes = 128 * 1024,
+}
+
 local function NormalizeSession(session)
   if type(session) ~= "table" or not FiniteNumber(session.id) then return nil end
   session.id = math.floor(session.id)
   if session.id < 0 then return nil end
 
   DropUnknownFields(session, SESSION_FIELDS)
+  session.diagnostics = CompactDiagnostic(session.diagnostics, DIAGNOSTIC_LIMITS)
+  session.screenshots = CompactDiagnostic(session.screenshots, SCREENSHOT_LIMITS)
   session.started = FiniteNumber(session.started) and session.started or 0
   session.ended = FiniteNumber(session.ended) and session.ended or nil
   if type(session.build) == "string" then
@@ -425,6 +447,10 @@ local function NormalizeSessions(db)
       sessions[#sessions + 1] = session
       validIds[session.id] = true
     end
+  end
+  for index = 6, #sessions do
+    sessions[index].diagnostics = nil
+    sessions[index].screenshots = nil
   end
   db.sessions = sessions
 
@@ -612,6 +638,10 @@ local function EmergencyCompact(db)
   while #db.sessions > FAILURE_MAX_SESSIONS do table.remove(db.sessions) end
   NormalizeSessions(db)
   db._schema = SCHEMA
+  for _, session in ipairs(db.sessions) do
+    session.diagnostics = nil
+    session.screenshots = nil
+  end
   db.persistence = {
     event = "SAVED_VARIABLES_TOO_LARGE",
     lastFailureAt = Now(),
@@ -642,6 +672,39 @@ function DB:EnsureReady()
     if not ok or ready ~= true then return false end
   end
   return NormalizeDatabase(self) and true
+end
+
+function DB:SaveDiagnostics(evidence)
+  if self._writesSuspended or not self:IsReady() or type(self.session) ~= "table" then return false end
+  local copy = CompactDiagnostic(evidence, DIAGNOSTIC_LIMITS)
+  if type(copy) ~= "table" then return false end
+  self.session.diagnostics = copy
+  for index = 6, #(self.raw.sessions or {}) do
+    self.raw.sessions[index].diagnostics = nil
+    self.raw.sessions[index].screenshots = nil
+  end
+  return true
+end
+
+function DB:SaveScreenshotEvidence(evidence)
+  if self._writesSuspended or not self:IsReady() or type(self.session) ~= "table" then return false end
+  local copy = CompactDiagnostic(evidence, SCREENSHOT_LIMITS)
+  if type(copy) ~= "table" then return false end
+  self.session.screenshots = copy
+  return true
+end
+
+function DB:GetDiagnosticSessions()
+  local result = {}
+  for index = 1, math.min(#(self.raw and self.raw.sessions or {}), 5) do
+    local session = self.raw.sessions[index]
+    if session.diagnostics or session.screenshots then
+      result[#result + 1] = { id = session.id, started = session.started, ended = session.ended,
+        diagnostics = CompactDiagnostic(session.diagnostics, DIAGNOSTIC_LIMITS),
+        screenshots = CompactDiagnostic(session.screenshots, SCREENSHOT_LIMITS) }
+    end
+  end
+  return result
 end
 
 function DB:IsWriteSuspended()
@@ -685,7 +748,11 @@ function DB:UpsertGroup(entry)
   end
   HardTrimRuntimeGroups(self)
   if type(self.raw) == "table" and type(self.raw.groups) == "table" then
-    return self.raw.groups[entry.sig]
+    local committed = self.raw.groups[entry.sig]
+    if committed and type(RDL.Fire) == "function" then
+      pcall(RDL.Fire, RDL, "RDL_CAPTURE", entry, committed)
+    end
+    return committed
   end
   return group
 end
@@ -698,6 +765,13 @@ if type(OriginalClear) == "function" then
     local db = type(self.raw) == "table" and self.raw or _G.RothDevLibDB
     if type(db) == "table" then db.persistence = nil end
     self._normalizedRoot = nil
-    return OriginalClear(self)
+    local result = OriginalClear(self)
+    if RDL.Screenshots and type(RDL.Screenshots.ClearSession) == "function" then
+      pcall(RDL.Screenshots.ClearSession, RDL.Screenshots)
+    end
+    if RDL.Diagnostics and type(RDL.Diagnostics.Init) == "function" then
+      pcall(RDL.Diagnostics.Init, RDL.Diagnostics)
+    end
+    return result
   end
 end

@@ -482,11 +482,7 @@ function DB:UpsertGroup(entry)
   table.insert(occ, 1, entry)
   local maxOcc = settings.maxOccurrencesPerGroup or 10
   while #occ > maxOcc do table.remove(occ) end
-  -- FIX B2+: Only fire callback, no direct UI call.
-  -- IMPORTANT: callback errors are captured (Integration\Callbacks.lua) and the failing callback is disabled.
-  if type(RDL.Fire) == "function" then
-    RDL:Fire("RDL_CAPTURE", entry, g)
-  end
+  -- DBLifecycle delivers RDL_CAPTURE after compaction and hard-cap eviction.
 
   -- Update per-session index (enables BugSack-style session filtering)
   self:_UpdateSessionIndex(entry)

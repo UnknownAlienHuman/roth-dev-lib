@@ -6,7 +6,7 @@ A bounded diagnostics library and UI for World of Warcraft addon development. It
 
 - Retail target: **12.1.5**
 - Interface: **120105**
-- Version: **1.0.0-alpha.20.0**
+- Version: **1.0.0-alpha.20.1**
 - Saved variables: `RothDevLibDB`
 
 The implementation is aligned with Blizzard UI source build **12.1.5 (70783)**. The complete offline regression suite and first-party Lua syntax gate pass in GitHub Actions. The named-client validation matrix remains required before release.
@@ -44,6 +44,21 @@ See [docs/INTEGRATION.md](docs/INTEGRATION.md) and [docs/INTEGRATION_RU.md](docs
 - Runtime registries—Bus, profiling, callbacks, Doctor, Locals, ChatTap, BugGrabber, Storm and Logger—have explicit saturation behavior.
 - File-load errors use a bounded boot queue and receive the real session only when committed.
 - Blizzard UI is observed or post-hooked. RothDevLib does not replace Blizzard frame methods, mutate popup definitions or unregister events owned by other frames.
+
+## Evidence for offline agents
+
+Session diagnostics now survive reload: native addon CPU metrics, instrumented
+CPU/memory summaries, FPS/heap samples, capture coverage and recent breadcrumbs
+are checkpointed into `RothDevLibDB.sessions`. Use `/rdev checkpoint`, then normal
+`/reload` or logout to let the client write SavedVariables. A checkpoint alone
+is not a disk flush.
+
+Optional `/rdev screenshot on` captures diagnostic images with a cooldown and
+session limit; it is off by default and includes the visible UI/chat. Screenshot
+metadata is saved separately from the image; the API does not return a filename.
+
+See [the agent evidence guide](docs/AGENT_DIAGNOSTICS.md) for data locations,
+commands, performance semantics, anomaly instrumentation and attribution limits.
 
 ## Validation
 

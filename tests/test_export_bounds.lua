@@ -85,10 +85,10 @@ for _, group in ipairs(full.groups) do
   assert(group.sig ~= 'ignored' and group.message ~= 'must-not-export')
 end
 
--- Session and nested diagnostics are detached from live DB state.
-assert(full.session.nested.value == 7)
-full.session.nested.value = 99
-assert(DB.session.nested.value == 7)
+-- Metadata is small and detached; heavy evidence uses diagnosticSessions.
+assert(full.session.id == 1 and full.session.nested == nil)
+full.session.id = 99
+assert(DB.session.id == 1 and DB.session.nested.value == 7)
 
 local zero = E:BuildFullObject({ maxGroups = 0 })
 assert(#zero.groups == 0 and zero.summary.groupCount == 520)

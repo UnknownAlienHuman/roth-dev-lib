@@ -2,7 +2,7 @@
 ## Title: !RothDevLib
 ## Notes: Bounded diagnostics for WoW addon development: error capture, context, breadcrumbs, profiling and structured export.
 ## Author: Neomorph
-## Version: 1.0.0-alpha.20.0
+## Version: 1.0.0-alpha.20.1
 ## SavedVariables: RothDevLibDB
 ## LoadSavedVariablesFirst: 1
 
@@ -65,6 +65,8 @@ Capture\Storm.lua
 Capture\Warnings.lua
 Capture\Taint.lua
 Capture\Suppress.lua
+Capture\Screenshots.lua
+Core\Diagnostics.lua
 
 # UI
 UI\Templates.xml

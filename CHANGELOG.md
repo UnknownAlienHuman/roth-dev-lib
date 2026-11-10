@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.0-alpha.20.1 — 2026-11-10
+
+- Persist bounded session evidence on login, every 30 seconds, explicit checkpoint and shutdown: addon versions, capture coverage, native addon CPU metrics, instrumented CPU/memory summaries, FPS/heap samples, breadcrumbs and logs.
+- Retain diagnostic evidence for the five newest sessions and expose it in full JSON and explicitly budgeted packed summaries.
+- Preserve per-occurrence extra context and dispatch capture callbacks only after DB commit, compaction and index updates.
+- Separate normal restriction transitions from taint failures; mark observer stacks and client-reported attribution without inventing the original taint source.
+- Stop classifying foreign taint as self-taint merely because RothDevLib's observer appears in the stack.
+- Label ordinary secret-access error messages as a heuristic category; inaccessible payloads remain filtered markers.
+- Add opt-in public Screenshot() requests, a persisted outcome ledger, one pending request, a 30-second cooldown and a 20-attempt UI-session limit. Never fabricate filenames or retry denied calls.
+- Add `/rdev checkpoint` and `/rdev screenshot on|off|now|status`; document the offline-agent workflow in `docs/AGENT_DIAGNOSTICS.md`.
+- Add persistence, capture-to-export, screenshot and teardown regressions. Real WoW screenshot/rendering, native performance readings, taint/Secret Values and save timing remain NOT-RUN.
+
 ## 1.0.0-alpha.20.0 — 2026-11-06
 
 ### Compatibility

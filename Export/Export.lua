@@ -247,6 +247,10 @@ local function SerializeGroup(group, limits)
           message = OptionalText(RawField(entry, "message"), 4096),
           origin = OriginSnapshot(RawField(entry, "origin")),
           stackTop = StackTopLines(RawField(entry, "stack"), 6),
+          evidence = SafeCopy(RawField(entry, "evidence"), {
+            maxDepth = 4, maxEntries = 24, maxNodes = 120,
+            maxStringBytes = 512, maxTotalBytes = 4096,
+          }),
         }
       end
       if #occurrences > 0 then object.occurrences = occurrences end
@@ -305,6 +309,16 @@ local function CollectGroups(signatureFilter, includeIgnored, maximum)
   return candidates, total
 end
 
+local function SessionMetadata()
+  local source = RDL.DB and RDL.DB.session
+  local metadata = {}
+  local fields = { "id", "started", "ended", "build", "character", "class", "spec",
+    "errors", "warnings", "taints", "restrictionChanges", "suppressed", "alerts", "asserts", "throttledCount" }
+  for _, key in ipairs(fields) do metadata[key] = RawField(source, key) end
+  return SafeCopy(metadata, { maxDepth = 2, maxEntries = 32, maxNodes = 64,
+    maxStringBytes = 1024, maxTotalBytes = 8192 })
+end
+
 local function BuildBaseEnvelope(kind)
   local system
   local util = RDL.Util
@@ -344,10 +358,7 @@ local function BuildBaseEnvelope(kind)
       name = "!RothDevLib",
       version = SafeText(RDL.version, "", 128),
     },
-    session = RDL.DB and SafeCopy(RDL.DB.session, {
-      maxDepth = 3, maxEntries = 40, maxNodes = 200,
-      maxStringBytes = 1024, maxTotalBytes = 32 * 1024,
-    }) or nil,
+    session = SessionMetadata(),
   }
 end
 
@@ -371,6 +382,15 @@ end
 function Export:BuildFullObject(options)
   local limits = NormalizeFullOptions(options)
   local envelope = BuildBaseEnvelope(limits.exportKind)
+  if RDL.DB and type(RDL.DB.GetDiagnosticSessions) == "function" then
+    local ok, sessions = pcall(RDL.DB.GetDiagnosticSessions, RDL.DB)
+    if ok then
+      envelope.diagnosticSessions = SafeCopy(sessions, {
+        maxDepth = 10, maxEntries = 256, maxNodes = 20000,
+        maxStringBytes = 8192, maxTotalBytes = 2 * 1024 * 1024,
+      })
+    end
+  end
   envelope.limits = {
     maxGroups = limits.maxGroups,
     maxOccurrences = limits.maxOccurrences,

@@ -145,6 +145,8 @@ function Capture:OnTaintEvent(event, addonName, blockedText)
     event = safeEvent,
     source = source,
     blocked = blocked,
+    stackProvenance = "event-observer",
+    attribution = "client-reported-blocked-addon-not-original-taint-source",
     restriction = RestrictionSnapshot(),
   })
 
@@ -174,10 +176,13 @@ function Capture:OnRestrictionStateChanged(event, restrictionType, state)
     restrictionTypeName = typeName,
     state = stateValue,
     stateName = stateName,
+    stackProvenance = "event-observer",
+    severity = "INFO",
+    observation = "restriction-transition-not-a-failure",
     restriction = RestrictionSnapshot(),
   })
   if entry and (status == "stored" or status == "queued") and type(RDL.Log) == "function" then
-    pcall(RDL.Log, RDL, "WARN", "TAINT", "Restriction state changed", {
+    pcall(RDL.Log, RDL, "INFO", "TAINT", "Restriction state changed", {
       type = typeName,
       state = stateName,
     })
